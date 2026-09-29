@@ -493,9 +493,18 @@ private:
 	u32 m_glu_land[32][7]{};
 	u32 m_glu_repl[32][7]{};
 	static const char *const s_glu_cls[7];
+	attotime sndglu_now() const;
+	attotime bt_at(u64 t) const;
 	bool sndglu_service();
 	void sndglu_arm(bool is_read, u8 data);
+	void sndglu_reg_write(u8 data);
 	void sndglu_commit();
+	// $C03D register write judged at the bus time bt_access computes (the
+	// CPU core calls the handler first). m_snd_force is that time.
+	bool m_glu_hold = false;
+	u8 m_glu_hold_data = 0;
+	attotime m_snd_force;
+	bool m_snd_force_on = false;
 	void sndglu_stall_until_commit();
 	void sndglu_tally(u16 addr, bool land);
 	void sndglu_log_table();
@@ -632,7 +641,8 @@ private:
 	u64 m_bt_istart = 0, m_bt_istall = 0, m_bt_frac = 0, m_bt_cprev = 0;
 	u64 m_bt_charged = 0, m_bt_idx = 0;
 	u32 m_bt_ipc = 0;       // the code block of the instruction (BTP_PCS entry)
-	u64 m_bt_fanchor = 0, m_bt_busfree = 0;
+	u64 m_bt_fanchor = 0, m_bt_busfree = 0, m_bt_slot = 0;
+	bool m_bt_slot_ok = false;
 	u64 m_bt_wbuf[4] = { 0, 0, 0, 0 };
 	int m_bt_wcount = 0, m_bt_wdepth = 1;
 	u64 m_bt_overhead = 0;
@@ -1865,8 +1875,12 @@ u8 apple2gs_state::twgs_bus(u32 address, int type, u8 data)
 // ZipGS (patent US 4,794,523; ZipGSX manual; D. Empson, comp.sys.apple2):
 // direct mapped, one tag per data byte (1-byte lines, no read-ahead); a read
 // miss runs one motherboard cycle and fills that byte; writes go through a
-// write buffer to the motherboard and also write the cache; private mapping
-// latches select the auxiliary and language-card tag bits. I/O is never
+// write buffer to the motherboard and also write the cache. The patent's
+// first-stage latch is one deep: the byte is enabled onto the Apple bus on
+// the next phase 0, and a second write before that phase 0 stops the CPU
+// until the latch can take it (so the new byte occupies the following
+// phase 0). Private mapping latches select the auxiliary and language-card
+// tag bits. I/O is never
 // cached; a 16 KB cache caches fast RAM banks $00-$2F, $E0, $E1 and $FC-$FF
 // (measured). Read hits return the cached byte.
 //
@@ -1875,9 +1889,12 @@ u8 apple2gs_state::twgs_bus(u32 address, int type, u8 data)
 // each data byte (1-byte lines); all memory is cached except I/O
 // $C000-$CFFF; a store also fills the cache (the ROM's cache size test reads
 // back stores to bank $BF); stores go to the GS through 4 latched byte
-// writes (schematic: 4 sets of address, bank and data latches); with the
-// data cache off, data reads miss and code fetches still hit; while the CPU
-// has interrupts off and the IRQ logic is on, the card runs at the GS speed.
+// writes (schematic: 4 sets of address, bank and data latches). GAL2 rev B
+// enables those latches with SEL_GS_PH2 on a fast motherboard PH2, including
+// a $C0xx write: with the IRQ slowdown off, no GAL term stretches that
+// write to a Mega II phase 0. With the data cache off, data reads miss and
+// code fetches still hit; while the CPU has interrupts off and the IRQ
+// logic is on, the card runs at the GS speed.
 // ---------------------------------------------------------------------------
 
 void apple2gs_state::bt_config()
@@ -1967,6 +1984,7 @@ u64 apple2gs_state::bt_fast(u64 t, bool refresh)
 		}
 	}
 	m_btc[BTC_FAST]++;
+	m_bt_slot = b;
 	return b + BT_FAST;
 }
 
@@ -1988,6 +2006,7 @@ u64 apple2gs_state::bt_mega(u64 t)
 	}
 	m_btc[BTC_MEGA]++;
 	m_bt_fanchor = b + len;
+	m_bt_slot = b;
 	return b + len;
 }
 
@@ -2010,12 +2029,15 @@ bool apple2gs_state::bt_aux(u32 a16, bool write)
 
 u64 apple2gs_state::bt_bus(u64 t, int cls)
 {
+	u64 end;
 	switch (cls)
 	{
-		case BC_MEGA: return bt_mega(t);
-		case BC_RAM: return bt_fast(t, true);
-		default: return bt_fast(t, false);
+		case BC_MEGA: end = bt_mega(t); break;
+		case BC_RAM: end = bt_fast(t, true); break;
+		default: end = bt_fast(t, false); break;
 	}
+	m_bt_slot_ok = true;
+	return end;
 }
 
 u64 apple2gs_state::bt_instruction(u32 pc)
@@ -2386,6 +2408,7 @@ int apple2gs_state::bt_access(u32 address, int type)
 {
 	const bool slow = m_bt_slow;
 	m_bt_slow = false;
+	m_bt_slot_ok = false;
 	if (m_bt_mode == BT_OFF)
 		return 0;
 
@@ -2429,6 +2452,11 @@ int apple2gs_state::bt_access(u32 address, int type)
 		cls = BC_FASTIO;
 	else if ((bank >= 0xf0) || (iolc && (a16 >= 0xd000) && !m_lcram && !write))
 		cls = BC_ROM;
+	// GAL2 rev B enables write-back on SEL_GS_PH2 (a fast GS PH2 edge).
+	// With the IRQ slowdown off, a $C0xx write is not stretched to phase 0.
+	const bool c0_ph2 = (m_bt_mode == BT_TWGS) && !m_bt_twslow && write && io && ((a16 & 0xff00) == 0xc000);
+	if (c0_ph2)
+		cls = BC_FASTIO;
 
 	u64 *const page = &m_btpage[(address >> 8) * 4];
 	u64 stall = 0;
@@ -2476,7 +2504,9 @@ int apple2gs_state::bt_access(u32 address, int type)
 				u64 accept = t;
 				if (m_bt_wcount >= m_bt_wdepth)
 				{
-					// the buffer is full: wait for the oldest write
+					// US 4,794,523: the latch is still driving the previous byte
+					// (enabled on its phase 0). Stop until that cycle ends, which
+					// is the following phase 0, and enable the new byte there.
 					accept = m_bt_wbuf[0];
 					for (int i = 1; i < m_bt_wcount; i++)
 						m_bt_wbuf[i - 1] = m_bt_wbuf[i];
@@ -2574,7 +2604,9 @@ int apple2gs_state::bt_access(u32 address, int type)
 				m_bt_wcount--;
 				m_btc[BTC_WBUF_FULL]++;
 			}
-			const u64 end = bt_bus(std::max(accept, m_bt_busfree), cls) + m_twgs_wextra;
+			// $C0xx write-back is one fast PH2 (SEL_GS_PH2), not PH2 plus the
+			// extra clocks used for ordinary posted stores.
+			const u64 end = bt_bus(std::max(accept, m_bt_busfree), cls) + (c0_ph2 ? 0 : m_twgs_wextra);
 			m_bt_busfree = end;
 			m_bt_wbuf[m_bt_wcount++] = end;
 			stall = accept - t;
@@ -2615,6 +2647,21 @@ int apple2gs_state::bt_access(u32 address, int type)
 		m_twgs_post = false;
 		m_twgs_wend[m_twgs_wcount - 1] = m_bt_busfree;
 		twgs_schedule_write();
+	}
+
+	// $C03D was held in the device handler, which runs before this hook.
+	// The byte reaches the GLU at m_bt_slot: the phase 0 the Zip latch
+	// drives, or the fast PH2 the TransWarp write-back enables.
+	if (m_glu_hold && write && a16 == 0xc03d)
+	{
+		if (m_bt_slot_ok)
+		{
+			m_snd_force = bt_at(m_bt_slot);
+			m_snd_force_on = true;
+		}
+		sndglu_reg_write(m_glu_hold_data);
+		m_snd_force_on = false;
+		m_glu_hold = false;
 	}
 
 	if (stall)
@@ -2988,13 +3035,35 @@ void apple2gs_state::sndglu_apply_vca()
 	}
 }
 
+// Bus-model ticks (1/1056 of a 14M clock) as an absolute machine time.
+attotime apple2gs_state::bt_at(u64 t) const
+{
+	const u64 secs = t / BT_PER_SEC;
+	const u64 rem = t % BT_PER_SEC;
+	return attotime(secs, attoseconds_t(double(rem) * (double(ATTOSECONDS_PER_SECOND) / double(BT_PER_SEC))));
+}
+
+// A GLU access reaches the GLU when its own bus cycle does. Zip and TransWarp
+// register writes set m_snd_force to that cycle (phase 0, or a fast PH2).
+// Anything else still sees the bus once earlier buffered writes have finished.
+attotime apple2gs_state::sndglu_now() const
+{
+	if (m_snd_force_on)
+		return m_snd_force;
+	const attotime now = machine().time();
+	if ((m_bt_mode != BT_ZIP) && (m_bt_mode != BT_TWGS))
+		return now;
+	const attotime bus = bt_at(m_bt_busfree);
+	return (bus > now) ? bus : now;
+}
+
 bool apple2gs_state::sndglu_service()
 {
 	if (!m_sndglu_busy_model || !m_sndglu_pending)
 		return false;
 	if (machine().side_effects_disabled())
-		return machine().time() < m_sndglu_busy_until;
-	if (machine().time() >= m_sndglu_busy_until)
+		return sndglu_now() < m_sndglu_busy_until;
+	if (sndglu_now() >= m_sndglu_busy_until)
 	{
 		sndglu_commit();
 		return false;
@@ -3004,7 +3073,7 @@ bool apple2gs_state::sndglu_service()
 
 void apple2gs_state::sndglu_arm(bool is_read, u8 data)
 {
-	const attotime now = machine().time();
+	const attotime now = sndglu_now();
 	const u64 ticks = now.as_ticks(A2GS_7M);
 	// Time to the next free phase, plus three DOC clocks for the strobe.
 	// Missing the phase waits from three clocks to a slot plus three.
@@ -3016,7 +3085,28 @@ void apple2gs_state::sndglu_arm(bool is_read, u8 data)
 	m_sndglu_pend_data = data;
 	m_sndglu_busy_until = attotime::from_ticks(commit_tick, A2GS_7M);
 	m_sndglu_pending = true;
-	m_sndglu_timer->adjust(m_sndglu_busy_until - now);
+	// Absolute commit time. now may be a future bus cycle; scheduling the
+	// interval from now would fire early and drop the collision.
+	const attotime left = m_sndglu_busy_until - machine().time();
+	m_sndglu_timer->adjust((left < attotime::zero) ? attotime::zero : left);
+}
+
+// Register write of $C03D. A write that arrives while the latch is still
+// waiting replaces the byte. The commit time does not move.
+void apple2gs_state::sndglu_reg_write(u8 data)
+{
+	if (sndglu_service())
+	{
+		logerror("Sound GLU busy: write %02x to %04x dropped\n", m_sndglu_pend_data, m_sndglu_pend_addr);
+		sndglu_tally(m_sndglu_pend_addr, false);
+		m_sndglu_pend_read = false;
+		m_sndglu_pend_ram = false;
+		m_sndglu_pend_auto = (m_sndglu_ctrl & 0x20) != 0;
+		m_sndglu_pend_addr = m_sndglu_addr;
+		m_sndglu_pend_data = data;
+		return;
+	}
+	sndglu_arm(false, data);
 }
 
 void apple2gs_state::sndglu_tally(u16 addr, bool land)
@@ -3331,7 +3421,9 @@ u8 apple2gs_state::c000_r(offs_t offset)
 	{
 		switch (offset)
 		{
-			// C07x ROM and FPI registers are fast
+			// C07x ROM and FPI registers are fast. $C03C-$C03F are a Mega II
+			// phase 0 (Tech Note #68: /M2SEL for internal I/O; the GLU
+			// select is the phase-0 strobe C038-3F*).
 			case 0x2d: case 0x35: case 0x36: case 0x37: case 0x68:
 				break;
 			default:
@@ -3502,7 +3594,7 @@ u8 apple2gs_state::c000_r(offs_t offset)
 			// are the VCA, returned as stored (not forced on).
 			if (!machine().side_effects_disabled())
 				sndglu_service();
-			return (m_sndglu_ctrl & 0x7f) | 0x10 | ((m_sndglu_pending && machine().time() < m_sndglu_busy_until) ? 0x80 : 0x00);
+			return (m_sndglu_ctrl & 0x7f) | 0x10 | ((m_sndglu_pending && sndglu_now() < m_sndglu_busy_until) ? 0x80 : 0x00);
 
 		case 0x3d:  // SOUNDDATA
 			if (machine().side_effects_disabled())
@@ -3656,7 +3748,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 
 	switch (offset)
 	{
-		// FPI registers are fast
+		// FPI registers are fast. $C03C-$C03F stay a synchronized 1 MHz cycle.
 		case 0x35: case 0x36: case 0x37:
 			break;
 		default:
@@ -3899,19 +3991,16 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 				sndglu_stall_until_commit();
 				break;
 			}
-			if (sndglu_service())
+			// The CPU core writes the device before the bus hook. On a Zip or
+			// a TransWarp the byte is not on the GLU until that hook's cycle
+			// (next phase 0, or a fast PH2). Judge the collision there.
+			if (m_bt_mode == BT_ZIP || m_bt_mode == BT_TWGS)
 			{
-				// Register write while the latch is still waiting for the DOC phase.
-				logerror("Sound GLU busy: write %02x to %04x dropped\n", m_sndglu_pend_data, m_sndglu_pend_addr);
-				sndglu_tally(m_sndglu_pend_addr, false);
-				m_sndglu_pend_read = false;
-				m_sndglu_pend_ram = false;
-				m_sndglu_pend_auto = (m_sndglu_ctrl & 0x20) != 0;
-				m_sndglu_pend_addr = m_sndglu_addr;
-				m_sndglu_pend_data = data;
+				m_glu_hold = true;
+				m_glu_hold_data = data;
 				break;
 			}
-			sndglu_arm(false, data);
+			sndglu_reg_write(data);
 			break;
 
 		case 0x3e:  // SOUNDADRL
