@@ -55,6 +55,11 @@ public:
 	// access type; it gives the extra cycles of the access (a bus timing model)
 	enum { BUS_OPCODE = 0, BUS_OPERAND, BUS_READ, BUS_WRITE, BUS_VECTOR };
 	using bus_hook_delegate = delegate<int (u32 address, int type)>;
+	// An optional external cache can satisfy a transfer before the address space is accessed.
+	using memory_hook_delegate = delegate<bool (u32 address, int type, u8 &data)>;
+	void set_memory_hook(memory_hook_delegate hook) { m_memory_hook = std::move(hook); }
+	using data_hook_delegate = delegate<u8 (u32 address, int type, u8 data)>;
+	void set_data_hook(data_hook_delegate hook) { m_data_hook = std::move(hook); }
 	void set_bus_hook(bus_hook_delegate hook) { m_bus_hook = std::move(hook); }
 	// the interrupt mask flag, for a model that slows down while interrupts are off
 	bool irq_masked() const { return m_flag_i != 0; }
@@ -254,6 +259,8 @@ protected:
 	unsigned m_destination;
 	int m_ICount;
 	bus_hook_delegate m_bus_hook;
+	memory_hook_delegate m_memory_hook;
+	data_hook_delegate m_data_hook;
 	int m_cpu_type;
 	uint8_t m_divider;
 	uint32_t m_debugger_temp;

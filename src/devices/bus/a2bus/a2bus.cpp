@@ -169,6 +169,7 @@ a2bus_device::a2bus_device(const machine_config &mconfig, device_type type, cons
 	, m_out_inh_cb(*this)
 	, m_out_dma_cb(*this)
 	, m_slot_irq_mask(0), m_slot_nmi_mask(0)
+	, m_dma_bank(0)
 {
 }
 
@@ -182,6 +183,8 @@ void a2bus_device::device_start()
 	std::fill(std::begin(m_device_list), std::end(m_device_list), nullptr);
 
 	m_slot_irq_mask = m_slot_nmi_mask = 0;
+	m_dma_bank = 0;
+	save_item(NAME(m_dma_bank));
 }
 
 //-------------------------------------------------
@@ -190,6 +193,7 @@ void a2bus_device::device_start()
 
 void a2bus_device::device_reset()
 {
+	m_dma_bank = 0;
 }
 
 device_a2bus_card_interface *a2bus_device::get_a2bus_card(int slot)
@@ -269,12 +273,13 @@ void a2bus_device::set_dma_line(int state)
 
 uint8_t a2bus_device::dma_r(uint16_t offset)
 {
-	return m_maincpu_space->read_byte(offset);
+	// Slot /DMA supplies A0-A15 only. The FPI/CYA prepends $C037.
+	return m_maincpu_space->read_byte((uint32_t(m_dma_bank) << 16) | offset);
 }
 
 void a2bus_device::dma_w(uint16_t offset, uint8_t data)
 {
-	m_maincpu_space->write_byte(offset, data);
+	m_maincpu_space->write_byte((uint32_t(m_dma_bank) << 16) | offset, data);
 }
 
 void a2bus_device::recalc_inh(int slot)

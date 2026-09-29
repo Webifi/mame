@@ -17,6 +17,7 @@
 #include "a2applicard.h"
 #include "a2arcadebd.h"
 #include "a2cffa.h"
+#include "a2cffa3000.h"
 #include "a2corvus.h"
 #include "a2diskiing.h"
 #include "a2dx1.h"
@@ -97,6 +98,7 @@ void apple2_cards(device_slot_interface &device)
 	device.option_add("mockingboard", A2BUS_MOCKINGBOARD);     // Sweet Micro Systems Mockingboard
 	device.option_add("phasor", A2BUS_PHASOR);                 // Applied Engineering Phasor
 	device.option_add("cffa2", A2BUS_CFFA2);                   // CFFA2000 Compact Flash for Apple II (www.dreher.net), 65C02/65816 firmware
+	device.option_add("cffa3000", A2BUS_CFFA3000);
 	device.option_add("cffa202", A2BUS_CFFA2_6502);            // CFFA2000 Compact Flash for Apple II (www.dreher.net), 6502 firmware
 	device.option_add("memexp", A2BUS_MEMEXP);                 // Apple II Memory Expansion Card
 	device.option_add("ramfactor", A2BUS_RAMFACTOR);           // Applied Engineering RamFactor
@@ -176,6 +178,7 @@ void apple2e_cards(device_slot_interface &device)
 	device.option_add("mockingboard", A2BUS_MOCKINGBOARD);     // Sweet Micro Systems Mockingboard
 	device.option_add("phasor", A2BUS_PHASOR);                 // Applied Engineering Phasor
 	device.option_add("cffa2", A2BUS_CFFA2);                   // CFFA2000 Compact Flash for Apple II (www.dreher.net), 65C02/65816 firmware
+	device.option_add("cffa3000", A2BUS_CFFA3000);
 	device.option_add("cffa202", A2BUS_CFFA2_6502);            // CFFA2000 Compact Flash for Apple II (www.dreher.net), 6502 firmware
 	device.option_add("memexp", A2BUS_MEMEXP);                 // Apple II Memory Expansion Card
 	device.option_add("ramfactor", A2BUS_RAMFACTOR);           // Applied Engineering RamFactor
@@ -264,6 +267,7 @@ void apple2gs_cards(device_slot_interface &device)
 	device.option_add("mockingboard", A2BUS_MOCKINGBOARD);     // Sweet Micro Systems Mockingboard
 	device.option_add("phasor", A2BUS_PHASOR);                 // Applied Engineering Phasor
 	device.option_add("cffa2", A2BUS_CFFA2);                   // CFFA2000 Compact Flash for Apple II (www.dreher.net), 65C02/65816 firmware
+	device.option_add("cffa3000", A2BUS_CFFA3000);
 	device.option_add("cffa202", A2BUS_CFFA2_6502);            // CFFA2000 Compact Flash for Apple II (www.dreher.net), 6502 firmware
 	device.option_add("memexp", A2BUS_MEMEXP);                 // Apple II Memory Expansion Card
 	device.option_add("ramfactor", A2BUS_RAMFACTOR);           // Applied Engineering RamFactor
@@ -339,6 +343,7 @@ void apple2gs_cards(device_slot_interface &device)
 void apple3_cards(device_slot_interface &device)
 {
 	device.option_add("cffa2", A2BUS_CFFA2_6502);          // CFFA2.0 Compact Flash for Apple II (www.dreher.net), 6502 firmware
+	device.option_add("cffa3000", A2BUS_CFFA3000);
 	device.option_add("applicard", A2BUS_APPLICARD);       // PCPI Appli-Card
 	device.option_add("thclock", A2BUS_THUNDERCLOCK);      // ThunderWare ThunderClock Plus - driver assumes slot 2 by default
 	device.option_add("mouse", A2BUS_MOUSE);               // Apple II Mouse Card

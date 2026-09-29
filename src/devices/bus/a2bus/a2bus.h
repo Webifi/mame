@@ -85,6 +85,9 @@ public:
 	void set_nmi_line(int state, int slot);
 	void set_dma_line(int state);
 	void recalc_inh(int slot);
+	// FPI/CYA DMA bank ($C037). IIe leaves this 0, so slot DMA stays in bank $00.
+	void set_dma_bank(uint8_t bank) { m_dma_bank = bank; }
+	uint8_t dma_bank() const { return m_dma_bank; }
 	uint8_t dma_r(uint16_t offset);
 	void dma_w(uint16_t offset, uint8_t data);
 	void reset_bus();
@@ -111,6 +114,7 @@ protected:
 
 	uint8_t m_slot_irq_mask;
 	uint8_t m_slot_nmi_mask;
+	uint8_t m_dma_bank;
 };
 
 

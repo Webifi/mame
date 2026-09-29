@@ -242,7 +242,11 @@ unsigned g65816_device::g65816i_read_8_normal(unsigned address)
 {
 	address = ADDRESS_65816(address);
 	CLOCKS -= (bus_5A22_cycle_burst(address));
-	const unsigned value = g65816_read_8(address);
+	u8 value = 0;
+	if (m_memory_hook.isnull() || !m_memory_hook(address, BUS_READ, value))
+		value = g65816_read_8(address);
+	if (!m_data_hook.isnull())
+		value = m_data_hook(address, BUS_READ, value);
 	BUS_HOOK(address, BUS_READ);
 	return value;
 }
@@ -251,7 +255,11 @@ unsigned g65816_device::g65816i_read_8_immediate(unsigned address)
 {
 	address = ADDRESS_65816(address);
 	CLOCKS -= (bus_5A22_cycle_burst(address));
-	const unsigned value = g65816_read_8_immediate(address);
+	u8 value = 0;
+	if (m_memory_hook.isnull() || !m_memory_hook(address, BUS_OPERAND, value))
+		value = g65816_read_8_immediate(address);
+	if (!m_data_hook.isnull())
+		value = m_data_hook(address, BUS_OPERAND, value);
 	BUS_HOOK(address, BUS_OPERAND);
 	return value;
 }
@@ -260,7 +268,11 @@ unsigned g65816_device::g65816i_read_8_opcode(unsigned address)
 {
 	address = ADDRESS_65816(address);
 	CLOCKS -= (bus_5A22_cycle_burst(address));
-	const unsigned value = g65816_read_8_opcode(address);
+	u8 value = 0;
+	if (m_memory_hook.isnull() || !m_memory_hook(address, BUS_OPCODE, value))
+		value = g65816_read_8_opcode(address);
+	if (!m_data_hook.isnull())
+		value = m_data_hook(address, BUS_OPCODE, value);
 	BUS_HOOK(address, BUS_OPCODE);
 	return value;
 }
@@ -278,7 +290,11 @@ unsigned g65816_device::g65816i_read_8_direct(unsigned address)
 		address = ADDRESS_65816(address);
 		CLOCKS -= (bus_5A22_cycle_burst(address));
 	}
-	const unsigned value = g65816_read_8(address);
+	u8 value = 0;
+	if (m_memory_hook.isnull() || !m_memory_hook(address, BUS_READ, value))
+		value = g65816_read_8(address);
+	if (!m_data_hook.isnull())
+		value = m_data_hook(address, BUS_READ, value);
 	BUS_HOOK(address, BUS_READ);
 	return value;
 }
@@ -286,11 +302,16 @@ unsigned g65816_device::g65816i_read_8_direct(unsigned address)
 unsigned g65816_device::g65816i_read_8_vector(unsigned address)
 {
 	CLOCKS -= (bus_5A22_cycle_burst(address));
-	unsigned value;
-	if (has_space(AS_VECTORS))
-		value = space(AS_VECTORS).read_byte(address & 0x001f);
-	else
-		value = g65816_read_8_immediate(address);
+	u8 value = 0;
+	if (m_memory_hook.isnull() || !m_memory_hook(address, BUS_VECTOR, value))
+	{
+		if (has_space(AS_VECTORS))
+			value = space(AS_VECTORS).read_byte(address & 0x001f);
+		else
+			value = g65816_read_8_immediate(address);
+	}
+	if (!m_data_hook.isnull())
+		value = m_data_hook(address, BUS_VECTOR, value);
 	BUS_HOOK(address, BUS_VECTOR);
 	return value;
 }
@@ -299,7 +320,11 @@ void g65816_device::g65816i_write_8_normal(unsigned address, unsigned value)
 {
 	address = ADDRESS_65816(address);
 	CLOCKS -= (bus_5A22_cycle_burst(address));
-	g65816_write_8(address, MAKE_UINT_8(value));
+	u8 data = MAKE_UINT_8(value);
+	if (m_memory_hook.isnull() || !m_memory_hook(address, BUS_WRITE, data))
+		g65816_write_8(address, data);
+	if (!m_data_hook.isnull())
+		m_data_hook(address, BUS_WRITE, value);
 	BUS_HOOK(address, BUS_WRITE);
 }
 
@@ -316,7 +341,11 @@ void g65816_device::g65816i_write_8_direct(unsigned address, unsigned value)
 		address = ADDRESS_65816(address);
 		CLOCKS -= (bus_5A22_cycle_burst(address));
 	}
-	g65816_write_8(address, MAKE_UINT_8(value));
+	u8 data = MAKE_UINT_8(value);
+	if (m_memory_hook.isnull() || !m_memory_hook(address, BUS_WRITE, data))
+		g65816_write_8(address, data);
+	if (!m_data_hook.isnull())
+		m_data_hook(address, BUS_WRITE, value);
 	BUS_HOOK(address, BUS_WRITE);
 }
 
