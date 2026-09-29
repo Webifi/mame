@@ -464,10 +464,36 @@ private:
 
 	bool m_last_speed = false;
 
-	// Sound GLU variables
+	// Sound GLU. The DOC host port is free on one phase of the oscillator slot
+	// (8 clocks of the 7.159 MHz DOC clock). A CPU transfer that misses that
+	// phase is latched and completed on the following slot, so the port is
+	// busy for between one and two slots. Register writes do not stall: a
+	// second write replaces the byte still in the latch. Register reads and
+	// sound-RAM accesses hold the CPU until the DOC port finishes.
 	u8 m_sndglu_ctrl = 0;
 	u16 m_sndglu_addr = 0;
 	int m_sndglu_dummy_read = 0;
+	attotime m_sndglu_busy_until;
+	bool m_sndglu_busy_model = true;
+	bool m_sndglu_pending = false;
+	bool m_sndglu_pend_read = false;
+	bool m_sndglu_pend_ram = false;
+	bool m_sndglu_pend_auto = false;
+	u16 m_sndglu_pend_addr = 0;
+	u8 m_sndglu_pend_data = 0;
+	emu_timer *m_sndglu_timer = nullptr;
+	attotime m_glu_log_at;
+	u32 m_glu_ram = 0;
+	u32 m_glu_land[32][7]{};
+	u32 m_glu_repl[32][7]{};
+	static const char *const s_glu_cls[7];
+	bool sndglu_service();
+	void sndglu_arm(bool is_read, u8 data);
+	void sndglu_commit();
+	void sndglu_stall_until_commit();
+	void sndglu_tally(u16 addr, bool land);
+	void sndglu_log_table();
+	TIMER_CALLBACK_MEMBER(sndglu_commit_cb);
 
 	// Key GLU variables
 	u8 m_glu_regs[12]{}, m_glu_bus = 0;
@@ -796,6 +822,7 @@ void apple2gs_state::machine_start()
 	m_zip_data = std::make_unique<u8[]>(0x10000);
 	m_twgs_data = std::make_unique<u8[]>(0x10000);
 	m_twgs_write_timer = timer_alloc(FUNC(apple2gs_state::twgs_write_complete), this);
+	m_sndglu_timer = timer_alloc(FUNC(apple2gs_state::sndglu_commit_cb), this);
 	twgs_build_firmware();
 	m_twgs_rom = memregion("twgs")->base();
 	memory_region *prof = machine().memory().region_alloc(":zipprof", BTP_SIZE, 1, ENDIANNESS_LITTLE);
@@ -810,6 +837,7 @@ void apple2gs_state::machine_start()
 			osd_printf_info("Cache totals TWGS hits=%llu differences=%llu ZipGS hits=%llu differences=%llu\n",
 				(unsigned long long)m_twdc_hits, (unsigned long long)m_twdc_mismatches,
 				(unsigned long long)m_zip_hits, (unsigned long long)m_zip_mismatches);
+		sndglu_log_table();
 	}));
 	m_maincpu->set_bus_hook(g65816_device::bus_hook_delegate(&apple2gs_state::bt_access, this));
 	m_speaker_state = 0;
@@ -951,6 +979,13 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_sndglu_ctrl));
 	save_item(NAME(m_sndglu_addr));
 	save_item(NAME(m_sndglu_dummy_read));
+	save_item(NAME(m_sndglu_busy_until));
+	save_item(NAME(m_sndglu_pending));
+	save_item(NAME(m_sndglu_pend_read));
+	save_item(NAME(m_sndglu_pend_ram));
+	save_item(NAME(m_sndglu_pend_auto));
+	save_item(NAME(m_sndglu_pend_addr));
+	save_item(NAME(m_sndglu_pend_data));
 	save_item(NAME(m_last_speed));
 	save_item(NAME(m_glu_regs));
 	save_item(NAME(m_glu_bus));
@@ -1190,6 +1225,19 @@ void apple2gs_state::machine_reset()
 	m_sndglu_ctrl = 0;
 	m_sndglu_addr = 0;
 	m_sndglu_dummy_read = 0;
+	m_sndglu_busy_until = attotime::zero;
+	m_sndglu_pending = false;
+	m_sndglu_pend_read = false;
+	m_sndglu_pend_ram = false;
+	m_sndglu_pend_auto = false;
+	m_sndglu_pend_addr = 0;
+	m_sndglu_pend_data = 0;
+	m_sndglu_timer->adjust(attotime::never);
+	m_glu_log_at = attotime::from_seconds(10);
+	m_glu_ram = 0;
+	std::fill(&m_glu_land[0][0], &m_glu_land[0][0] + 32 * 7, 0);
+	std::fill(&m_glu_repl[0][0], &m_glu_repl[0][0] + 32 * 7, 0);
+	m_sndglu_busy_model = ioport("glu_busy")->read() != 0;
 
 	m_b0_0000bank.select(0);
 	m_e0_0000bank.select(0);
@@ -2897,6 +2945,140 @@ void apple2gs_state::lcrom_update()
 }
 
 // most softswitches don't care about read vs write, so handle them here
+const char *const apple2gs_state::s_glu_cls[7] = { "flo", "fhi", "vol", "ptr", "ctl", "siz", "oth" };
+
+bool apple2gs_state::sndglu_service()
+{
+	if (!m_sndglu_busy_model || !m_sndglu_pending)
+		return false;
+	if (machine().side_effects_disabled())
+		return machine().time() < m_sndglu_busy_until;
+	if (machine().time() >= m_sndglu_busy_until)
+	{
+		sndglu_commit();
+		return false;
+	}
+	return true;
+}
+
+void apple2gs_state::sndglu_arm(bool is_read, u8 data)
+{
+	const attotime now = machine().time();
+	const u64 ticks = now.as_ticks(A2GS_7M);
+	// Time to the next free phase, plus three DOC clocks for the strobe.
+	// Missing the phase waits from three clocks to a slot plus three.
+	const u64 commit_tick = (ticks / 8 + 1) * 8 + 3;
+	m_sndglu_pend_read = is_read;
+	m_sndglu_pend_ram = (m_sndglu_ctrl & 0x40) != 0;
+	m_sndglu_pend_auto = (m_sndglu_ctrl & 0x20) != 0;
+	m_sndglu_pend_addr = m_sndglu_addr;
+	m_sndglu_pend_data = data;
+	m_sndglu_busy_until = attotime::from_ticks(commit_tick, A2GS_7M);
+	m_sndglu_pending = true;
+	m_sndglu_timer->adjust(m_sndglu_busy_until - now);
+}
+
+void apple2gs_state::sndglu_tally(u16 addr, bool land)
+{
+	const int osc = addr & 0x1f;
+	int cls;
+	switch ((addr >> 5) & 7)
+	{
+		case 0: cls = 0; break;
+		case 1: cls = 1; break;
+		case 2: cls = 2; break;
+		case 4: cls = 3; break;
+		case 5: cls = 4; break;
+		case 6: cls = 5; break;
+		default: cls = 6; break;
+	}
+	if (land)
+		m_glu_land[osc][cls]++;
+	else
+		m_glu_repl[osc][cls]++;
+}
+
+void apple2gs_state::sndglu_log_table()
+{
+	if (!m_sndglu_busy_model)
+		return;
+	logerror("Sound GLU vca %02x\n", m_sndglu_ctrl & 0x0f);
+	logerror("Sound GLU ram bytes %u\n", m_glu_ram);
+	for (int osc = 0; osc < 32; osc++)
+	{
+		bool any = false;
+		for (int c = 0; c < 7; c++)
+			any = any || m_glu_land[osc][c] || m_glu_repl[osc][c];
+		if (!any)
+			continue;
+		logerror("Sound GLU osc %02d", osc);
+		for (int c = 0; c < 7; c++)
+			logerror(" %s %u/%u", s_glu_cls[c], m_glu_land[osc][c], m_glu_repl[osc][c]);
+		logerror("\n");
+	}
+}
+
+void apple2gs_state::sndglu_commit()
+{
+	if (!m_sndglu_pending)
+		return;
+	m_sndglu_pending = false;
+	m_sndglu_timer->adjust(attotime::never);
+	const u16 addr = m_sndglu_pend_addr;
+	if (m_sndglu_pend_read)
+	{
+		if (m_sndglu_pend_ram)
+			m_sndglu_dummy_read = m_docram[addr];
+		else
+			m_sndglu_dummy_read = m_doc->read(addr);
+	}
+	else if (m_sndglu_pend_ram)
+	{
+		m_docram[addr] = m_sndglu_pend_data;
+		m_glu_ram++;
+	}
+	else
+	{
+		m_doc->write(addr, m_sndglu_pend_data);
+		sndglu_tally(addr, true);
+	}
+	// The pointer increments only if the CPU has not stored a new address
+	// since this transfer was accepted. A store to $C03E/$C03F replaces
+	// the pointer; the completing cycle must not add one to that new value.
+	if (m_sndglu_pend_auto && m_sndglu_addr == addr)
+		m_sndglu_addr = (addr + 1) & 0xffff;
+	if (machine().time() >= m_glu_log_at)
+	{
+		m_glu_log_at += attotime::from_seconds(10);
+		sndglu_log_table();
+	}
+}
+
+void apple2gs_state::sndglu_stall_until_commit()
+{
+	if (!m_sndglu_pending)
+		return;
+	const attotime until = m_sndglu_busy_until;
+	if (machine().time() < until)
+	{
+		u64 cycles = m_maincpu->attotime_to_cycles(until - machine().time());
+		if (cycles < 1)
+			cycles = 1;
+		if (cycles > 100000)
+			cycles = 100000;
+		m_maincpu->adjust_icount(-int(cycles));
+		int guard = 0;
+		while (machine().time() < until && guard++ < 8)
+			m_maincpu->adjust_icount(-1);
+	}
+	sndglu_commit();
+}
+
+TIMER_CALLBACK_MEMBER(apple2gs_state::sndglu_commit_cb)
+{
+	sndglu_commit();
+}
+
 void apple2gs_state::do_io(int offset)
 {
 	if(machine().side_effects_disabled()) return;
@@ -3282,26 +3464,34 @@ u8 apple2gs_state::c000_r(offs_t offset)
 			return m_a2bus->dma_bank();
 
 		case 0x3c:  // SOUNDCTL
-			return m_sndglu_ctrl | 0x1f; // "write only" bits read as 1
+			// Bit 7 is the DOC port. Bit 4 is reserved and reads as 1. Bits 3-0
+			// are the VCA, returned as stored (not forced on).
+			if (!machine().side_effects_disabled())
+				sndglu_service();
+			return (m_sndglu_ctrl & 0x7f) | 0x10 | ((m_sndglu_pending && machine().time() < m_sndglu_busy_until) ? 0x80 : 0x00);
 
 		case 0x3d:  // SOUNDDATA
-			ret = m_sndglu_dummy_read;
-			if (!machine().side_effects_disabled())
+			if (machine().side_effects_disabled())
+				return m_sndglu_dummy_read;
+			if (!m_sndglu_busy_model)
 			{
-				if (m_sndglu_ctrl & 0x40)    // docram access
-				{
+				ret = m_sndglu_dummy_read;
+				if (m_sndglu_ctrl & 0x40)
 					m_sndglu_dummy_read = m_docram[m_sndglu_addr];
-				}
 				else
-				{
 					m_sndglu_dummy_read = m_doc->read(m_sndglu_addr);
-				}
-
-				if (m_sndglu_ctrl & 0x20)    // auto-increment
-				{
+				if (m_sndglu_ctrl & 0x20)
 					m_sndglu_addr++;
-				}
+				return ret;
 			}
+			// Finish anything still in the latch, then post this read. The
+			// byte returned is the previous latch; the new byte is ready
+			// before the next instruction (the CPU is held for the DOC cycle).
+			if (sndglu_service())
+				sndglu_stall_until_commit();
+			ret = m_sndglu_dummy_read;
+			sndglu_arm(true, 0);
+			sndglu_stall_until_commit();
 			return ret;
 
 		case 0x3e:  // SOUNDADRL
@@ -3646,7 +3836,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 			break;
 
 		case 0x3c:  // SOUNDCTL
-			m_sndglu_ctrl = data & 0x7f; // make sure DOC is never busy
+			m_sndglu_ctrl = data & 0x7f; // bit 7 (busy) is read-only
 			if (!(m_sndglu_ctrl & 0x40)) // clear hi byte of address pointer on DOC access
 			{
 				m_sndglu_addr &= 0xff;
@@ -3654,19 +3844,39 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 			break;
 
 		case 0x3d:  // SOUNDDATA
-			if (m_sndglu_ctrl & 0x40)    // docram access
+			if (!m_sndglu_busy_model)
 			{
-				m_docram[m_sndglu_addr] = data;
+				if (m_sndglu_ctrl & 0x40)
+					m_docram[m_sndglu_addr] = data;
+				else
+					m_doc->write(m_sndglu_addr, data);
+				if (m_sndglu_ctrl & 0x20)
+					m_sndglu_addr++;
+				break;
 			}
-			else
+			if (m_sndglu_ctrl & 0x40)
 			{
-				m_doc->write(m_sndglu_addr, data);
+				// Sound RAM is not dropped (the production GLU keeps every byte).
+				// Hold the CPU until the DOC RAM port takes this byte.
+				if (sndglu_service())
+					sndglu_stall_until_commit();
+				sndglu_arm(false, data);
+				sndglu_stall_until_commit();
+				break;
 			}
-
-			if (m_sndglu_ctrl & 0x20)    // auto-increment
+			if (sndglu_service())
 			{
-				m_sndglu_addr++;
+				// Register write while the latch is still waiting for the DOC phase.
+				logerror("Sound GLU busy: write %02x to %04x dropped\n", m_sndglu_pend_data, m_sndglu_pend_addr);
+				sndglu_tally(m_sndglu_pend_addr, false);
+				m_sndglu_pend_read = false;
+				m_sndglu_pend_ram = false;
+				m_sndglu_pend_auto = (m_sndglu_ctrl & 0x20) != 0;
+				m_sndglu_pend_addr = m_sndglu_addr;
+				m_sndglu_pend_data = data;
+				break;
 			}
+			sndglu_arm(false, data);
 			break;
 
 		case 0x3e:  // SOUNDADRL
@@ -5351,6 +5561,11 @@ INPUT_PORTS_START( apple2gs )
 	PORT_CONFNAME(0x01, 0x00, "TransWarp GS real ROM (partial)")
 	PORT_CONFSETTING(0x00, DEF_STR( Off ))
 	PORT_CONFSETTING(0x01, DEF_STR( On ))
+
+	PORT_START("glu_busy")
+	PORT_CONFNAME(0x01, 0x01, "Sound GLU busy flag")
+	PORT_CONFSETTING(0x00, "Off (never busy)")
+	PORT_CONFSETTING(0x01, "On (DOC phase latch)")
 
 	PORT_START("ram_start")
 	PORT_CONFNAME(0x07, 0x05, "Power-on RAM contents")
