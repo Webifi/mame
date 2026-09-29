@@ -168,7 +168,8 @@ public:
 		  m_doc(*this, "doc"),
 		  m_iwm(*this, "fdc"),
 		  m_floppy(*this, "fdc:%d", 0U),
-		  m_sysconfig(*this, "a2_config")
+		  m_sysconfig(*this, "a2_config"),
+		  m_btconfig(*this, "bus_timing")
 
 	{
 		m_cur_floppy = nullptr;
@@ -213,6 +214,7 @@ private:
 	required_device<applefdintf_device> m_iwm;
 	required_device_array<floppy_connector, 4> m_floppy;
 	required_ioport m_sysconfig;
+	required_ioport m_btconfig;
 
 	static constexpr int CNXX_UNCLAIMED = -1;
 
@@ -496,6 +498,7 @@ private:
 	void raise_irq(int irq);
 	void lower_irq(int irq);
 	void update_speed();
+	TIMER_CALLBACK_MEMBER(apply_speed);
 	int get_vpos();
 	void process_clock();
 	void clear_vgcint(u8 data);
@@ -509,12 +512,90 @@ private:
 	int m_accel_stage = 0;
 	u32 m_accel_speed = 0;
 	u8 m_accel_slotspk = 0, m_accel_gsxsettings = 0, m_accel_percent = 0;
+
+	// TransWarp GS: the accelerator of the CPU type setting when the
+	// "Accelerator" setting is TransWarp GS
+	bool m_twgs = false, m_twgs_sel = false, m_twgs_irq_at_reset = true;
+	u8 m_twgs_config = 0;       // $BC0000: bit 1 data cache on, bit 2 TransWarp on, bit 3 IRQ slowdown off
+	u16 m_twgs_arg = 0, m_twgs_result = 0;
+	u8 m_twgs_fw[0x200];        // $BC/FE00-FFFF: the firmware interface
+	void twgs_build_firmware();
+	void twgs_reset_config();
+	void twgs_set_config(u8 data);
+	void twgs_speed_index(int index);
+	int twgs_cur_index();
+	u16 twgs_index_freq(int index);
+	int twgs_freq_index(u16 khz);
+	u8 twgs_r(offs_t offset);
+	void twgs_w(offs_t offset, u8 data);
+	void floatingbank_w(offs_t offset, u8 data);
 	memory_passthrough_handler m_accel_tap;
 
 	void accel_reset();
 	void accel_temp_delay(int ms, bool condition);
 	void accel_stop_delay();
 	void accel_slot(int slot);
+
+	// Bus timing model: the FPI fast cycle with DRAM refresh, the Mega II
+	// 1 MHz sync, and the ZipGS cache. Time is in units of 1/1056 of a 14M
+	// clock, so the fast, Mega II and ZipGS cycles are all whole numbers.
+	static constexpr u64 BT_CLK = 1056;
+	static constexpr u64 BT_PER_SEC = 15'120'000'000; // 14.318181 MHz * 1056
+	static constexpr u64 BT_FAST = 5 * BT_CLK;
+	static constexpr u64 BT_REFRESH_PERIOD = 50 * BT_CLK;
+	static constexpr u64 BT_REFRESH = 5 * BT_CLK;
+	static constexpr u64 BT_MEGA = 14 * BT_CLK;
+	static constexpr u64 BT_MEGA_LAST = 16 * BT_CLK;
+	static constexpr u64 BT_LINE = 912 * BT_CLK;
+	static constexpr u64 BT_IDLE = 64; // more cycles than one instruction: the CPU waited (WAI)
+	static constexpr u64 BT_PAGE_UNIT = 66; // per-page stall counters are in 1/16 of a 14M clock
+	enum { BT_OFF = 0, BT_STOCK, BT_ZIP, BT_TWGS };
+	enum { BC_RAM = 0, BC_ROM, BC_FASTIO, BC_MEGA };
+
+	// profile region ":zipprof", read by Lua
+	static constexpr u32 BTP_COUNT = 0x20;     // u64 counters
+	static constexpr u32 BTP_PAGES = 0x100;    // 65536 data pages x u64 reads, bus reads, writes, stall
+	// code: 16-byte blocks in banks $00-$05, then 256-byte pages; u64 stall, bus reads, time
+	static constexpr u32 BTP_PCS = 0x200100;
+	static constexpr u32 BTP_PC_ENTRIES = 0x6000 + 0x10000;
+	static constexpr u32 BTP_SIZE = BTP_PCS + BTP_PC_ENTRIES * 24;
+	enum { BTC_INSTR = 0, BTC_READS, BTC_HITS, BTC_MISSES, BTC_UNCACHED, BTC_WRITES, BTC_MEGA, BTC_FAST,
+		BTC_STALL_READ, BTC_STALL_WRITE, BTC_STALL_INTERNAL, BTC_REFRESH, BTC_TIME,
+		BTC_MISS_OPCODE, BTC_MISS_OPERAND, BTC_MISS_DATA, BTC_WBUF_FULL, BTC_COUNT };
+
+	int m_bt_mode = BT_OFF;
+	bool m_bt_enabled = false, m_bt_resync = true, m_bt_slow = false;
+	u64 m_bt_cycle = BT_FAST;
+	u64 m_bt_istart = 0, m_bt_istall = 0, m_bt_frac = 0, m_bt_cprev = 0;
+	u64 m_bt_charged = 0, m_bt_idx = 0;
+	u32 m_bt_ipc = 0;       // the code block of the instruction (BTP_PCS entry)
+	u64 m_bt_fanchor = 0, m_bt_busfree = 0;
+	u64 m_bt_wbuf[4] = { 0, 0, 0, 0 };
+	int m_bt_wcount = 0, m_bt_wdepth = 1;
+	u64 m_bt_overhead = 0;
+	std::unique_ptr<u32[]> m_zip_tag;
+	u32 m_zip_mask = 0x3fff;
+	u8 m_zip_size = 1;
+	bool m_zip_auxtag = false;   // aux-mapped bank $00/$E0 accesses get an aux tag of their own (else the tag of bank $01/$E1)
+	bool m_zip_bank_ok[256];
+	u32 m_twgs_mask = 0x1fff;
+	int m_twgs_depth = 4;
+	bool m_bt_twslow = false;    // this instruction runs at the GS speed (TransWarp GS IRQ slowdown)
+	u32 m_bt_repsep = 1;         // REP and SEP: this many of their cycles run at the motherboard speed
+	u64 m_twgs_wextra = 0;       // extra bus time of each TransWarp GS write to the motherboard
+	u8 *m_btprof = nullptr;
+	u64 *m_btc = nullptr;
+	u64 *m_btpage = nullptr, *m_btpc = nullptr;
+
+	int bt_access(u32 address, int type);
+	u64 bt_instruction(u32 pc);
+	u64 bt_fast(u64 t, bool refresh);
+	u64 bt_mega(u64 t);
+	u64 bt_bus(u64 t, int cls);
+	bool bt_aux(u32 a16, bool write);
+	void bt_config();
+	void bt_setup(u32 speed);
+	void bt_control();
 };
 
 // FF6ACF is speed test routine in ROM 3
@@ -523,7 +604,12 @@ private:
 // 1 MHz is 14M / 14.  14/5 = 2.8 * 65536 (16.16 fixed point) = 0x2cccd.
 #define slow_cycle() \
 {   \
-	if (m_last_speed && !machine().side_effects_disabled()) \
+	if (m_bt_mode != BT_OFF) \
+	{\
+		if (!machine().side_effects_disabled()) \
+			m_bt_slow = true; \
+	}\
+	else if (m_last_speed && !machine().side_effects_disabled()) \
 	{\
 		m_slow_counter += 0x0002cccd; \
 		int cycles = (m_slow_counter >> 16) & 0xffff; \
@@ -641,6 +727,16 @@ void apple2gs_state::machine_start()
 {
 	m_ram_ptr = m_ram->pointer();
 	m_ram_size = m_ram->size();
+
+	m_zip_tag = std::make_unique<u32[]>(0x10000);
+	twgs_build_firmware();
+	memory_region *prof = machine().memory().region_alloc(":zipprof", BTP_SIZE, 1, ENDIANNESS_LITTLE);
+	m_btprof = prof->base();
+	std::fill_n(m_btprof, BTP_SIZE, 0);
+	m_btc = reinterpret_cast<u64 *>(m_btprof + BTP_COUNT);
+	m_btpage = reinterpret_cast<u64 *>(m_btprof + BTP_PAGES);
+	m_btpc = reinterpret_cast<u64 *>(m_btprof + BTP_PCS);
+	m_maincpu->set_bus_hook(g65816_device::bus_hook_delegate(&apple2gs_state::bt_access, this));
 	m_speaker_state = 0;
 	m_speaker->level_w(m_speaker_state);
 	m_upperbank.select(0);
@@ -809,6 +905,42 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_accel_warm_boot));
 	save_item(NAME(m_accel_speed));
 	save_item(NAME(m_motoroff_time));
+
+	// the bus timing model: a run resumed from a state has the same cache, write buffer, time
+	// base and counters as the run that saved it
+	save_item(NAME(m_bt_mode));
+	save_item(NAME(m_bt_enabled));
+	save_item(NAME(m_bt_resync));
+	save_item(NAME(m_bt_slow));
+	save_item(NAME(m_bt_cycle));
+	save_item(NAME(m_bt_istart));
+	save_item(NAME(m_bt_istall));
+	save_item(NAME(m_bt_frac));
+	save_item(NAME(m_bt_cprev));
+	save_item(NAME(m_bt_charged));
+	save_item(NAME(m_bt_idx));
+	save_item(NAME(m_bt_ipc));
+	save_item(NAME(m_bt_fanchor));
+	save_item(NAME(m_bt_busfree));
+	save_item(NAME(m_bt_wbuf));
+	save_item(NAME(m_bt_wcount));
+	save_item(NAME(m_bt_wdepth));
+	save_item(NAME(m_bt_overhead));
+	save_item(NAME(m_bt_twslow));
+	save_item(NAME(m_zip_mask));
+	save_item(NAME(m_zip_size));
+	save_item(NAME(m_zip_auxtag));
+	save_item(NAME(m_zip_bank_ok));
+	save_item(NAME(m_twgs_mask));
+	save_item(NAME(m_twgs_depth));
+	save_item(NAME(m_twgs));
+	save_item(NAME(m_twgs_sel));
+	save_item(NAME(m_twgs_irq_at_reset));
+	save_item(NAME(m_twgs_config));
+	save_item(NAME(m_twgs_arg));
+	save_item(NAME(m_twgs_result));
+	save_pointer(NAME(m_zip_tag), 0x10000);
+	save_pointer(NAME(m_btprof), BTP_SIZE);
 }
 
 void apple2gs_state::machine_reset()
@@ -854,6 +986,8 @@ void apple2gs_state::machine_reset()
 	// always assert full speed on reset
 	m_maincpu->set_unscaled_clock(A2GS_2_8M);
 	m_last_speed = true;
+	bt_config();
+	bt_setup(A2GS_2_8M.value());
 
 	m_sndglu_ctrl = 0;
 	m_sndglu_addr = 0;
@@ -906,7 +1040,23 @@ void apple2gs_state::machine_reset()
 		m_accel_present = true;
 		int idxSpeed = (m_sysconfig->read() >> 1);
 		m_accel_speed = speeds[idxSpeed];
+		// the clocks of upgraded cards (oscillator / 4)
+		static const u32 clocks[8] = { 0, 12500000, 13750000, 14000000, 15000000, 10000000, 0, 0 };
+		const u32 clock = clocks[(m_btconfig->read() >> 16) & 7];
+		if (clock)
+			m_accel_speed = clock;
 		accel_reset();
+	}
+
+	// TransWarp GS: the same speeds, no Zip registers and no Zip delays
+	m_twgs = m_accel_present && m_twgs_sel;
+	if (m_twgs)
+	{
+		m_accel_unlocked = false;
+		m_accel_gsxsettings = 0;
+		m_accel_slotspk = 0;
+		m_accel_percent = 0;
+		twgs_reset_config();
 	}
 }
 
@@ -949,19 +1099,32 @@ void apple2gs_state::update_speed()
 	const bool isfast = (m_speed & SPEED_HIGH) && !(m_speed & m_motors_active);
 	const bool noaccel = !m_accel_fast || m_accel_temp_slowdown;
 	u32 new_speed = m_accel_speed;
-	m_last_speed = true;
 
 	if (isfast && noaccel)
 	{
 		new_speed = A2GS_2_8M.value();
 	}
-	else if (!isfast && (noaccel || BIT(m_accel_gsxsettings, 3)))
+	else if (!isfast && (noaccel || BIT(m_accel_gsxsettings, 3) || m_twgs))
 	{
 		new_speed = A2GS_1M.value();
-		m_last_speed = false;
 	}
 
+	// Account for the current slice at its original clock before changing domains.
+	if (m_maincpu->executing() && (new_speed != m_maincpu->unscaled_clock()))
+	{
+		machine().scheduler().synchronize(timer_expired_delegate(FUNC(apple2gs_state::apply_speed), this));
+		return;
+	}
+
+	m_last_speed = (new_speed != A2GS_1M.value());
 	m_maincpu->set_unscaled_clock(new_speed, !m_last_speed); // re-align with PH0
+	bt_setup(new_speed);
+}
+
+TIMER_CALLBACK_MEMBER(apple2gs_state::apply_speed)
+{
+	// A later access in the same instruction may have changed the requested speed.
+	update_speed();
 }
 
 void apple2gs_state::accel_reset()
@@ -1011,9 +1174,674 @@ TIMER_DEVICE_CALLBACK_MEMBER(apple2gs_state::accel_timer)
 	accel_stop_delay();
 }
 
+// ---------------------------------------------------------------------------
+// TransWarp GS firmware interface (Applied Engineering, TransWarp GS
+// Programmer's Reference, Appendix B): "TWGS" at $BC/FF00 and a jump table
+// of JSL calls from $BC/FF08. This is not the AE ROM: each call is a short
+// routine at $BC/FE00 that uses the registers at $BC/FD00 below. The
+// configuration register at $BC/0000 is the card's (TWGS ROM 1.8s
+// disassembly, D. Brock et al.): bit 1 data cache on, bit 2 TransWarp on,
+// bit 3 IRQ slowdown off. Speed index 0 is the GS slow speed, 1 the GS fast
+// speed with the TransWarp off, 2 the TransWarp speed (the ROM's three).
+// ---------------------------------------------------------------------------
+
+void apple2gs_state::twgs_build_firmware()
+{
+	std::fill_n(m_twgs_fw, 0x200, 0);
+	static const u8 id[8] = { 'T', 'W', 'G', 'S', 'S', 'M', 'J', 'S' };
+	std::copy_n(id, 8, m_twgs_fw + 0x100);
+
+	// 65816 code, native mode: LDA/STA long to a $BC/FDxx register
+	enum { LDA, STA, TAX, TXA, RTL };
+	struct op { int code; u8 reg; };
+	static const std::vector<std::vector<op>> calls = {
+		{ { LDA, 0x02 }, { TAX, 0 }, { LDA, 0x00 }, { RTL, 0 } },   // $FF08 GetTWInfo
+		{ { STA, 0x20 }, { RTL, 0 } },                              // $FF0C ResetTW
+		{ { LDA, 0x04 }, { RTL, 0 } },                              // $FF10 GetMaxSpeed
+		{ { LDA, 0x06 }, { TAX, 0 }, { RTL, 0 } },                  // $FF14 GetNumISpeed
+		{ { STA, 0x10 }, { LDA, 0x10 }, { TAX, 0 }, { RTL, 0 } },   // $FF18 Freq2Index
+		{ { TXA, 0 }, { STA, 0x12 }, { LDA, 0x12 }, { RTL, 0 } },   // $FF1C Index2Freq
+		{ { LDA, 0x08 }, { RTL, 0 } },                              // $FF20 GetCurSpeed
+		{ { STA, 0x14 }, { LDA, 0x14 }, { RTL, 0 } },               // $FF24 SetCurSpeed
+		{ { LDA, 0x0a }, { TAX, 0 }, { RTL, 0 } },                  // $FF28 GetCurISpeed
+		{ { TXA, 0 }, { STA, 0x16 }, { RTL, 0 } },                  // $FF2C SetCurISpeed
+		{ { STA, 0x18 }, { RTL, 0 } },                              // $FF30 FlushCache
+		{ { STA, 0x1a }, { RTL, 0 } },                              // $FF34 DisableIRQLogic
+		{ { STA, 0x1c }, { RTL, 0 } },                              // $FF38 EnableIRQLogic
+		{ { LDA, 0x0e }, { RTL, 0 } },                              // $FF3C GetTWConfig
+		{ { STA, 0x1e }, { RTL, 0 } },                              // $FF40 SetTWConfig
+		{ { LDA, 0x0c }, { RTL, 0 } },                              // $FF44 GetCacheSize
+		{ { STA, 0x22 }, { RTL, 0 } },                              // $FF48 EnableDataCache
+		{ { STA, 0x24 }, { RTL, 0 } } };                            // $FF4C DisableDataCache
+	u32 pc = 0;
+	for (int i = 0; i < int(calls.size()); i++)
+	{
+		const u32 entry = 0x108 + i * 4;
+		m_twgs_fw[entry] = 0x5c; // JML $BCFExx
+		m_twgs_fw[entry + 1] = pc & 0xff;
+		m_twgs_fw[entry + 2] = 0xfe;
+		m_twgs_fw[entry + 3] = 0xbc;
+		for (const op &o : calls[i])
+		{
+			switch (o.code)
+			{
+				case LDA: case STA:
+					m_twgs_fw[pc++] = (o.code == LDA) ? 0xaf : 0x8f;
+					m_twgs_fw[pc++] = o.reg;
+					m_twgs_fw[pc++] = 0xfd;
+					m_twgs_fw[pc++] = 0xbc;
+					break;
+				case TAX: m_twgs_fw[pc++] = 0xaa; break;
+				case TXA: m_twgs_fw[pc++] = 0x8a; break;
+				case RTL: m_twgs_fw[pc++] = 0x6b; break;
+			}
+		}
+	}
+}
+
+// ResetTW: the settings of the TWGS control panel (here: the machine configuration)
+void apple2gs_state::twgs_reset_config()
+{
+	twgs_set_config(0x06 | (m_twgs_irq_at_reset ? 0x00 : 0x08));
+}
+
+void apple2gs_state::twgs_set_config(u8 data)
+{
+	m_twgs_config = data & 0x0e;
+	m_accel_fast = BIT(m_twgs_config, 2);
+	update_speed();
+}
+
+void apple2gs_state::twgs_speed_index(int index)
+{
+	m_speed = (index == 0) ? (m_speed & ~SPEED_HIGH) : (m_speed | SPEED_HIGH);
+	twgs_set_config((index == 2) ? (m_twgs_config | 0x04) : (m_twgs_config & ~0x04));
+}
+
+int apple2gs_state::twgs_cur_index()
+{
+	if (!(m_speed & SPEED_HIGH))
+		return 0;
+	return BIT(m_twgs_config, 2) ? 2 : 1;
+}
+
+u16 apple2gs_state::twgs_index_freq(int index)
+{
+	switch (index)
+	{
+		case 0: return 1024;
+		case 1: return 2600;
+		case 2: return m_accel_speed / 1000;
+		default: return 0;
+	}
+}
+
+int apple2gs_state::twgs_freq_index(u16 khz)
+{
+	for (int i = 0; i < 3; i++)
+		if (twgs_index_freq(i) >= khz)
+			return i;
+	return 2;
+}
+
+u8 apple2gs_state::twgs_r(offs_t offset)
+{
+	if (offset == 0x0000)
+		return m_twgs_config;
+	if (offset >= 0xfe00)
+		return m_twgs_fw[offset - 0xfe00];
+	if ((offset & 0xff00) == 0xfd00)
+	{
+		u16 v = 0;
+		switch (offset & 0xfe)
+		{
+			case 0x00: v = 0x0000; break;                                  // features: no hardware flush, fixed clock
+			case 0x02: v = 0x0108; break;                                  // version 1.8
+			case 0x04: v = twgs_index_freq(2); break;                      // the maximum speed, KHz
+			case 0x06: v = 3; break;                                       // number of speeds
+			case 0x08: v = twgs_index_freq(twgs_cur_index()); break;       // the current speed, KHz
+			case 0x0a: v = twgs_cur_index(); break;
+			case 0x0c: v = (m_twgs_mask + 1) >> 10; break;                 // cache size, KB
+			case 0x0e: v = m_twgs_config; break;
+			case 0x10: case 0x12: case 0x14: v = m_twgs_result; break;
+		}
+		return BIT(offset, 0) ? (v >> 8) : (v & 0xff);
+	}
+	return 0x00;
+}
+
+void apple2gs_state::twgs_w(offs_t offset, u8 data)
+{
+	if (offset == 0x0000)
+	{
+		twgs_set_config(data);
+		return;
+	}
+	if ((offset & 0xff00) != 0xfd00)
+		return;
+	if (!BIT(offset, 0))
+	{
+		m_twgs_arg = data;
+		return;
+	}
+	// the high byte of a 16-bit store: the call
+	const u16 arg = m_twgs_arg | (u16(data) << 8);
+	switch (offset & 0xfe)
+	{
+		case 0x10: m_twgs_result = twgs_freq_index(arg); break;
+		case 0x12: m_twgs_result = twgs_index_freq(arg); break;
+		case 0x14:
+		{
+			const int index = twgs_freq_index(arg);
+			twgs_speed_index(index);
+			m_twgs_result = twgs_index_freq(index);
+			break;
+		}
+		case 0x16: if (arg < 3) twgs_speed_index(arg); break;
+		case 0x18: std::fill_n(m_zip_tag.get(), 0x10000, 0); break;
+		case 0x1a: twgs_set_config(m_twgs_config | 0x08); break;
+		case 0x1c: twgs_set_config(m_twgs_config & ~0x08); break;
+		case 0x1e: twgs_set_config((arg & ~0x02) | (m_twgs_config & 0x02)); break; // keeps the data cache bit
+		case 0x20: twgs_reset_config(); break;
+		case 0x22: twgs_set_config(m_twgs_config | 0x02); break;
+		case 0x24: twgs_set_config(m_twgs_config & ~0x02); break;
+	}
+}
+
 /***************************************************************************
     VIDEO
 ***************************************************************************/
+
+// ---------------------------------------------------------------------------
+// Bus timing model
+//
+// IIgs (header of this file, IIgs Hardware Reference): a fast cycle is 5 14M
+// clocks; DRAM refresh takes 5 clocks of every 50 and delays fast RAM, not ROM
+// or I/O; a Mega II (1 MHz) access waits for the next Mega II cycle, 14 clocks,
+// with every 65th cycle 16 clocks (912 clocks a line).
+//
+// ZipGS (patent US 4,794,523; ZipGSX manual; D. Empson, comp.sys.apple2):
+// direct mapped, one tag per data byte (1-byte lines, no read-ahead); a read
+// miss runs one motherboard cycle and fills that byte; writes go through a
+// write buffer to the motherboard and also write the cache; the tag is the
+// memory used (aux mapping and language card state); I/O is never
+// cached; a 16 KB cache caches fast RAM banks $00-$2F, $E0, $E1 and $FC-$FF
+// (measured). The model changes timing only: data always comes from MAME.
+//
+// TransWarp GS (AE manual and Programmer's Reference; G. Body schematic,
+// 2016; ROM 1.8s disassembly): direct mapped, 8 or 32 KB, a 16-bit tag for
+// each data byte (1-byte lines); all memory is cached except I/O
+// $C000-$CFFF; a store also fills the cache (the ROM's cache size test reads
+// back stores to bank $BF); stores go to the GS through 4 latched byte
+// writes (schematic: 4 sets of address, bank and data latches); with the
+// data cache off, data reads miss and code fetches still hit; while the CPU
+// has interrupts off and the IRQ logic is on, the card runs at the GS speed.
+// ---------------------------------------------------------------------------
+
+void apple2gs_state::bt_config()
+{
+	const ioport_value cfg = m_btconfig->read();
+	m_bt_enabled = BIT(cfg, 0);
+	m_zip_size = (cfg >> 1) & 3;
+	m_zip_mask = (0x2000 << m_zip_size) - 1;
+	std::fill_n(m_zip_tag.get(), 0x10000, 0);
+
+	static const u32 fastbanks[4] = { 0x10, 0x30, 0x70, 0x80 };
+	u32 limit = fastbanks[m_zip_size];
+	if (((cfg >> 3) & 3) == 1)
+		limit = 0x20;
+	else if (((cfg >> 3) & 3) == 2)
+		limit = 0x80;
+	for (int bank = 0; bank < 256; bank++)
+		m_zip_bank_ok[bank] = (bank < limit) || (bank == 0xe0) || (bank == 0xe1) || (bank >= 0xfc);
+
+	m_bt_overhead = (cfg >> 5) & 3;
+	m_zip_auxtag = BIT(cfg, 9);
+	m_twgs_sel = BIT(cfg, 10);
+	m_twgs_mask = BIT(cfg, 11) ? 0x7fff : 0x1fff;
+	m_twgs_irq_at_reset = !BIT(cfg, 12);
+	m_twgs_depth = BIT(cfg, 13) ? 3 : 4;
+	m_bt_repsep = (cfg >> 25) & 3;
+	m_twgs_wextra = ((cfg >> 28) & 7) * BT_CLK;
+	static const int depths[4] = { 1, 2, 4, 0 };
+	m_bt_wdepth = depths[(cfg >> 7) & 3];
+	m_bt_wcount = 0;
+	m_bt_busfree = 0;
+	m_bt_fanchor = 0;
+}
+
+void apple2gs_state::bt_setup(u32 speed)
+{
+	int mode = BT_OFF;
+	if (m_bt_enabled && m_last_speed)
+		mode = (speed == A2GS_2_8M.value()) ? BT_STOCK : (m_twgs ? BT_TWGS : BT_ZIP);
+	m_bt_mode = mode;
+	m_bt_cycle = ((mode == BT_ZIP) || (mode == BT_TWGS)) ? (BT_PER_SEC / speed) : BT_FAST;
+	m_bt_twslow = false;
+	m_bt_resync = true;
+	m_bt_slow = false;
+	m_bt_wcount = 0;
+}
+
+void apple2gs_state::bt_control()
+{
+	u32 *const header = reinterpret_cast<u32 *>(m_btprof);
+	if (header[4] == 1)
+	{
+		std::fill(m_btprof + BTP_COUNT, m_btprof + BTP_SIZE, 0);
+		header[4] = 0;
+	}
+	header[0] = 0x4353475a; // "ZGSC"
+	header[1] = 4;
+	header[2] = m_bt_mode;
+	header[3] = (m_bt_mode == BT_ZIP) ? (m_zip_mask + 1) : (m_bt_mode == BT_TWGS) ? (m_twgs_mask + 1) : 0;
+	header[5] = u32(m_bt_cycle);
+	header[6] = u32(BT_CLK);
+	header[7] = ((m_bt_mode == BT_TWGS) ? m_twgs_depth : m_bt_wdepth) | (u32(m_bt_overhead) << 8);
+}
+
+u64 apple2gs_state::bt_fast(u64 t, bool refresh)
+{
+	u64 b = (t <= m_bt_fanchor) ? m_bt_fanchor : m_bt_fanchor + ((t - m_bt_fanchor + BT_FAST - 1) / BT_FAST) * BT_FAST;
+	if (refresh)
+	{
+		const u64 r = (b / BT_REFRESH_PERIOD) * BT_REFRESH_PERIOD;
+		u64 wait = 0;
+		if (b < r + BT_REFRESH)
+			wait = r + BT_REFRESH;
+		else if (b + BT_FAST > r + BT_REFRESH_PERIOD)
+			wait = r + BT_REFRESH_PERIOD + BT_REFRESH;
+		if (wait)
+		{
+			m_btc[BTC_REFRESH]++;
+			b = wait;
+			m_bt_fanchor = b;
+		}
+	}
+	m_btc[BTC_FAST]++;
+	return b + BT_FAST;
+}
+
+u64 apple2gs_state::bt_mega(u64 t)
+{
+	const u64 line = (t / BT_LINE) * BT_LINE;
+	const u64 pos = t - line;
+	u64 b, len;
+	if (pos <= 64 * BT_MEGA)
+	{
+		const u64 k = (pos + BT_MEGA - 1) / BT_MEGA;
+		b = line + k * BT_MEGA;
+		len = (k == 64) ? BT_MEGA_LAST : BT_MEGA;
+	}
+	else
+	{
+		b = line + BT_LINE;
+		len = BT_MEGA;
+	}
+	m_btc[BTC_MEGA]++;
+	m_bt_fanchor = b + len;
+	return b + len;
+}
+
+// does this bank $00/$E0 access go to the aux bank ($01/$E1)? The rules of auxbank_update()
+bool apple2gs_state::bt_aux(u32 a16, bool write)
+{
+	if (a16 < 0x0200)
+		return m_altzp;
+	if (a16 >= 0xc000)
+		return (a16 >= 0xd000) && m_altzp;
+	if (m_video->get_80store())
+	{
+		if ((a16 >= 0x0400) && (a16 < 0x0800))
+			return m_video->get_page2();
+		if ((a16 >= 0x2000) && (a16 < 0x4000) && m_video->get_hires())
+			return m_video->get_page2();
+	}
+	return write ? m_ramwrt : m_ramrd;
+}
+
+u64 apple2gs_state::bt_bus(u64 t, int cls)
+{
+	switch (cls)
+	{
+		case BC_MEGA: return bt_mega(t);
+		case BC_RAM: return bt_fast(t, true);
+		default: return bt_fast(t, false);
+	}
+}
+
+u64 apple2gs_state::bt_instruction(u32 pc)
+{
+	u64 charge = 0;
+	const u64 now = m_maincpu->total_cycles();
+	if (m_bt_resync)
+	{
+		m_bt_resync = false;
+		m_bt_istart = u64(m_maincpu->local_time().as_double() * double(BT_PER_SEC));
+		m_bt_frac = 0;
+	}
+	else
+	{
+		// the cycles of the last instruction, as the CPU core counts them
+		const u64 base = now - m_bt_cprev - m_bt_charged;
+		if ((m_bt_mode == BT_STOCK) && (base <= BT_IDLE))
+		{
+			// its internal cycles are also bus cycles at 2.8 MHz (refresh)
+			while (m_bt_idx < base)
+			{
+				const u64 t = m_bt_istart + m_bt_idx * BT_FAST + m_bt_istall;
+				const u64 stall = bt_fast(t, true) - t - BT_FAST;
+				m_bt_istall += stall;
+				charge += stall;
+				m_bt_idx++;
+			}
+			if (charge)
+			{
+				m_btc[BTC_STALL_INTERNAL] += charge;
+				m_btpc[m_bt_ipc * 3] += charge / BT_PAGE_UNIT;
+			}
+		}
+		else if (m_bt_twslow && (base <= BT_IDLE))
+		{
+			// TransWarp GS IRQ slowdown: its internal cycles are GS fast cycles too
+			while (m_bt_idx < base)
+			{
+				const u64 t = m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
+				const u64 stall = bt_fast(t, true) - t - m_bt_cycle;
+				m_bt_istall += stall;
+				charge += stall;
+				m_bt_idx++;
+			}
+			if (charge)
+			{
+				m_btc[BTC_STALL_INTERNAL] += charge;
+				m_btpc[m_bt_ipc * 3] += charge / BT_PAGE_UNIT;
+			}
+		}
+		const u64 duration = base * m_bt_cycle + m_bt_istall;
+		m_bt_istart += duration;
+		m_btc[BTC_TIME] += duration;
+		m_btpc[m_bt_ipc * 3 + 2] += duration / BT_PAGE_UNIT;
+	}
+	m_btc[BTC_INSTR]++;
+	m_bt_cprev = now;
+	m_bt_charged = 0;
+	m_bt_idx = 0;
+	m_bt_istall = 0;
+	m_bt_ipc = (pc < 0x060000) ? (pc >> 4) : (0x6000 + (pc >> 8));
+	if (m_bt_mode == BT_TWGS)
+		m_bt_twslow = !BIT(m_twgs_config, 3) && m_maincpu->irq_masked();
+	return charge;
+}
+
+int apple2gs_state::bt_access(u32 address, int type)
+{
+	const bool slow = m_bt_slow;
+	m_bt_slow = false;
+	if (m_bt_mode == BT_OFF)
+		return 0;
+
+	u64 charge = 0;
+	if (type == g65816_device::BUS_OPCODE)
+	{
+		charge = bt_instruction(address);
+		if (m_bt_repsep && ((m_bt_mode == BT_ZIP) || (m_bt_mode == BT_TWGS)))
+		{
+			auto dis = machine().disable_side_effects();
+			const u8 op = m_maincpu->space(AS_PROGRAM).read_byte(address);
+			if ((op == 0xc2) || (op == 0xe2))
+			{
+				// REP and SEP: N of the instruction's cycles run at the motherboard speed (fast
+				// cycles with refresh) in place of N card cycles, then the card clock again
+				const u64 t0 = m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
+				u64 end = std::max(t0, m_bt_busfree);
+				for (u32 i = 0; i < m_bt_repsep; i++)
+					end = bt_fast(end, true);
+				end = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle;
+				const u64 extra = (end > t0 + m_bt_repsep * m_bt_cycle) ? (end - t0 - m_bt_repsep * m_bt_cycle) : 0;
+				m_bt_istall += extra;
+				charge += extra;
+			}
+		}
+	}
+
+	const u64 t = m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
+	m_bt_idx++;
+
+	const u32 bank = address >> 16;
+	const u32 a16 = address & 0xffff;
+	const bool write = (type == g65816_device::BUS_WRITE);
+	// banks with I/O and a language card at $C000-$FFFF
+	const bool iolc = (bank >= 0xe0) ? (bank <= 0xe1) : ((bank <= 0x01) && !(m_shadow & SHAD_IOLC));
+	const bool io = iolc && ((a16 & 0xf000) == 0xc000);
+	int cls = BC_RAM;
+	if (slow)
+		cls = BC_MEGA;
+	else if (io)
+		cls = BC_FASTIO;
+	else if ((bank >= 0xf0) || (iolc && (a16 >= 0xd000) && !m_lcram && !write))
+		cls = BC_ROM;
+
+	u64 *const page = &m_btpage[(address >> 8) * 4];
+	u64 stall = 0;
+	bool busread = false;
+	if (write)
+	{
+		m_btc[BTC_WRITES]++;
+		page[2]++;
+	}
+	else
+	{
+		m_btc[BTC_READS]++;
+		page[0]++;
+	}
+
+	if (m_bt_mode == BT_STOCK)
+	{
+		stall = bt_bus(t, cls) - t - BT_FAST;
+		if ((cls == BC_MEGA) && !write)
+		{
+			page[1]++;
+			busread = true;
+		}
+	}
+	else if (m_bt_mode == BT_ZIP)
+	{
+		const bool cacheable = !io && m_zip_bank_ok[bank] && !(iolc && (a16 >= 0xd000) && BIT(m_accel_gsxsettings, 7));
+		u32 &tag = m_zip_tag[address & m_zip_mask];
+		// the tag is the memory used (as on the TransWarp GS; the Zip patent keeps
+		// soft switch mode bits in the tag): an aux-mapped bank $00/$E0 access gets
+		// the tag of bank $01/$E1 (or, with the setting, an aux tag of its own),
+		// and $D000-$FFFF gets the language card state (ROM, bank 1, bank 2)
+		u32 taddr = address;
+		if (((bank == 0x00) || (bank == 0xe0)) && ((a16 < 0xc000) || iolc) && bt_aux(a16, write))
+			taddr |= m_zip_auxtag ? 0x4000000 : 0x010000;
+		if (iolc && (a16 >= 0xd000))
+		{
+			if (!write && !m_lcram)
+				taddr |= 0x1000000;         // ROM
+			else if ((a16 < 0xe000) && m_lcram2)
+				taddr |= 0x2000000;         // language card bank 2
+		}
+		if (write)
+		{
+			if (cacheable)
+				tag = taddr + 1;
+			while (m_bt_wcount && (m_bt_wbuf[0] <= t))
+			{
+				for (int i = 1; i < m_bt_wcount; i++)
+					m_bt_wbuf[i - 1] = m_bt_wbuf[i];
+				m_bt_wcount--;
+			}
+			if (m_bt_wdepth == 0)
+			{
+				// no write buffer: the CPU waits for the motherboard write, then the ZipGS clock
+				const u64 end = bt_bus(std::max(t, m_bt_busfree), cls);
+				m_bt_busfree = end;
+				stall = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle - t - m_bt_cycle;
+			}
+			else
+			{
+				u64 accept = t;
+				if (m_bt_wcount >= m_bt_wdepth)
+				{
+					// the buffer is full: wait for the oldest write
+					accept = m_bt_wbuf[0];
+					for (int i = 1; i < m_bt_wcount; i++)
+						m_bt_wbuf[i - 1] = m_bt_wbuf[i];
+					m_bt_wcount--;
+					m_btc[BTC_WBUF_FULL]++;
+				}
+				const u64 end = bt_bus(std::max(accept, m_bt_busfree), cls);
+				m_bt_busfree = end;
+				m_bt_wbuf[m_bt_wcount++] = end;
+				stall = accept - t;
+			}
+		}
+		else if (cacheable && (tag == taddr + 1))
+		{
+			m_btc[BTC_HITS]++;
+		}
+		else
+		{
+			// a motherboard read, after the buffered writes; then the ZipGS clock again
+			const u64 end = bt_bus(std::max(t, m_bt_busfree), cls);
+			m_bt_busfree = end;
+			m_bt_wcount = 0;
+			const u64 resume = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle + m_bt_overhead * m_bt_cycle;
+			stall = resume - t - m_bt_cycle;
+			page[1]++;
+			busread = true;
+			if (cacheable)
+			{
+				tag = taddr + 1;
+				m_btc[BTC_MISSES]++;
+				if (type == g65816_device::BUS_OPCODE)
+					m_btc[BTC_MISS_OPCODE]++;
+				else if (type == g65816_device::BUS_OPERAND)
+					m_btc[BTC_MISS_OPERAND]++;
+				else
+					m_btc[BTC_MISS_DATA]++;
+			}
+			else
+				m_btc[BTC_UNCACHED]++;
+		}
+	}
+	else
+	{
+		// TransWarp GS
+		const bool cacheable = !io;
+		const bool code = (type == g65816_device::BUS_OPCODE) || (type == g65816_device::BUS_OPERAND);
+		u32 &tag = m_zip_tag[address & m_twgs_mask];
+		// the tag is the memory used (G. Body schematic; GAL equations, A2DP): in
+		// the I/O banks GAL5 gives the tag bank bit 0 of the aux memory (BL0X,
+		// by RAMRD, RAMWRT, ALTZP, 80STORE/PAGE2/HIRES), and GAL4 adds the
+		// language card state for $D000-$FFFF (AD0, AD1)
+		u32 taddr = address;
+		if (iolc)
+		{
+			if (((bank == 0x00) || (bank == 0xe0)) && bt_aux(a16, write))
+				taddr |= 0x010000;
+			if (a16 >= 0xd000)
+			{
+				if (!write && !m_lcram)
+					taddr |= 0x1000000;         // ROM
+				else if ((a16 < 0xe000) && m_lcram2)
+					taddr |= 0x2000000;         // language card bank 2
+			}
+		}
+		if (bank == 0xbc)
+		{
+			// the card's ROM and registers: no GS bus cycle
+		}
+		else if (m_bt_twslow)
+		{
+			// interrupts off with the IRQ logic on: GS speed, one bus cycle for each access
+			const u64 end = bt_bus(std::max(t, m_bt_busfree), cls);
+			m_bt_busfree = end;
+			m_bt_wcount = 0;
+			stall = end - t - m_bt_cycle;
+			if (write && cacheable)
+				tag = taddr + 1;
+			if (!write)
+			{
+				m_btc[BTC_UNCACHED]++;
+				page[1]++;
+				busread = true;
+			}
+		}
+		else if (write)
+		{
+			if (cacheable)
+				tag = taddr + 1;
+			while (m_bt_wcount && (m_bt_wbuf[0] <= t))
+			{
+				for (int i = 1; i < m_bt_wcount; i++)
+					m_bt_wbuf[i - 1] = m_bt_wbuf[i];
+				m_bt_wcount--;
+			}
+			u64 accept = t;
+			if (m_bt_wcount >= m_twgs_depth)
+			{
+				// the write latches are full: wait for the oldest write
+				accept = m_bt_wbuf[0];
+				for (int i = 1; i < m_bt_wcount; i++)
+					m_bt_wbuf[i - 1] = m_bt_wbuf[i];
+				m_bt_wcount--;
+				m_btc[BTC_WBUF_FULL]++;
+			}
+			const u64 end = bt_bus(std::max(accept, m_bt_busfree), cls) + m_twgs_wextra;
+			m_bt_busfree = end;
+			m_bt_wbuf[m_bt_wcount++] = end;
+			stall = accept - t;
+		}
+		else if (cacheable && (code || BIT(m_twgs_config, 1)) && (tag == taddr + 1))
+		{
+			m_btc[BTC_HITS]++;
+		}
+		else
+		{
+			// a GS read, after the latched writes; then the TransWarp clock again
+			const u64 end = bt_bus(std::max(t, m_bt_busfree), cls);
+			m_bt_busfree = end;
+			m_bt_wcount = 0;
+			const u64 resume = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle + m_bt_overhead * m_bt_cycle;
+			stall = resume - t - m_bt_cycle;
+			page[1]++;
+			busread = true;
+			if (cacheable && (code || BIT(m_twgs_config, 1)))
+			{
+				tag = taddr + 1;
+				m_btc[BTC_MISSES]++;
+				if (type == g65816_device::BUS_OPCODE)
+					m_btc[BTC_MISS_OPCODE]++;
+				else if (type == g65816_device::BUS_OPERAND)
+					m_btc[BTC_MISS_OPERAND]++;
+				else
+					m_btc[BTC_MISS_DATA]++;
+			}
+			else
+				m_btc[BTC_UNCACHED]++;
+		}
+	}
+
+	if (stall)
+	{
+		m_bt_istall += stall;
+		page[3] += stall / BT_PAGE_UNIT;
+		m_btpc[m_bt_ipc * 3] += stall / BT_PAGE_UNIT;
+		m_btc[write ? BTC_STALL_WRITE : BTC_STALL_READ] += stall;
+	}
+	if (busread)
+		m_btpc[m_bt_ipc * 3 + 1]++;
+
+	charge += stall;
+	m_bt_frac += charge;
+	const u64 n = m_bt_frac / m_bt_cycle;
+	m_bt_frac -= n * m_bt_cycle;
+	m_bt_charged += n;
+	return int(n);
+}
 
 TIMER_DEVICE_CALLBACK_MEMBER(apple2gs_state::apple2_interrupt)
 {
@@ -1036,6 +1864,8 @@ TIMER_DEVICE_CALLBACK_MEMBER(apple2gs_state::apple2_interrupt)
 		}
 
 		m_adbmicro->set_input_line(m5074x_device::M5074X_INT1_LINE, ASSERT_LINE);
+
+		bt_control();
 
 		// 3.5 motor off timeout
 		if (m_motoroff_time > 0)
@@ -1830,7 +2660,7 @@ u8 apple2gs_state::c000_r(offs_t offset)
 				case 0x5b: // status flags
 				{
 					// bits 0-1 are cache size: [8, 16, 32, 64]kB
-					const u8 b01 = 0x03;
+					const u8 b01 = m_zip_size;
 					// bit 3 is set if a temporary delay is active due to slot or softswitch access
 					const u8 b3 = m_accel_temp_slowdown ? 0x08 : 0x00;
 					// bit 4 is set if the Zip is disabled
@@ -2131,7 +2961,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 
 		case 0x5a: // Zip accelerator unlock
 			accel_stop_delay();
-			if (m_sysconfig->read() & 0x01)
+			if ((m_sysconfig->read() & 0x01) && !m_twgs)
 			{
 				if ((data & 0xf0) == 0x50)
 				{
@@ -2509,9 +3339,18 @@ void apple2gs_state::c800_w(offs_t offset, u8 data)
 // 65816 bank register is left on floating bus
 u8 apple2gs_state::floatingbank_r(offs_t offset)
 {
+	if (m_twgs && ((offset >> 16) == 0xbc))
+		return twgs_r(offset & 0xffff);
+
 	// When the memory expansion slot is empty, this is the behavior
 	// for every bank not populated by motherboard RAM or ROM.
 	return offset >> 16;
+}
+
+void apple2gs_state::floatingbank_w(offs_t offset, u8 data)
+{
+	if (m_twgs && ((offset >> 16) == 0xbc) && !machine().side_effects_disabled())
+		twgs_w(offset & 0xffff, data);
 }
 
 // mirror expansion RAM banks per Hardware Reference, Figure 3-9
@@ -3125,7 +3964,7 @@ void apple2gs_state::bank1_0000_sh_w(offs_t offset, u8 data)
 void apple2gs_state::apple2gs_map(address_map &map)
 {
 	// default behavior for unpopulated banks (affected by memory expansion slot)
-	map(0x000000, 0xffffff).r(FUNC(apple2gs_state::floatingbank_r)).nopw();
+	map(0x000000, 0xffffff).rw(FUNC(apple2gs_state::floatingbank_r), FUNC(apple2gs_state::floatingbank_w));
 	map.unmap_value_high(); // with expansion slot, unpopulated banks return ff on ROM3
 
 	// "fast side" - runs 2.8 MHz minus RAM refresh, banks 00 and 01 usually have writes shadowed to E0/E1 where I/O lives
@@ -3736,6 +4575,63 @@ INPUT_PORTS_START( apple2gs )
 	PORT_CONFSETTING(0x03, "8 MHz ZipGS")
 	PORT_CONFSETTING(0x05, "12 MHz ZipGS")
 	PORT_CONFSETTING(0x07, "16 MHz ZipGS")
+
+	PORT_START("bus_timing")
+	PORT_CONFNAME(0x001, 0x001, "Bus timing")
+	PORT_CONFSETTING(0x000, "MAME default")
+	PORT_CONFSETTING(0x001, "Model: refresh, 1 MHz sync, ZipGS cache")
+	PORT_CONFNAME(0x006, 0x006, "ZipGS cache size")
+	PORT_CONFSETTING(0x000, "8 KB")
+	PORT_CONFSETTING(0x002, "16 KB")
+	PORT_CONFSETTING(0x004, "32 KB")
+	PORT_CONFSETTING(0x006, "64 KB")
+	PORT_CONFNAME(0x018, 0x000, "ZipGS cached fast RAM")
+	PORT_CONFSETTING(0x000, "By cache size (16 KB: $00-$2F measured)")
+	PORT_CONFSETTING(0x008, "Banks $00-$1F")
+	PORT_CONFSETTING(0x010, "All banks")
+	PORT_CONFNAME(0x060, 0x020, "ZipGS cycles added after a bus read")
+	PORT_CONFSETTING(0x000, "0")
+	PORT_CONFSETTING(0x020, "1")
+	PORT_CONFSETTING(0x040, "2")
+	PORT_CONFSETTING(0x060, "3")
+	PORT_CONFNAME(0x180, 0x000, "ZipGS write buffer")
+	PORT_CONFSETTING(0x000, "1 write")
+	PORT_CONFSETTING(0x080, "2 writes")
+	PORT_CONFSETTING(0x100, "4 writes")
+	PORT_CONFSETTING(0x180, "None: the CPU waits for each write")
+	PORT_CONFNAME(0x200, 0x000, "ZipGS tag of aux-mapped bank $00 (RAMRD/RAMWRT/ALTZP/80STORE)")
+	PORT_CONFSETTING(0x000, "The memory used (bank $01)")
+	PORT_CONFSETTING(0x200, "An aux tag of its own")
+	PORT_CONFNAME(0x400, 0x000, "Accelerator of the CPU type")
+	PORT_CONFSETTING(0x000, "ZipGS")
+	PORT_CONFSETTING(0x400, "TransWarp GS")
+	PORT_CONFNAME(0x800, 0x000, "TransWarp GS cache size")
+	PORT_CONFSETTING(0x000, "8 KB")
+	PORT_CONFSETTING(0x800, "32 KB")
+	PORT_CONFNAME(0x1000, 0x000, "TransWarp GS AppleTalk/IRQ slowdown")
+	PORT_CONFSETTING(0x000, "On")
+	PORT_CONFSETTING(0x1000, "Off")
+	PORT_CONFNAME(0x2000, 0x000, "TransWarp GS write latches in use")
+	PORT_CONFSETTING(0x000, "4")
+	PORT_CONFSETTING(0x2000, "3")
+	PORT_CONFNAME(0x70000, 0x00000, "Accelerator clock")
+	PORT_CONFSETTING(0x00000, "The speed of the CPU type")
+	PORT_CONFSETTING(0x50000, "10 MHz")
+	PORT_CONFSETTING(0x10000, "12.5 MHz")
+	PORT_CONFSETTING(0x20000, "13.75 MHz")
+	PORT_CONFSETTING(0x30000, "14 MHz")
+	PORT_CONFSETTING(0x40000, "15 MHz")
+	PORT_CONFNAME(0x6000000, 0x2000000, "REP and SEP cycles at the motherboard speed (early 65816 fix)")
+	PORT_CONFSETTING(0x0000000, "0")
+	PORT_CONFSETTING(0x2000000, "1")
+	PORT_CONFSETTING(0x4000000, "2")
+	PORT_CONFSETTING(0x6000000, "3")
+	PORT_CONFNAME(0x70000000, 0x20000000, "TransWarp GS extra time of each write")
+	PORT_CONFSETTING(0x00000000, "0")
+	PORT_CONFSETTING(0x10000000, "1 clock of 14M")
+	PORT_CONFSETTING(0x20000000, "2 clocks")
+	PORT_CONFSETTING(0x30000000, "3 clocks")
+	PORT_CONFSETTING(0x40000000, "4 clocks")
 INPUT_PORTS_END
 
 INPUT_PORTS_START( apple2gsrom3 )

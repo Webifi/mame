@@ -51,6 +51,14 @@ public:
 
 	auto wdm_handler() { return m_wdm_w.bind(); }
 
+	// bus hook: called after each memory access with the address and the
+	// access type; it gives the extra cycles of the access (a bus timing model)
+	enum { BUS_OPCODE = 0, BUS_OPERAND, BUS_READ, BUS_WRITE, BUS_VECTOR };
+	using bus_hook_delegate = delegate<int (u32 address, int type)>;
+	void set_bus_hook(bus_hook_delegate hook) { m_bus_hook = std::move(hook); }
+	// the interrupt mask flag, for a model that slows down while interrupts are off
+	bool irq_masked() const { return m_flag_i != 0; }
+
 	/* Registers - used by g65816_set_reg() and g65816_get_reg() */
 	enum
 	{
@@ -245,6 +253,7 @@ protected:
 	unsigned m_source;
 	unsigned m_destination;
 	int m_ICount;
+	bus_hook_delegate m_bus_hook;
 	int m_cpu_type;
 	uint8_t m_divider;
 	uint32_t m_debugger_temp;

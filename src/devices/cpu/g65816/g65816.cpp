@@ -236,25 +236,33 @@ const g65816_device::execute_func g65816_device::s_g65816_execute[5] =
 
 #define ADDRESS_65816(A) ((A)&0x00ffffff)
 
+#define BUS_HOOK(A, T) if (!m_bus_hook.isnull()) CLOCKS -= m_bus_hook((A), (T))
+
 unsigned g65816_device::g65816i_read_8_normal(unsigned address)
 {
 	address = ADDRESS_65816(address);
 	CLOCKS -= (bus_5A22_cycle_burst(address));
-	return g65816_read_8(address);
+	const unsigned value = g65816_read_8(address);
+	BUS_HOOK(address, BUS_READ);
+	return value;
 }
 
 unsigned g65816_device::g65816i_read_8_immediate(unsigned address)
 {
 	address = ADDRESS_65816(address);
 	CLOCKS -= (bus_5A22_cycle_burst(address));
-	return g65816_read_8_immediate(address);
+	const unsigned value = g65816_read_8_immediate(address);
+	BUS_HOOK(address, BUS_OPERAND);
+	return value;
 }
 
 unsigned g65816_device::g65816i_read_8_opcode(unsigned address)
 {
 	address = ADDRESS_65816(address);
 	CLOCKS -= (bus_5A22_cycle_burst(address));
-	return g65816_read_8_opcode(address);
+	const unsigned value = g65816_read_8_opcode(address);
+	BUS_HOOK(address, BUS_OPCODE);
+	return value;
 }
 
 unsigned g65816_device::g65816i_read_8_direct(unsigned address)
@@ -270,16 +278,21 @@ unsigned g65816_device::g65816i_read_8_direct(unsigned address)
 		address = ADDRESS_65816(address);
 		CLOCKS -= (bus_5A22_cycle_burst(address));
 	}
-	return g65816_read_8(address);
+	const unsigned value = g65816_read_8(address);
+	BUS_HOOK(address, BUS_READ);
+	return value;
 }
 
 unsigned g65816_device::g65816i_read_8_vector(unsigned address)
 {
 	CLOCKS -= (bus_5A22_cycle_burst(address));
+	unsigned value;
 	if (has_space(AS_VECTORS))
-		return space(AS_VECTORS).read_byte(address & 0x001f);
+		value = space(AS_VECTORS).read_byte(address & 0x001f);
 	else
-		return g65816_read_8_immediate(address);
+		value = g65816_read_8_immediate(address);
+	BUS_HOOK(address, BUS_VECTOR);
+	return value;
 }
 
 void g65816_device::g65816i_write_8_normal(unsigned address, unsigned value)
@@ -287,6 +300,7 @@ void g65816_device::g65816i_write_8_normal(unsigned address, unsigned value)
 	address = ADDRESS_65816(address);
 	CLOCKS -= (bus_5A22_cycle_burst(address));
 	g65816_write_8(address, MAKE_UINT_8(value));
+	BUS_HOOK(address, BUS_WRITE);
 }
 
 void g65816_device::g65816i_write_8_direct(unsigned address, unsigned value)
@@ -303,6 +317,7 @@ void g65816_device::g65816i_write_8_direct(unsigned address, unsigned value)
 		CLOCKS -= (bus_5A22_cycle_burst(address));
 	}
 	g65816_write_8(address, MAKE_UINT_8(value));
+	BUS_HOOK(address, BUS_WRITE);
 }
 
 unsigned g65816_device::g65816i_read_16_normal(unsigned address)
