@@ -500,6 +500,7 @@ private:
 	void sndglu_tally(u16 addr, bool land);
 	void sndglu_log_table();
 	void sndglu_apply_vca();
+	float m_snd_gain_mono = -1.0f, m_snd_gain_side = -1.0f, m_snd_vca = -1.0f;
 	TIMER_CALLBACK_MEMBER(sndglu_commit_cb);
 
 	// Key GLU variables
@@ -1241,6 +1242,7 @@ void apple2gs_state::machine_reset()
 	std::fill(&m_glu_repl[0][0], &m_glu_repl[0][0] + 32 * 7, 0);
 	m_sndglu_busy_model = ioport("glu_busy")->read() != 0;
 	m_snd_demux = ioport("snd_demux")->read() != 0;
+	m_snd_vca = -1.0f;
 	sndglu_apply_vca();
 
 	m_b0_0000bank.select(0);
@@ -2961,16 +2963,29 @@ static float sndglu_vca_gain(u8 step)
 
 void apple2gs_state::sndglu_apply_vca()
 {
+	// The output choice changes only at reset. Changing a route gain while running drops output
+	// samples, so the VCA is a gain on the two sources instead.
+	const float mono = m_snd_demux ? 0.0f : 1.0f;
+	const float side = m_snd_demux ? 1.0f : 0.0f;
+	if ((mono != m_snd_gain_mono) || (side != m_snd_gain_side))
+	{
+		m_snd_gain_mono = mono;
+		m_snd_gain_side = side;
+		m_doc->set_route_gain(0, m_sndmono, 0, mono);
+		m_doc->set_route_gain(1, m_sndmono, 0, mono);
+		m_doc->set_route_gain(0, m_sndright, 0, side);
+		m_doc->set_route_gain(1, m_sndleft, 0, side);
+		m_speaker->set_route_gain(0, m_sndmono, 0, mono);
+		m_speaker->set_route_gain(0, m_sndleft, 0, side);
+		m_speaker->set_route_gain(0, m_sndright, 0, side);
+	}
 	const float g = sndglu_vca_gain(m_sndglu_ctrl);
-	const float mono = m_snd_demux ? 0.0f : g;
-	const float side = m_snd_demux ? g : 0.0f;
-	m_doc->set_route_gain(0, m_sndmono, 0, mono);
-	m_doc->set_route_gain(1, m_sndmono, 0, mono);
-	m_doc->set_route_gain(0, m_sndright, 0, side);
-	m_doc->set_route_gain(1, m_sndleft, 0, side);
-	m_speaker->set_route_gain(0, m_sndmono, 0, mono);
-	m_speaker->set_route_gain(0, m_sndleft, 0, side);
-	m_speaker->set_route_gain(0, m_sndright, 0, side);
+	if (g != m_snd_vca)
+	{
+		m_snd_vca = g;
+		m_doc->set_output_gain(ALL_OUTPUTS, g);
+		m_speaker->set_output_gain(ALL_OUTPUTS, g);
+	}
 }
 
 bool apple2gs_state::sndglu_service()
