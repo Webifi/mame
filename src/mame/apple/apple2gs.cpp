@@ -654,6 +654,7 @@ private:
 	bool m_zip_store80 = false, m_zip_page2 = false, m_zip_hires = false;
 	bool m_zip_lcram = false, m_zip_lcram2 = true;
 	bool m_zip_iolc = false, m_zip_intcxrom = false;
+	bool m_zip_c8_slot = false; // this $C800-$CFFF access is the selected card
 	bool m_zip_hit = false;
 	u64 m_zip_hits = 0, m_zip_mismatches = 0;
 	bool zip_iolc(u32 address) const;
@@ -1095,6 +1096,7 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_zip_lcram2));
 	save_item(NAME(m_zip_iolc));
 	save_item(NAME(m_zip_intcxrom));
+	save_item(NAME(m_zip_c8_slot));
 	save_item(NAME(m_zip_hit));
 	save_item(NAME(m_zip_hits));
 	save_item(NAME(m_zip_mismatches));
@@ -1228,7 +1230,7 @@ void apple2gs_state::machine_reset()
 	m_zip_store80 = m_zip_page2 = m_zip_hires = false;
 	m_zip_lcram = false;
 	m_zip_lcram2 = true;
-	m_zip_iolc = m_zip_intcxrom = false;
+	m_zip_iolc = m_zip_intcxrom = m_zip_c8_slot = false;
 	m_zip_hit = false;
 	m_zip_hits = m_zip_mismatches = 0;
 	std::fill_n(m_zip_data.get(), 0x10000, 0);
@@ -1880,9 +1882,12 @@ u8 apple2gs_state::twgs_bus(u32 address, int type, u8 data)
 // the next phase 0, and a second write before that phase 0 stops the CPU
 // until the latch can take it (so the new byte occupies the following
 // phase 0). Private mapping latches select the auxiliary and language-card
-// tag bits. I/O is never
-// cached; a 16 KB cache caches fast RAM banks $00-$2F, $E0, $E1 and $FC-$FF
-// (measured). Read hits return the cached byte.
+// tag bits. $C000-$C0FF is never cached. $C100-$C7FF is one page per slot,
+// so the tag names it. $C800-$CFFF is the shared /IOSTROBE window and is not
+// read from cache when the motherboard serves the selected card (MENABB: the
+// tag cannot name the slot, and the card can change the bytes). Motherboard
+// ROM in that window stays cacheable. A 16 KB cache caches fast RAM banks
+// $00-$2F, $E0, $E1 and $FC-$FF (measured). Read hits return the cached byte.
 //
 // TransWarp GS (AE manual and Programmer's Reference; G. Body schematic,
 // 2016; ROM 1.8s disassembly): direct mapped, 8 or 32 KB, a 16-bit tag for
@@ -2262,9 +2267,14 @@ bool apple2gs_state::zip_cacheable(u32 address) const
 	const u16 a = address;
 	const bool mapped = (bank <= 1) || (bank == 0xe0) || (bank == 0xe1);
 	// SW1/1 disables Cxxx/Dxxx in both views, not the Exxx/Fxxx region.
-	// With it clear, only actual C0xx I/O is excluded; C1xx-CFxx can cache.
+	// With it clear, $C0xx stays uncached and $C1xx-$C7xx can cache. The
+	// /IOSTROBE window is uncached only when this access is the selected card
+	// (m_zip_c8_slot, set by c800_r/c800_w from the pre-clear owner). $C059.7
+	// still bypasses $C000-$DFFF in the four mapped banks.
+	const bool slot_window = zip_iolc(address) && (a >= 0xc800) && (a <= 0xcfff) && m_zip_c8_slot;
 	return m_zip_bank_ok[bank]
 		&& !(zip_iolc(address) && (a >= 0xc000) && (a < 0xc100))
+		&& !slot_window
 		&& !(mapped && BIT(m_accel_gsxsettings, 7) && (a >= 0xc000) && (a < 0xe000));
 }
 
@@ -4364,6 +4374,9 @@ u8 apple2gs_state::c800_r(offs_t offset)
 {
 	const int slot = m_cnxx_slot;
 	const int internal = (m_intcxrom) || (m_intc8rom);
+	// Sample the owner before $CFFF clears it. The Zip data hook runs after
+	// this handler. Motherboard ROM is not this flag.
+	m_zip_c8_slot = !internal && (slot > 0) && (m_slotdevice[slot] != nullptr);
 
 	if ((offset == 0x7ff) && !machine().side_effects_disabled())
 	{
@@ -4387,7 +4400,8 @@ u8 apple2gs_state::c800_r(offs_t offset)
 
 void apple2gs_state::c800_w(offs_t offset, u8 data)
 {
-	if ((m_cnxx_slot > 0) && (m_slotdevice[m_cnxx_slot] != nullptr))
+	m_zip_c8_slot = (m_cnxx_slot > 0) && (m_slotdevice[m_cnxx_slot] != nullptr);
+	if (m_zip_c8_slot)
 	{
 		slow_cycle();
 		m_slotdevice[m_cnxx_slot]->write_c800(offset&0xfff, data);
