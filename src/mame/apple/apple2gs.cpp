@@ -144,6 +144,9 @@ public:
 		  //      m_a2host(*this, "a2host"),
 		  m_gameio(*this, "gameio"),
 		  m_speaker(*this, "speaker_sound"),
+		  m_sndmono(*this, "sndmono"),
+		  m_sndleft(*this, "sndleft"),
+		  m_sndright(*this, "sndright"),
 		  m_upperbank(*this, A2GS_UPPERBANK_TAG),
 		  m_upperaux(*this, A2GS_AUXUPPER_TAG),
 		  m_upper00(*this, A2GS_00UPPER_TAG),
@@ -208,6 +211,7 @@ private:
 //  required_device<apple2_host_device> m_a2host;
 	required_device<apple2_gameio_device> m_gameio;
 	required_device<speaker_sound_device> m_speaker;
+	required_device<speaker_device> m_sndmono, m_sndleft, m_sndright;
 	memory_view m_upperbank, m_upperaux, m_upper00, m_upper01;
 	required_device<address_map_bank_device> m_c300bank;
 	memory_view m_b0_0000bank, m_b0_0200bank, m_b0_0400bank, m_b0_0800bank, m_b0_2000bank, m_b0_4000bank;
@@ -469,12 +473,14 @@ private:
 	// phase is latched and completed on the following slot, so the port is
 	// busy for between one and two slots. Register writes do not stall: a
 	// second write replaces the byte still in the latch. Register reads and
-	// sound-RAM accesses hold the CPU until the DOC port finishes.
-	u8 m_sndglu_ctrl = 0;
+	// sound-RAM accesses hold the CPU until the DOC port finishes. The 16-step
+	// VCA sits after the DOC/speaker sum.
+	u8 m_sndglu_ctrl = 0x0f;
 	u16 m_sndglu_addr = 0;
 	int m_sndglu_dummy_read = 0;
 	attotime m_sndglu_busy_until;
 	bool m_sndglu_busy_model = true;
+	bool m_snd_demux = false;
 	bool m_sndglu_pending = false;
 	bool m_sndglu_pend_read = false;
 	bool m_sndglu_pend_ram = false;
@@ -493,6 +499,7 @@ private:
 	void sndglu_stall_until_commit();
 	void sndglu_tally(u16 addr, bool land);
 	void sndglu_log_table();
+	void sndglu_apply_vca();
 	TIMER_CALLBACK_MEMBER(sndglu_commit_cb);
 
 	// Key GLU variables
@@ -867,15 +874,10 @@ void apple2gs_state::machine_start()
 
 	std::fill(std::begin(m_glu_regs), std::end(m_glu_regs), 0);
 
-	// setup speaker toggle volumes.  this should be done mathematically probably,
-	// but these ad-hoc values aren't too bad.
-#define LVL(x) (double(x) / 32768.0)
-	static const double lvlTable[16] =
-	{
-		LVL(0x0000), LVL(0x03ff), LVL(0x04ff), LVL(0x05ff), LVL(0x06ff), LVL(0x07ff), LVL(0x08ff), LVL(0x09ff),
-		LVL(0x0aff), LVL(0x0bff), LVL(0x0cff), LVL(0x0fff), LVL(0x1fff), LVL(0x3fff), LVL(0x5fff), LVL(0x7fff)
-	};
-	m_speaker->set_levels(16, lvlTable);
+	// The one-bit speaker is full scale into the summer. The $C03C nibble is the
+	// VCA after that sum, applied in sndglu_apply_vca().
+	static const double click[2] = { 0.0, 1.0 };
+	m_speaker->set_levels(2, click);
 
 	// precalculate joystick time constants
 	m_x_calibration = attotime::from_nsec(10800).as_double();
@@ -1222,7 +1224,7 @@ void apple2gs_state::machine_reset()
 	bt_config();
 	bt_setup(A2GS_2_8M.value());
 
-	m_sndglu_ctrl = 0;
+	m_sndglu_ctrl = 0x0f; // power-on VCA step; firmware may replace it
 	m_sndglu_addr = 0;
 	m_sndglu_dummy_read = 0;
 	m_sndglu_busy_until = attotime::zero;
@@ -1238,6 +1240,8 @@ void apple2gs_state::machine_reset()
 	std::fill(&m_glu_land[0][0], &m_glu_land[0][0] + 32 * 7, 0);
 	std::fill(&m_glu_repl[0][0], &m_glu_repl[0][0] + 32 * 7, 0);
 	m_sndglu_busy_model = ioport("glu_busy")->read() != 0;
+	m_snd_demux = ioport("snd_demux")->read() != 0;
+	sndglu_apply_vca();
 
 	m_b0_0000bank.select(0);
 	m_e0_0000bank.select(0);
@@ -2947,6 +2951,28 @@ void apple2gs_state::lcrom_update()
 // most softswitches don't care about read vs write, so handle them here
 const char *const apple2gs_state::s_glu_cls[7] = { "flo", "fhi", "vol", "ptr", "ctl", "siz", "oth" };
 
+// The $C03C nibble is the amplifier after the DOC/speaker sum.
+// Step 0 is mute. No resistor values for a log taper were found, so
+// steps 1..15 are the linear fraction n/15 of full scale.
+static float sndglu_vca_gain(u8 step)
+{
+	return float(step & 0x0f) / 15.0f;
+}
+
+void apple2gs_state::sndglu_apply_vca()
+{
+	const float g = sndglu_vca_gain(m_sndglu_ctrl);
+	const float mono = m_snd_demux ? 0.0f : g;
+	const float side = m_snd_demux ? g : 0.0f;
+	m_doc->set_route_gain(0, m_sndmono, 0, mono);
+	m_doc->set_route_gain(1, m_sndmono, 0, mono);
+	m_doc->set_route_gain(0, m_sndright, 0, side);
+	m_doc->set_route_gain(1, m_sndleft, 0, side);
+	m_speaker->set_route_gain(0, m_sndmono, 0, mono);
+	m_speaker->set_route_gain(0, m_sndleft, 0, side);
+	m_speaker->set_route_gain(0, m_sndright, 0, side);
+}
+
 bool apple2gs_state::sndglu_service()
 {
 	if (!m_sndglu_busy_model || !m_sndglu_pending)
@@ -3105,14 +3131,7 @@ void apple2gs_state::do_io(int offset)
 
 		case 0x30:  // SPKR
 			m_speaker_state ^= 1;
-			if (m_speaker_state)
-			{
-				m_speaker->level_w(m_sndglu_ctrl & 0xf);
-			}
-			else
-			{
-				m_speaker->level_w(0);
-			}
+			m_speaker->level_w(m_speaker_state);
 
 			accel_temp_delay(5, (m_accel_slotspk & 1));
 			break;
@@ -3841,6 +3860,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 			{
 				m_sndglu_addr &= 0xff;
 			}
+			sndglu_apply_vca();
 			break;
 
 		case 0x3d:  // SOUNDDATA
@@ -5567,6 +5587,11 @@ INPUT_PORTS_START( apple2gs )
 	PORT_CONFSETTING(0x00, "Off (never busy)")
 	PORT_CONFSETTING(0x01, "On (DOC phase latch)")
 
+	PORT_START("snd_demux")
+	PORT_CONFNAME(0x01, 0x00, "DOC stereo demultiplexer")
+	PORT_CONFSETTING(0x00, "Off (stock mono)")
+	PORT_CONFSETTING(0x01, "On (even right, odd left)")
+
 	PORT_START("ram_start")
 	PORT_CONFNAME(0x07, 0x05, "Power-on RAM contents")
 	PORT_CONFSETTING(0x00, "All zeroes")
@@ -5753,19 +5778,26 @@ void apple2gs_state::apple2gs(machine_config &config)
 	PALETTE(config, "palette", FUNC(apple2gs_state::palette_init), 256);
 
 	/* sound hardware */
-	SPEAKER(config, "a2speaker").front_center();
-	SPEAKER_SOUND(config, m_speaker).add_route(ALL_OUTPUTS, "a2speaker", 1.00);
+	// One mono sum (speaker, headphone, video pin) and the molex demultiplexer
+	// (even DOC channels right, odd channels left). sndglu_apply_vca() mutes
+	// the path that is not selected and applies the 16-step VCA to the other.
+	SPEAKER(config, "sndmono").front_center();
+	SPEAKER(config, "sndleft").front_left();
+	SPEAKER(config, "sndright").front_right();
+	SPEAKER_SOUND(config, m_speaker);
+	m_speaker->add_route(ALL_OUTPUTS, "sndmono", 1.00);
+	m_speaker->add_route(ALL_OUTPUTS, "sndleft", 1.00);
+	m_speaker->add_route(ALL_OUTPUTS, "sndright", 1.00);
 
-	SPEAKER(config, "ensoniq", 4).corners();
 	ES5503(config, m_doc, A2GS_7M);
-	m_doc->set_channels(4);
+	m_doc->set_channels(2);
 	m_doc->set_addrmap(0, &apple2gs_state::a2gs_es5503_map);
 	m_doc->irq_func().set(FUNC(apple2gs_state::doc_irq_w));
 	m_doc->adc_func().set(FUNC(apple2gs_state::doc_adc_read));
-	m_doc->add_route(0, "ensoniq", 1.0, 0);
-	m_doc->add_route(1, "ensoniq", 1.0, 1);
-	m_doc->add_route(2, "ensoniq", 1.0, 2);
-	m_doc->add_route(3, "ensoniq", 1.0, 3);
+	m_doc->add_route(0, "sndmono", 1.0);
+	m_doc->add_route(1, "sndmono", 1.0);
+	m_doc->add_route(0, "sndright", 1.0);
+	m_doc->add_route(1, "sndleft", 1.0);
 
 	/* RAM */
 	EEPROM_X24C44_16BIT(config, m_twgs_nvram);
