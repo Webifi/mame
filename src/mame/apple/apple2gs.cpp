@@ -55,6 +55,8 @@
 ***************************************************************************/
 
 #include "emu.h"
+#include "twgs_timing.h"
+#include "twgs_clock.h"
 #include "osdcore.h"
 
 #include "apple2video.h"
@@ -597,6 +599,7 @@ private:
 	bool twgs_shadowed(u32 address) const;
 	void twgs_drain(unsigned count);
 	void twgs_schedule_write();
+	void twgs_flush_due();
 	TIMER_CALLBACK_MEMBER(twgs_write_complete);
 	void twgs_set_config(u8 data);
 	u8 twgs_bus(u32 address, int type, u8 data);
@@ -691,6 +694,33 @@ private:
 	bool m_twdc_armed = true;
 	u32 m_twdc_arm_pc = 0;
 	u64 m_twdc_hits = 0, m_twdc_mismatches = 0;
+	bool twgs_cached_access(u32 address, int type, u8 &data, int &cycles);
+	// The physical card shares one controller/SRAM state between data and
+	// timing. Legacy synthetic firmware mode retains its separate interface.
+	// This factor represents every supported oscillator's four subclocks
+	// exactly (including 50/55/64 MHz), without per-edge attotime arithmetic.
+	static constexpr u64 TWGS_TIME_SCALE = 220;
+	using twgs_time = twgs_decoded::time_base<BT_PER_SEC * TWGS_TIME_SCALE>;
+	static u64 twgs_ticks(attotime const &t) { return twgs_time::ticks(t.seconds(), t.attoseconds()); }
+	static attotime twgs_at(u64 t) { return attotime(t / (BT_PER_SEC * TWGS_TIME_SCALE), twgs_time::fraction(t)); }
+	twgs_decoded::timing_scaled<TWGS_TIME_SCALE> m_twgs_kernel;
+	bool m_twgs_kernel_on = false, m_twgs_kernel_started = false;
+	u64 m_twgs_transaction = 0, m_twgs_retired = 0, m_twgs_visible = 0;
+	u64 m_twgs_unemitted_cycles = 0;
+	s64 m_twgs_cycle_charge = 0;
+	struct twgs_board
+	{
+		apple2gs_state &owner;
+		void read(twgs_decoded::transaction &w, u64 begin, u64 end) { w.data = owner.twgs_board_read(w, begin, end); }
+		void write(twgs_decoded::transaction const &w, u64 begin, u64 end) { owner.twgs_board_write(w, begin, end); }
+	};
+	u8 twgs_board_read(twgs_decoded::transaction const &w, u64 begin, u64 end);
+	void twgs_board_write(twgs_decoded::transaction const &w, u64 begin, u64 end);
+	void twgs_kernel_cycle(u32 address, int type, u8 &data);
+	int twgs_kernel_access(u32 address, int type, u8 &data);
+	int twgs_internal(u32 address, int type, u8 data);
+	u64 twgs_kernel_instruction(u32 pc);
+	void twgs_kernel_schedule();
 	u8 *m_btprof = nullptr;
 	u64 *m_btc = nullptr;
 	u64 *m_btpage = nullptr, *m_btpc = nullptr;
@@ -845,6 +875,7 @@ void apple2gs_state::machine_start()
 	m_twgs_write_timer = timer_alloc(FUNC(apple2gs_state::twgs_write_complete), this);
 	m_sndglu_timer = timer_alloc(FUNC(apple2gs_state::sndglu_commit_cb), this);
 	m_doc->set_host_sync([this](attotime time) { sndglu_service(time); });
+	m_a2bus->set_dma_sync([this]() { twgs_flush_due(); });
 	twgs_build_firmware();
 	m_twgs_rom = memregion("twgs")->base();
 	memory_region *prof = machine().memory().region_alloc(":zipprof", BTP_SIZE, 1, ENDIANNESS_LITTLE);
@@ -1060,6 +1091,120 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_zip_size));
 	save_item(NAME(m_zip_auxtag));
 	save_item(NAME(m_zip_bank_ok));
+	// Decoded card state: every physical register, tag and holding latch.
+	save_item(NAME(m_twgs_kernel_on));
+	save_item(NAME(m_twgs_kernel_started));
+	save_item(NAME(m_twgs_transaction));
+	save_item(NAME(m_twgs_retired));
+	save_item(NAME(m_twgs_visible));
+	save_item(NAME(m_twgs_unemitted_cycles));
+	save_item(NAME(m_twgs_cycle_charge));
+	save_item(NAME(m_twgs_kernel.now));
+	save_item(NAME(m_twgs_kernel.early));
+	save_item(NAME(m_twgs_kernel.late));
+	save_item(NAME(m_twgs_kernel.gs_event));
+	save_item(NAME(m_twgs_kernel.gs_start));
+	save_item(NAME(m_twgs_kernel.x4));
+	save_item(NAME(m_twgs_kernel.slot_start));
+	save_item(NAME(m_twgs_kernel.slot_end));
+	save_item(NAME(m_twgs_kernel.access_slot_start));
+	save_item(NAME(m_twgs_kernel.access_slot_end));
+	save_item(NAME(m_twgs_kernel.board_cycles));
+	save_item(NAME(m_twgs_kernel.mega_cycles));
+	save_item(NAME(m_twgs_kernel.refresh_cycles));
+	save_item(NAME(m_twgs_kernel.speed));
+	save_item(NAME(m_twgs_kernel.shadow));
+	save_item(NAME(m_twgs_kernel.next_gs_level));
+	save_item(NAME(m_twgs_kernel.had_bus));
+	save_item(NAME(m_twgs_kernel.fast_hits));
+	save_item(NAME(m_twgs_kernel.c.ctl.q1));
+	save_item(NAME(m_twgs_kernel.c.ctl.q2));
+	save_item(NAME(m_twgs_kernel.c.ctl.gs));
+	save_item(NAME(m_twgs_kernel.c.ctl.early));
+	save_item(NAME(m_twgs_kernel.c.ctl.delayed));
+	save_item(NAME(m_twgs_kernel.c.ctl.service));
+	save_item(NAME(m_twgs_kernel.c.ctl.pause_sample));
+	save_item(NAME(m_twgs_kernel.c.ctl.sync));
+	save_item(NAME(m_twgs_kernel.c.ctl.r16_sample));
+	save_item(NAME(m_twgs_kernel.c.ctl.r17_sample));
+	save_item(NAME(m_twgs_kernel.c.ctl.read));
+	save_item(NAME(m_twgs_kernel.c.ctl.miss));
+	save_item(NAME(m_twgs_kernel.c.ctl.eligible));
+	save_item(NAME(m_twgs_kernel.c.ctl.slow));
+	save_item(NAME(m_twgs_kernel.c.ctl.pause));
+	save_item(NAME(m_twgs_kernel.c.ctl.use_gal2a));
+	save_item(NAME(m_twgs_kernel.c.ctl.pin7_card_phase));
+	save_item(NAME(m_twgs_kernel.c.decode.g3));
+	save_item(NAME(m_twgs_kernel.c.decode.g4));
+	save_item(NAME(m_twgs_kernel.c.decode.gal3_revision));
+	save_item(NAME(m_twgs_kernel.c.decode.gal4_b));
+	save_item(NAME(m_twgs_kernel.c.decode.gal5_permuted));
+	save_item(NAME(m_twgs_kernel.c.decode.use_tables));
+	save_item(NAME(m_twgs_kernel.c.fpga.q));
+	save_item(NAME(m_twgs_kernel.c.tags));
+	save_item(NAME(m_twgs_kernel.c.bytes));
+	save_item(NAME(m_twgs_kernel.c.valid));
+	save_item(NAME(m_twgs_kernel.c.active_column));
+	save_item(NAME(m_twgs_kernel.c.bank_column));
+	save_item(NAME(m_twgs_kernel.c.mask));
+	save_item(NAME(m_twgs_kernel.c.fp));
+	save_item(NAME(m_twgs_kernel.c.comparator_enable));
+	save_item(NAME(m_twgs_kernel.c.cpu));
+	save_item(NAME(m_twgs_kernel.c.we));
+	save_item(NAME(m_twgs_kernel.c.forced_write));
+	save_item(NAME(m_twgs_kernel.c.bank_valid));
+	save_item(NAME(m_twgs_kernel.c.completions));
+	save_item(NAME(m_twgs_kernel.c.deliveries));
+	save_item(NAME(m_twgs_kernel.c.strobe_changes));
+	save_item(NAME(m_twgs_kernel.c.bank_errors));
+	save_item(NAME(m_twgs_kernel.c.high_errors));
+	save_item(NAME(m_twgs_kernel.c.completed));
+	save_item(NAME(m_twgs_kernel.c.delivered));
+	save_item(NAME(m_twgs_kernel.c.from_sram));
+	save_item(NAME(m_twgs_kernel.c.external_advance));
+	save_item(NAME(m_twgs_kernel.c.receipt));
+	save_item(NAME(m_twgs_kernel.c.pins.tag));
+	save_item(NAME(m_twgs_kernel.c.pins.eligible));
+	save_item(NAME(m_twgs_kernel.c.pins.bank_io));
+	save_item(NAME(m_twgs_kernel.c.pins.irq));
+	save_item(NAME(m_twgs_kernel.c.pins.fast_instruction));
+	save_item(NAME(m_twgs_kernel.c.pins.gal3_pins));
+	save_item(NAME(m_twgs_kernel.c.word.address));
+	save_item(NAME(m_twgs_kernel.c.word.id));
+	save_item(NAME(m_twgs_kernel.c.word.data));
+	save_item(NAME(m_twgs_kernel.c.word.type));
+	save_item(NAME(m_twgs_kernel.c.word.seed));
+	save_item(NAME(m_twgs_kernel.c.active.bus.address));
+	save_item(NAME(m_twgs_kernel.c.active.bus.id));
+	save_item(NAME(m_twgs_kernel.c.active.bus.data));
+	save_item(NAME(m_twgs_kernel.c.active.bus.type));
+	save_item(NAME(m_twgs_kernel.c.active.bus.seed));
+	save_item(NAME(m_twgs_kernel.c.bank_candidate.bus.address));
+	save_item(NAME(m_twgs_kernel.c.bank_candidate.bus.id));
+	save_item(NAME(m_twgs_kernel.c.bank_candidate.bus.data));
+	save_item(NAME(m_twgs_kernel.c.bank_candidate.bus.type));
+	save_item(NAME(m_twgs_kernel.c.bank_candidate.bus.seed));
+	save_item(NAME(m_twgs_kernel.c.retired.bus.address));
+	save_item(NAME(m_twgs_kernel.c.retired.bus.id));
+	save_item(NAME(m_twgs_kernel.c.retired.bus.data));
+	save_item(NAME(m_twgs_kernel.c.retired.bus.type));
+	save_item(NAME(m_twgs_kernel.c.retired.bus.seed));
+	save_item(NAME(m_twgs_kernel.c.active.byte));
+	save_item(NAME(m_twgs_kernel.c.active.valid));
+	save_item(NAME(m_twgs_kernel.c.bank_candidate.byte));
+	save_item(NAME(m_twgs_kernel.c.bank_candidate.valid));
+	save_item(NAME(m_twgs_kernel.c.retired.byte));
+	save_item(NAME(m_twgs_kernel.c.retired.valid));
+	for (unsigned i=0;i<4;++i)
+	{
+		save_item(NAME(m_twgs_kernel.c.latches[i].byte), i);
+		save_item(NAME(m_twgs_kernel.c.latches[i].valid), i);
+		save_item(NAME(m_twgs_kernel.c.latches[i].bus.address), i);
+		save_item(NAME(m_twgs_kernel.c.latches[i].bus.id), i);
+		save_item(NAME(m_twgs_kernel.c.latches[i].bus.data), i);
+		save_item(NAME(m_twgs_kernel.c.latches[i].bus.type), i);
+		save_item(NAME(m_twgs_kernel.c.latches[i].bus.seed), i);
+	}
 	save_item(NAME(m_twgs_mask));
 	save_item(NAME(m_twgs_depth));
 	save_item(NAME(m_twgs));
@@ -1298,6 +1443,9 @@ void apple2gs_state::machine_reset()
 	m_twgs_post = false;
 	m_twgs_write_timer->adjust(attotime::never);
 	m_maincpu->set_memory_hook(g65816_device::memory_hook_delegate());
+	m_maincpu->set_cached_access(g65816_device::cached_access_delegate());
+	m_maincpu->set_internal_hook(g65816_device::internal_hook_delegate());
+	m_twgs_kernel_on = false;
 	m_maincpu->set_data_hook(g65816_device::data_hook_delegate(&apple2gs_state::twdc_access, this));
 	if (!m_twgs_real)
 		m_maincpu->reset();
@@ -1359,8 +1507,20 @@ void apple2gs_state::machine_reset()
 	}
 	if (m_twgs_real)
 	{
+		m_twgs_kernel_on = m_twgs;
+		if (cold_start)
+		{
+			m_twgs_kernel = twgs_decoded::timing_scaled<TWGS_TIME_SCALE>{};
+			m_twgs_kernel_started = false;
+			m_twgs_transaction = m_twgs_retired = m_twgs_visible = 0;
+			m_twgs_unemitted_cycles = 0;
+			m_twgs_cycle_charge = 0;
+		}
 		m_maincpu->set_memory_hook(m_twgs ? g65816_device::memory_hook_delegate(&apple2gs_state::twgs_memory, this) : g65816_device::memory_hook_delegate());
+		m_maincpu->set_cached_access(m_twgs ? g65816_device::cached_access_delegate(&apple2gs_state::twgs_cached_access, this) : g65816_device::cached_access_delegate());
+		m_maincpu->set_internal_hook(m_twgs_kernel_on ? g65816_device::internal_hook_delegate(&apple2gs_state::twgs_internal, this) : g65816_device::internal_hook_delegate());
 		m_maincpu->set_data_hook(g65816_device::data_hook_delegate(&apple2gs_state::twdc_access, this));
+		update_speed();
 		m_maincpu->reset();
 	}
 }
@@ -1401,6 +1561,17 @@ void apple2gs_state::lower_irq(int irq)
 
 void apple2gs_state::update_speed()
 {
+	if (m_twgs_kernel_on)
+	{
+		// Keep the accounting clock fixed at the card oscillator / 4. Actual
+		// slow/fast selection and transition latency come from the GALs.
+		m_last_speed = true;
+		if (m_maincpu->unscaled_clock() != m_accel_speed)
+			m_maincpu->set_unscaled_clock(m_accel_speed);
+		if (m_bt_mode != BT_TWGS || m_bt_cycle != BT_PER_SEC / m_accel_speed)
+			bt_setup(m_accel_speed);
+		return;
+	}
 	const bool isfast = (m_speed & SPEED_HIGH) && !(m_speed & m_motors_active);
 	const bool noaccel = !m_accel_fast || m_accel_temp_slowdown;
 	u32 new_speed = m_accel_speed;
@@ -1669,8 +1840,13 @@ u8 apple2gs_state::twgs_rom_r(offs_t offset)
 {
 	if (offset >= 0x8000)
 		return m_twgs_rom[offset & 0x7fff];
-	if (offset == 0)
-		return m_twgs_config;
+	if (offset < 0x4000)
+	{
+		// GAL6/P12 and the FPGA select this whole range. Resolve the driven
+		// nibble from old FPGA state before the CPU-fall clock, including CH
+		// on D0; keep the existing undriven-bus value on the other lanes.
+		return m_twgs_kernel.c.fpga.config_read(0xbc0000 | offset, true, true, offset ? 0xbc : 0);
+	}
 	if (offset == 0x4000)
 	{
 		if (BIT(m_twgs_serial, 7))
@@ -1742,6 +1918,179 @@ bool apple2gs_state::twgs_shadowed(u32 address) const
 	return low >= 0x6000 && low < 0xa000 && aux && !(m_shadow & SHAD_SUPERHIRES);
 }
 
+u8 apple2gs_state::twgs_board_read(twgs_decoded::transaction const &w, u64 begin, u64 end)
+{
+	begin /= TWGS_TIME_SCALE;
+	end /= TWGS_TIME_SCALE;
+	const bool slow = m_bt_slow;
+	m_bt_busfree = end;
+	// Keep the existing GLU strobe convention within the actual final Mega II
+	// cycle. An isolated access can include a preceding synchronization wait.
+	const bool mega = m_twgs_kernel.bus_class(w) == BC_MEGA;
+	m_bt_slot = mega ? end - ((end % BT_LINE) ? BT_MEGA : 16 * BT_CLK) : begin;
+	m_bt_slot_ok = true;
+	m_snd_force = bt_at(m_bt_slot);
+	m_snd_force_on = true;
+	u8 data;
+	if (w.type == g65816_device::BUS_VECTOR)
+		data = m_maincpu->space(g65816_device::AS_VECTORS).read_byte(w.address & 0x1f);
+	else if (m_twgs_boot && (w.address >> 16) == 0 && (w.address & 0xffff) >= 0x8000)
+		data = m_twgs_rom[w.address & 0x7fff];
+	else if ((w.address >> 16) == 0xbc)
+	{
+		m_twgs_boot = false;
+		data = twgs_rom_r(w.address & 0xffff);
+	}
+	else
+		data = m_maincpu->space(AS_PROGRAM).read_byte(w.address);
+	m_snd_force_on = false;
+	m_bt_slow = slow;
+	return data;
+}
+
+void apple2gs_state::twgs_board_write(twgs_decoded::transaction const &w, u64 begin, u64 end)
+{
+	begin /= TWGS_TIME_SCALE;
+	end /= TWGS_TIME_SCALE;
+	m_twgs_retired = std::max(m_twgs_retired, w.id);
+	// BC belongs to the card. FPGA/register capture happens at CPU completion;
+	// it is never converted into a motherboard write by a barrier or drain.
+	if ((w.address >> 16) == 0xbc)
+		return;
+	const bool slow = m_bt_slow;
+	m_bt_busfree = end;
+	const bool mega = m_twgs_kernel.bus_class(w) == BC_MEGA;
+	m_bt_slot = mega ? end - ((end % BT_LINE) ? BT_MEGA : 16 * BT_CLK) : begin;
+	m_bt_slot_ok = true;
+	m_snd_force = bt_at(m_bt_slot);
+	m_snd_force_on = true;
+	m_maincpu->space(AS_PROGRAM).write_byte(w.address, w.data);
+	m_snd_force_on = false;
+	m_bt_slow = slow;
+}
+
+void apple2gs_state::twgs_kernel_schedule()
+{
+	if (m_twgs_retired >= m_twgs_visible)
+	{
+		if (m_twgs_write_timer->enabled())
+			m_twgs_write_timer->adjust(attotime::never);
+		return;
+	}
+	const attotime now = machine().time();
+	const attotime when = std::max(now, twgs_at(m_twgs_kernel.gs_event));
+	if (!m_twgs_write_timer->enabled() || m_twgs_write_timer->expire() != when)
+		m_twgs_write_timer->adjust(when - now);
+}
+
+void apple2gs_state::twgs_kernel_cycle(u32 address, int type, u8 &data)
+{
+	auto &t = m_twgs_kernel;
+	t.speed = (m_speed & m_motors_active) ? (m_speed & ~SPEED_HIGH) : m_speed;
+	t.shadow = m_shadow;
+	if (!m_twgs_kernel_started)
+	{
+		t.x4 = (BT_PER_SEC * TWGS_TIME_SCALE) / (u64(m_accel_speed) * 4);
+		t.c.mask = m_twgs_mask;
+		t.start(twgs_ticks(m_maincpu->local_time()));
+		m_twgs_kernel_started = true;
+	}
+	const u64 start = t.now, old_mega = t.mega_cycles, old_board = t.board_cycles, old_refresh = t.refresh_cycles;
+	twgs_decoded::transaction w{address, ++m_twgs_transaction, data, u8(type), false};
+	t.access(w, twgs_board{*this});
+	const u64 duration = t.now - start;
+	const u64 charge = duration > t.x4 * 4 ? duration - t.x4 * 4 : 0;
+	const u64 stall = charge / TWGS_TIME_SCALE;
+	m_bt_idx++;
+	m_bt_istall += stall;
+	// Retain even the first partial clock's credit. Clamping each transfer
+	// would let machine time creep ahead of the decoded CPU/GS edge stream.
+	m_twgs_cycle_charge += s64(duration) - s64(t.x4 * 4);
+	m_btc[BTC_MEGA] += t.mega_cycles - old_mega;
+	m_btc[BTC_FAST] += t.board_cycles - old_board - (t.mega_cycles - old_mega);
+	m_btc[BTC_REFRESH] += t.refresh_cycles - old_refresh;
+	u64 *const page = &m_btpage[(address >> 8) * 4];
+	const bool internal = type >= g65816_device::BUS_INTERNAL;
+	if (w.read())
+	{
+		data = t.c.receipt;
+		m_btc[BTC_READS]++;
+		page[0]++;
+		if (t.c.from_sram && !t.had_bus)
+			m_btc[BTC_HITS]++;
+		else
+		{
+			page[1]++;
+			m_btpc[m_bt_ipc * 3 + 1]++;
+			m_btc[t.c.pins.eligible ? BTC_MISSES : BTC_UNCACHED]++;
+			if (t.c.pins.eligible)
+				m_btc[type == g65816_device::BUS_OPCODE ? BTC_MISS_OPCODE : type == g65816_device::BUS_OPERAND ? BTC_MISS_OPERAND : BTC_MISS_DATA]++;
+		}
+	}
+	else
+	{
+		m_btc[BTC_WRITES]++;
+		page[2]++;
+		if ((address >> 16) == 0xbc)
+			twgs_rom_w(address & 0xffff, data);
+		else if ((address >> 16) >= 0x80 || t.bus_class(w) != BC_RAM)
+			m_twgs_visible = w.id;
+	}
+	m_btc[internal ? BTC_STALL_INTERNAL : w.read() ? BTC_STALL_READ : BTC_STALL_WRITE] += stall;
+	page[3] += stall / BT_PAGE_UNIT;
+	m_btpc[m_bt_ipc * 3] += stall / BT_PAGE_UNIT;
+	if (m_twgs_visible > m_twgs_retired || m_twgs_write_timer->enabled())
+		twgs_kernel_schedule();
+}
+
+u64 apple2gs_state::twgs_kernel_instruction(u32 pc)
+{
+	const u64 now = m_maincpu->total_cycles();
+	if (!m_bt_resync)
+	{
+		const u64 base = now - m_bt_cprev - m_bt_charged;
+		if (base > BT_IDLE)
+		{
+			// WAI/STP expose their held read bus while the CPU is suspended.
+			const u64 deadline = twgs_ticks(m_maincpu->local_time());
+			m_twgs_kernel.advance_until(deadline, twgs_board{*this});
+		}
+		else if (base != m_bt_idx)
+		{
+			++m_twgs_unemitted_cycles;
+			fatalerror("TWGS CPU bus coverage at %06x: base=%llu emitted=%llu\n", pc,
+				(unsigned long long)base, (unsigned long long)m_bt_idx);
+		}
+		const u64 duration = m_twgs_kernel.now / TWGS_TIME_SCALE - m_bt_istart;
+		m_btc[BTC_TIME] += duration;
+		m_btpc[m_bt_ipc * 3 + 2] += duration / BT_PAGE_UNIT;
+	}
+	m_bt_resync = false;
+	m_bt_istart = m_twgs_kernel.now / TWGS_TIME_SCALE;
+	m_btc[BTC_INSTR]++;
+	m_bt_cprev = now;
+	m_bt_charged = m_bt_idx = m_bt_istall = 0;
+	m_bt_ipc = pc < 0x060000 ? pc >> 4 : 0x6000 + (pc >> 8);
+	return 0;
+}
+
+int apple2gs_state::twgs_kernel_access(u32 address, int type, u8 &data)
+{
+	if (type == g65816_device::BUS_OPCODE)
+		twgs_kernel_instruction(address);
+	twgs_kernel_cycle(address, type, data);
+	const u64 cycle = m_twgs_kernel.x4 * 4;
+	const u64 n = m_twgs_cycle_charge > 0 ? u64(m_twgs_cycle_charge) / cycle : 0;
+	m_twgs_cycle_charge -= n * cycle;
+	m_bt_charged += n;
+	return int(n);
+}
+
+int apple2gs_state::twgs_internal(u32 address, int type, u8 data)
+{
+	return twgs_kernel_access(address, type, data);
+}
+
 void apple2gs_state::twgs_drain(unsigned count)
 {
 	// The bus latches retain the CPU bank byte. FPI performs shadowing when
@@ -1773,9 +2122,36 @@ void apple2gs_state::twgs_schedule_write()
 	}
 }
 
+void apple2gs_state::twgs_flush_due()
+{
+	if (m_twgs_kernel_on)
+	{
+		if (m_twgs_kernel_started)
+			m_twgs_kernel.advance_until(twgs_ticks(machine().time()), twgs_board{*this});
+		twgs_kernel_schedule();
+		return;
+	}
+
+}
+
 TIMER_CALLBACK_MEMBER(apple2gs_state::twgs_write_complete)
 {
+	if (m_twgs_kernel_on)
+	{
+		twgs_flush_due();
+		return;
+	}
 	twgs_drain(1);
+}
+
+bool apple2gs_state::twgs_cached_access(u32 address, int type, u8 &data, int &cycles)
+{
+	if (m_twgs_kernel_on)
+	{
+		cycles = twgs_kernel_access(address, type, data);
+		return true;
+	}
+	return false;
 }
 
 bool apple2gs_state::twgs_memory(u32 address, int type, u8 &data)
@@ -2761,6 +3137,7 @@ TIMER_DEVICE_CALLBACK_MEMBER(apple2gs_state::apple2_interrupt)
 
 TIMER_DEVICE_CALLBACK_MEMBER(apple2gs_state::apple2_vgc)
 {
+	twgs_flush_due();
 	// flush the previous scanline to ensure SCB or palette changes are visible
 	m_screen->update_now();
 
@@ -3983,7 +4360,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 			break;
 
 		case 0x3c:  // SOUNDCTL
-			if (((m_bt_mode == BT_ZIP) || (m_bt_mode == BT_TWGS)))
+			if (!m_snd_force_on && ((m_bt_mode == BT_ZIP) || (m_bt_mode == BT_TWGS)))
 			{
 				m_glu_hold = true;
 				m_glu_hold_reg = 0xc03c;
@@ -3997,7 +4374,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 			// The CPU core writes the device before the bus hook. On a Zip or
 			// a TransWarp the byte is not on the GLU until that hook's cycle
 			// (its own bus cycle). Judge the collision there.
-			if (m_bt_mode == BT_ZIP || m_bt_mode == BT_TWGS)
+			if (!m_snd_force_on && (m_bt_mode == BT_ZIP || m_bt_mode == BT_TWGS))
 			{
 				m_glu_hold = true;
 				m_glu_hold_reg = 0xc03d;
@@ -4010,7 +4387,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 		case 0x3e:  // SOUNDADRL
 		case 0x3f:  // SOUNDADRH
 			// On a Zip or a TransWarp the store reaches the GLU at its own bus cycle.
-			if (m_bt_mode == BT_ZIP || m_bt_mode == BT_TWGS)
+			if (!m_snd_force_on && (m_bt_mode == BT_ZIP || m_bt_mode == BT_TWGS))
 			{
 				m_glu_hold = true;
 				m_glu_hold_reg = 0xc000 | offset;

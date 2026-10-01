@@ -75,6 +75,7 @@ public:
 	auto nmi_w() { return m_out_nmi_cb.bind(); }
 	auto inh_w() { return m_out_inh_cb.bind(); }
 	auto dma_w() { return m_out_dma_cb.bind(); }
+	void set_dma_sync(std::function<void ()> sync) { m_dma_sync = std::move(sync); }
 
 	void add_a2bus_card(int slot, device_a2bus_card_interface *card);
 	device_a2bus_card_interface *get_a2bus_card(int slot);
@@ -104,6 +105,7 @@ protected:
 
 	// internal state
 	required_address_space m_maincpu_space;
+	std::function<void ()> m_dma_sync;
 
 	devcb_write_line    m_out_irq_cb;
 	devcb_write_line    m_out_nmi_cb;
