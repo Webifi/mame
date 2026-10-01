@@ -3,6 +3,15 @@
 #include "twgs_cache_logic.h"
 #include <array>
 #include <initializer_list>
+// Rare paths kept out of the hot functions' register allocation: with
+// preserve_most the caller saves nothing around the call.
+#ifndef TWGS_COLD
+#if defined(__clang__)
+#define TWGS_COLD [[gnu::noinline,gnu::cold]] __attribute__((preserve_most))
+#else
+#define TWGS_COLD [[gnu::noinline,gnu::cold]]
+#endif
+#endif
 namespace twgs_decoded {
 struct gal3_tables {
  std::array<std::array<uint8_t,65536>,3> bank{},data{};
@@ -25,11 +34,39 @@ struct gal3_tables {
  }
 };
 inline const gal3_tables g3_transitions;
+// GAL3 input pins of one access before its registered outputs are merged:
+// VDA, VPA, VPB and the bank byte, as cache_decode::access places them.
+struct gal3_input_table {
+ std::array<uint32_t,2048> pins{};
+ gal3_input_table() noexcept {
+  constexpr unsigned map[8]={10,11,8,9,6,7,4,5};
+  for(unsigned cls=0;cls<8;++cls)for(unsigned bank=0;bank<256;++bank){
+   uint32_t p=0xffffff;
+   auto put=[&](unsigned n,bool v){p=(p&~(1u<<n))|(uint32_t(v)<<n);};
+   put(2,cls&1);put(3,cls&2);put(13,false);put(14,cls&4);
+   for(unsigned b=0;b<8;++b)put(map[b],(bank>>b)&1);
+   pins[(cls<<8)|bank]=p&~0x7f8000u;
+  }
+ }
+};
+inline const gal3_input_table g3_inputs;
 struct decoded_access {
  uint16_t tag;
  bool eligible, bank_io, irq, fast_instruction;
  uint32_t gal3_pins;
 };
+// Results of cache_decode::access_io (GAL4/GAL5/GAL7 settling) per input:
+// the FPGA pads word and the address bits, read, VPB, cache size, GAL4
+// registered outputs, GAL3 H/I/J and the GAL4/GAL5 programming variants.
+// The settled GAL4 pin word is stored too: it is the next call's state.
+struct io_memo {
+ static constexpr unsigned BITS=12,SIZE=1u<<BITS,LIMIT=SIZE/2;
+ struct entry {uint64_t fp=0,key=~0ULL; uint32_t g4=0; uint16_t tag=0; bool eligible=false,bank_io=false;};
+ entry table[SIZE];
+ unsigned used=0;
+ uint64_t built=0;
+};
+inline io_memo io_cache;
 struct cache_decode {
  uint32_t g3=0x7f8000, g4=0xffffff;
  unsigned gal3_revision=2; // 0=B, 1=C, 2=E; hardware programming revision, not speed grade.
@@ -40,19 +77,20 @@ struct cache_decode {
  static bool bit(uint32_t p,unsigned n) noexcept {return (p>>n)&1;}
  static bool pad(uint64_t p,unsigned n) noexcept {return (p>>n)&1;}
  uint32_t eval3(uint32_t p) const noexcept {return gal3_revision==0 ? gal3b(p) : gal3_revision==1 ? gal3c(p) : gal3e(p);}
- decoded_access access(uint32_t address, bool read, bool vda, bool vpa, bool vpb, uint64_t fp, bool cache32) noexcept {
+ [[gnu::always_inline]] decoded_access access(uint32_t address, bool read, bool vda, bool vpa, bool vpb, uint64_t fp, bool cache32) noexcept {
   const unsigned bank=address>>16;
-  uint32_t i3=0xffffff;
-  i3=put(i3,2,vda);i3=put(i3,3,vpa);i3=put(i3,13,false);i3=put(i3,14,vpb);
-  for(unsigned b=0;b<8;++b)i3=put(i3,bank_pin[b],(bank>>b)&1);
   constexpr uint32_t g3out=0x7f8000;
-  const uint32_t g3reg=(15u<<17)|(gal3_revision==2 ? (1u<<22) : 0);
-  i3=(i3&~g3out)|(g3&g3out);
+  const unsigned cls=unsigned(vda)|(unsigned(vpa)<<1)|(unsigned(vpb)<<2);
+  uint32_t i3=g3_inputs.pins[(cls<<8)|bank];
   if(use_tables){
-   const unsigned state=((g3>>17)&15)|((g3>>18)&16),cls=unsigned(vda)|(unsigned(vpa)<<1)|(unsigned(vpb)<<2);
+   const unsigned state=((g3>>17)&15)|((g3>>18)&16);
    g3=uint32_t(g3_transitions.bank[gal3_revision][(state<<11)|(cls<<8)|bank])<<15;
-   i3=(i3&~g3out)|g3;
-  }else for(unsigned j=0;j<8;++j){const auto n=(eval3(i3)&(g3out&~g3reg))|(g3&g3reg);if(n==g3)break;g3=n;i3=(i3&~g3out)|g3;}
+   i3|=g3;
+  }else{
+   const uint32_t g3reg=(15u<<17)|(gal3_revision==2 ? (1u<<22) : 0);
+   i3|=g3&g3out;
+   for(unsigned j=0;j<8;++j){const auto n=(eval3(i3)&(g3out&~g3reg))|(g3&g3reg);if(n==g3)break;g3=n;i3=(i3&~g3out)|g3;}
+  }
   const bool io_bank = bank==0xe0 || bank==0xe1 || (bank<2 && !pad(fp,36));
   if (!io_bank) {
    // Fuse reduction: every GAL4 AD0/AD1 rejection product requires BANK_IO=0.
@@ -64,6 +102,29 @@ struct cache_decode {
    g4 |= (1u<<15)|(1u<<18)|(1u<<22);
    return {uint16_t((bank^1)|(tag2<<8)),eligible,false,bit(g3,18),bit(g3,22),i3};
   }
+  return access_io(address,read,vpb,fp,cache32,i3);
+ }
+ // access_io through io_cache: identical results and the same g4.
+ decoded_access access_io_cached(uint32_t address, bool read, bool vpb, uint64_t fp, bool cache32, uint32_t i3) noexcept {
+  const uint64_t key=(address>>8)|(uint64_t(read)<<16)|(uint64_t(vpb)<<17)|(uint64_t(cache32)<<18)|(uint64_t(bit(g4,15))<<19)|(uint64_t(bit(g4,18))<<20)|(uint64_t(bit(g4,22))<<21)
+   |(uint64_t(bit(g3,15))<<22)|(uint64_t(bit(g3,16))<<23)|(uint64_t(bit(g3,21))<<24)|(uint64_t(gal4_b)<<25)|(uint64_t(gal5_permuted)<<26);
+  const uint64_t h=(fp*0x9E3779B97F4A7C15ULL)^(key*0xC2B2AE3D27D4EB4FULL);
+  for(unsigned i=unsigned(h>>(64-io_memo::BITS));;i=(i+1)&(io_memo::SIZE-1)){
+   auto &e=io_cache.table[i];
+   if(e.key==key&&e.fp==fp){g4=e.g4;return {e.tag,e.eligible,e.bank_io,bit(g3,18),bit(g3,22),i3};}
+   if(e.key==~0ULL)return access_io_insert(i,key,address,read,vpb,fp,cache32,i3);
+  }
+ }
+ TWGS_COLD decoded_access access_io_insert(unsigned i,uint64_t key,uint32_t address, bool read, bool vpb, uint64_t fp, bool cache32, uint32_t i3) noexcept {
+  if(io_cache.used>=io_memo::LIMIT){for(auto &x:io_cache.table)x.key=~0ULL;io_cache.used=0;i=unsigned(((fp*0x9E3779B97F4A7C15ULL)^(key*0xC2B2AE3D27D4EB4FULL))>>(64-io_memo::BITS));}
+  const decoded_access d=access_io(address,read,vpb,fp,cache32,i3);
+  ++io_cache.used;++io_cache.built;
+  io_cache.table[i]={fp,key,g4,d.tag,d.eligible,d.bank_io};
+  return d;
+ }
+ // I/O banks (E0, E1, and 00/01 while the FPGA maps them): GAL4, GAL5, GAL7.
+ [[gnu::noinline]] decoded_access access_io(uint32_t address, bool read, bool vpb, uint64_t fp, bool cache32, uint32_t i3) noexcept {
+  const unsigned bank=address>>16;
   uint32_t i4=0xffffff;
   for(unsigned b=2;b<8;++b)i4=put(i4,bank_pin[b],(bank>>b)&1);
   i4=put(i4,10,(bank>>1)&1);i4=put(i4,16,bank&1);

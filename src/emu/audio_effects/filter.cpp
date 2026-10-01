@@ -167,18 +167,21 @@ void audio_effect_filter::apply(const emu::detail::output_buffer_flat<sample_t> 
 		return;
 	}
 
+	const auto filters = m_filter;
 	u32 samples = src.available_samples();
 	dest.prepare_space(samples);
 
 	for(u32 channel = 0; channel != m_channels; channel++) {
 		const sample_t *srcd = src.ptrs(channel, 0);
 		sample_t *destd = dest.ptrw(channel, 0);
+		auto history = m_history[channel];
 		for(u32 sample = 0; sample != samples; sample++) {
-			m_history[channel][0].push(*srcd++);
-			m_filter[0].apply(m_history[channel][0], m_history[channel][1]);
-			m_filter[1].apply(m_history[channel][1], m_history[channel][2]);
-			*destd++ = m_history[channel][2].m_v0;
+			history[0].push(*srcd++);
+			filters[0].apply(history[0], history[1]);
+			filters[1].apply(history[1], history[2]);
+			*destd++ = history[2].m_v0;
 		}
+		m_history[channel] = history;
 	}
 
 	dest.commit(samples);

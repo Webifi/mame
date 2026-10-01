@@ -589,6 +589,7 @@ private:
 	u32 m_twgs_waddr[4]{};
 	u8 m_twgs_wdata[4]{};
 	u64 m_twgs_wend[4]{};
+	bool m_twgs_wdefer[4]{};
 	u8 m_twgs_wcount = 0;
 	bool m_twgs_post = false, m_twgs_access_io = false;
 	emu_timer *m_twgs_write_timer = nullptr;
@@ -1144,6 +1145,9 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_twgs_kernel.c.from_sram));
 	save_item(NAME(m_twgs_kernel.c.external_advance));
 	save_item(NAME(m_twgs_kernel.c.receipt));
+	// A load can resume a held-bus completion before setword recomputes these.
+	save_item(NAME(m_twgs_kernel.c.sample_row));
+	save_item(NAME(m_twgs_kernel.c.raw_match));
 	save_item(NAME(m_twgs_kernel.c.pins.tag));
 	save_item(NAME(m_twgs_kernel.c.pins.eligible));
 	save_item(NAME(m_twgs_kernel.c.pins.bank_io));
@@ -1209,6 +1213,7 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_twgs_waddr));
 	save_item(NAME(m_twgs_wdata));
 	save_item(NAME(m_twgs_wend));
+	save_item(NAME(m_twgs_wdefer));
 	save_item(NAME(m_twgs_wcount));
 	save_item(NAME(m_twgs_post));
 	save_item(NAME(m_twgs_access_io));
@@ -1476,6 +1481,8 @@ void apple2gs_state::machine_reset()
 		update_speed();
 		m_maincpu->reset();
 	}
+	if (!m_accel_present)
+		m_maincpu->set_data_hook(g65816_device::data_hook_delegate());
 }
 
 void apple2gs_state::raise_irq(int irq)
@@ -2033,7 +2040,7 @@ int apple2gs_state::twgs_kernel_access(u32 address, int type, u8 &data)
 		twgs_kernel_instruction(address);
 	twgs_kernel_cycle(address, type, data);
 	const u64 cycle = m_twgs_kernel.x4 * 4;
-	const u64 n = m_twgs_cycle_charge > 0 ? u64(m_twgs_cycle_charge) / cycle : 0;
+	const u64 n = m_twgs_cycle_charge >= s64(cycle) ? u64(m_twgs_cycle_charge) / cycle : 0;
 	m_twgs_cycle_charge -= n * cycle;
 	m_bt_charged += n;
 	return int(n);
@@ -2058,6 +2065,7 @@ void apple2gs_state::twgs_drain(unsigned count)
 			m_twgs_waddr[i] = m_twgs_waddr[i + 1];
 			m_twgs_wdata[i] = m_twgs_wdata[i + 1];
 			m_twgs_wend[i] = m_twgs_wend[i + 1];
+			m_twgs_wdefer[i] = m_twgs_wdefer[i + 1];
 		}
 	}
 	m_bt_slow = slow;
@@ -2066,12 +2074,25 @@ void apple2gs_state::twgs_drain(unsigned count)
 
 void apple2gs_state::twgs_schedule_write()
 {
-	if (!m_twgs_wcount)
-		m_twgs_write_timer->adjust(attotime::never);
+	// Unshadowed RAM has no autonomous reader. Cache misses and mapping/IO
+	// accesses drain it before use; slot DMA synchronizes at its bus access.
+	// Keep a timer whenever any queued write can affect a peripheral/video.
+	// Bus slot reservation and full-buffer CPU waits are unchanged.
+	bool observable = false;
+	for (unsigned i = 0; i < m_twgs_wcount; ++i)
+		observable |= !m_twgs_wdefer[i];
+	if (!observable)
+	{
+		if (m_twgs_write_timer->expire() != attotime::never)
+			m_twgs_write_timer->adjust(attotime::never);
+	}
 	else
 	{
 		const attotime end = attotime::from_double(double(m_twgs_wend[0]) / double(BT_PER_SEC));
-		m_twgs_write_timer->adjust(std::max(attotime::zero, end - machine().time()));
+		const attotime now = machine().time();
+		const attotime when = std::max(now, end);
+		if (!m_twgs_write_timer->enabled() || m_twgs_write_timer->expire() != when)
+			m_twgs_write_timer->adjust(when - now);
 	}
 }
 
@@ -2084,7 +2105,15 @@ void apple2gs_state::twgs_flush_due()
 		twgs_kernel_schedule();
 		return;
 	}
-
+	// Materialize only completed bus cycles before an external observation.
+	if (!m_twgs_wcount)
+		return;
+	const u64 now = u64(machine().time().as_double() * double(BT_PER_SEC));
+	unsigned count = 0;
+	while (count < m_twgs_wcount && m_twgs_wend[count] && m_twgs_wend[count] <= now)
+		++count;
+	if (count)
+		twgs_drain(count);
 }
 
 TIMER_CALLBACK_MEMBER(apple2gs_state::twgs_write_complete)
@@ -2104,7 +2133,72 @@ bool apple2gs_state::twgs_cached_access(u32 address, int type, u8 &data, int &cy
 		cycles = twgs_kernel_access(address, type, data);
 		return true;
 	}
-	return false;
+	// Combine the memory, data and timing callbacks for ordinary SRAM hits.
+	// Special bank and bootstrap reads retain the full motherboard path.
+	if (m_twgs_boot || m_bt_mode != BT_TWGS || (address >> 16) == 0xbc ||
+		(address >> 16) == 0xbf || (twgs_io_bank(address) && (address & 0xf000) == 0xc000) ||
+		!BIT(m_twgs_config, 2) || !BIT(m_speed, 7) ||
+		(!BIT(m_twgs_config, 3) && m_maincpu->irq_masked()) ||
+		(type == g65816_device::BUS_READ && !BIT(m_twgs_config, 1)))
+		return false;
+	const u32 tag = (twgs_io_bank(address) ? twgs_taddr(address, type) : address) + 1;
+	const u32 slot = address & m_twgs_mask;
+	if (type == g65816_device::BUS_WRITE)
+	{
+		// The enabled card captures ordinary stores in its four latches and
+		// updates SRAM. Device, ROM and bootstrap stores retain
+		// the general path. No motherboard handler runs at capture time.
+		m_twgs_access_io = false;
+		m_twgs_access_cacheable = true;
+		m_twgs_access_tag = tag;
+		m_twgs_access_hit = m_twgs_tag[slot] == tag;
+		if (m_twgs_wcount >= TWGS_WRITE_LATCHES)
+			twgs_drain(1);
+		m_bt_slow = twgs_shadowed(address);
+		m_twgs_waddr[m_twgs_wcount] = address;
+		m_twgs_wdata[m_twgs_wcount] = data;
+		m_twgs_wdefer[m_twgs_wcount] = (address >> 16) < 0x80 && !m_bt_slow && ((address >> 16) >= 2 || (address & 0xf000) != 0xc000);
+		m_twgs_wend[m_twgs_wcount++] = 0;
+		m_twgs_post = true;
+		m_twgs_tag[slot] = tag;
+		m_twgs_cache_data[slot] = data;
+		cycles = bt_access(address, type, data);
+		return true;
+	}
+	if (m_twgs_tag[slot] != tag)
+		return false;
+	data = m_twgs_cache_data[slot];
+	const bool opcode = type == g65816_device::BUS_OPCODE;
+	const bool stretched_opcode = opcode && REPSEP_SLOW_CYCLES && (data == 0xc2 || data == 0xe2);
+	if (!m_bt_twslow && !m_twgs_post && !stretched_opcode)
+	{
+		// An SRAM hit has no motherboard transaction. Only an opcode needs
+		// to close the previous instruction and account its internal cycles.
+		m_bt_slow = m_bt_slot_ok = false;
+		if (opcode)
+			m_bt_frac += bt_instruction(address);
+		m_bt_idx++;
+		m_btc[BTC_READS]++;
+		m_btc[BTC_HITS]++;
+		m_btpage[(address >> 8) * 4]++;
+		cycles = 0;
+		if (m_bt_frac >= m_bt_cycle)
+		{
+			const u64 n = m_bt_frac / m_bt_cycle;
+			m_bt_frac -= n * m_bt_cycle;
+			m_bt_charged += n;
+			cycles = int(n);
+		}
+		return true;
+	}
+	// These are inputs to the general hook, not state of the SRAM. A hit
+	// completed above needs no descriptor for a motherboard transaction.
+	m_twgs_access_io = false;
+	m_twgs_access_cacheable = true;
+	m_twgs_access_tag = tag;
+	m_twgs_access_hit = true;
+	cycles = bt_access(address, type, data);
+	return true;
 }
 
 bool apple2gs_state::twgs_memory(u32 address, int type, u8 &data)
@@ -2146,6 +2240,7 @@ bool apple2gs_state::twgs_memory(u32 address, int type, u8 &data)
 	m_bt_slow = twgs_shadowed(address);
 	m_twgs_waddr[m_twgs_wcount] = address;
 	m_twgs_wdata[m_twgs_wcount] = data;
+	m_twgs_wdefer[m_twgs_wcount] = bank < 0x80 && !m_bt_slow && (bank >= 2 || (address & 0xf000) != 0xc000);
 	m_twgs_wend[m_twgs_wcount++] = 0;
 	m_twgs_post = true;
 	return true;
@@ -2739,6 +2834,25 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 
 	const u64 t = m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
 	m_bt_idx++;
+
+	// A cache hit has no motherboard transaction. Keep its counters and
+	// instruction charge, without decoding or scheduling an unused bus slot.
+	if (m_bt_mode == BT_TWGS && !m_bt_twslow && !m_twgs_post &&
+		type != g65816_device::BUS_WRITE && (address >> 16) != 0xbc &&
+		m_twgs_access_cacheable && m_twgs_access_hit &&
+		(type == g65816_device::BUS_OPCODE || type == g65816_device::BUS_OPERAND || BIT(m_twgs_config, 1)))
+	{
+		m_btc[BTC_READS]++;
+		m_btc[BTC_HITS]++;
+		m_btpage[(address >> 8) * 4]++;
+		m_bt_frac += charge;
+		if (m_bt_frac < m_bt_cycle)
+			return 0;
+		const u64 n = m_bt_frac / m_bt_cycle;
+		m_bt_frac -= n * m_bt_cycle;
+		m_bt_charged += n;
+		return int(n);
+	}
 
 	const u32 bank = address >> 16;
 	const u32 a16 = address & 0xffff;
