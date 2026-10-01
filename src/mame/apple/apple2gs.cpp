@@ -728,6 +728,7 @@ private:
 	int bt_access(u32 address, int type, u8 data);
 	u64 bt_instruction(u32 pc);
 	u64 bt_fast(u64 t, bool refresh);
+	u64 bt_mega_start(u64 t) const;
 	u64 bt_mega(u64 t);
 	u64 bt_bus(u64 t, int cls);
 	bool bt_aux(u32 a16, bool write);
@@ -2372,22 +2373,19 @@ u64 apple2gs_state::bt_fast(u64 t, bool refresh)
 	return b + BT_FAST;
 }
 
-u64 apple2gs_state::bt_mega(u64 t)
+// A slow access presented at t runs in the first Mega II cycle that starts at
+// or after t (Lowry FPI notes p.23). Cycle 64 of each line is the long one.
+u64 apple2gs_state::bt_mega_start(u64 t) const
 {
 	const u64 line = (t / BT_LINE) * BT_LINE;
 	const u64 pos = t - line;
-	u64 b, len;
-	if (pos <= 64 * BT_MEGA)
-	{
-		const u64 k = (pos + BT_MEGA - 1) / BT_MEGA;
-		b = line + k * BT_MEGA;
-		len = (k == 64) ? BT_MEGA_LAST : BT_MEGA;
-	}
-	else
-	{
-		b = line + BT_LINE;
-		len = BT_MEGA;
-	}
+	return (pos <= 64 * BT_MEGA) ? line + ((pos + BT_MEGA - 1) / BT_MEGA) * BT_MEGA : line + BT_LINE;
+}
+
+u64 apple2gs_state::bt_mega(u64 t)
+{
+	const u64 b = bt_mega_start(t);
+	const u64 len = ((b % BT_LINE) == 64 * BT_MEGA) ? BT_MEGA_LAST : BT_MEGA;
 	m_btc[BTC_MEGA]++;
 	m_bt_fanchor = b + len;
 	m_bt_slot = b;
@@ -2888,10 +2886,11 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 				u64 accept = t;
 				if (m_bt_wcount >= m_bt_wdepth)
 				{
-					// US 4,794,523: the latch is still driving the previous byte
-					// (enabled on its phase 0). Stop until that cycle ends, which
-					// is the following phase 0, and enable the new byte there.
-					accept = m_bt_wbuf[0];
+					// US 4,794,523 Table I: the CPU stops until the previous byte's
+					// cycle ends, and CLR can latch the new byte only after DL1/DL2
+					// see that end (two ZipGS clocks). The byte misses the PH2 cycle
+					// that starts there, so a slow write takes the Mega II cycle after.
+					accept = ((m_bt_wbuf[0] + m_bt_cycle - 1) / m_bt_cycle + 1) * m_bt_cycle;
 					for (int i = 1; i < m_bt_wcount; i++)
 						m_bt_wbuf[i - 1] = m_bt_wbuf[i];
 					m_bt_wcount--;
@@ -3437,8 +3436,16 @@ attotime apple2gs_state::sndglu_now() const
 {
 	if (m_snd_force_on)
 		return m_snd_force;
+	if (m_bt_mode == BT_ZIP)
+	{
+		// ZipGS writes arrive forced, so this is a $C03C-$C03F read. The GLU
+		// select is a PH0 strobe: the read gets there only in the Mega II
+		// cycle that bt_access will charge for it, after any posted write.
+		const u64 t = m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
+		return bt_at(bt_mega_start(std::max(t, m_bt_busfree)));
+	}
 	const attotime now = machine().time();
-	if ((m_bt_mode != BT_ZIP) && (m_bt_mode != BT_TWGS))
+	if (m_bt_mode != BT_TWGS)
 		return now;
 	const attotime bus = bt_at(m_bt_busfree);
 	return (bus > now) ? bus : now;
