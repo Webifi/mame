@@ -273,12 +273,16 @@ void a2bus_device::set_dma_line(int state)
 
 uint8_t a2bus_device::dma_r(uint16_t offset)
 {
+	if (m_dma_sync)
+		m_dma_sync();
 	// Slot /DMA supplies A0-A15 only. The FPI/CYA prepends $C037.
 	return m_maincpu_space->read_byte((uint32_t(m_dma_bank) << 16) | offset);
 }
 
 void a2bus_device::dma_w(uint16_t offset, uint8_t data)
 {
+	if (m_dma_sync)
+		m_dma_sync();
 	m_maincpu_space->write_byte((uint32_t(m_dma_bank) << 16) | offset, data);
 }
 
