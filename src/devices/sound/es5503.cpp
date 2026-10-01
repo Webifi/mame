@@ -258,6 +258,51 @@ void es5503_device::advance_to(attotime time)
 			m_adc_result = m_adc_func();
 			continue;
 		}
+		// Complete an uninterrupted oscillator slot in one iteration. Nothing
+		// can observe the channel midpoint before target, and the DAC holds
+		// the same integer value across both halves of E-low.
+		if (m_phase == ADDRESS && m_next_tick + 4 <= target &&
+			(!m_adc_tick || m_adc_tick > m_next_tick + 4))
+		{
+			if (m_host_operation == HOST_NONE &&
+				m_slot < m_scan_enabled && (m_oscillators[m_slot].control & 1))
+			{
+				// A halted oscillator performs no waveform fetch. Its service
+				// still resets M0+H and contributes center level on its channel.
+				// Integrate the preceding DAC hold through this sample edge.
+				oscillator &o = m_oscillators[m_slot];
+				integrate_to(m_next_tick + 4);
+				m_fetch_control = o.control;
+				m_fetch_volume = o.vol;
+				m_fetch_active = false;
+				if ((o.control & 3) == 3)
+					o.accumulator = 0;
+				m_cstrb = true;
+				m_channel_strobe = o.control >> 4;
+				m_dac_channel = m_channel_strobe & (m_output_channels - 1);
+				m_dac_sample = 0;
+				++m_slot; // refresh slots follow, so this cannot wrap the scan
+				m_next_tick += 8;
+				continue;
+			}
+			integrate_to(m_next_tick);
+			m_cstrb = false;
+			commit_host();
+			address_phase();
+			m_phase = CHANNEL;
+			m_channel_strobe = (m_slot < m_scan_enabled) ? m_fetch_control >> 4 : 15;
+			integrate_to(m_next_tick + 4);
+			m_phase = SAMPLE;
+			sample_phase();
+			if (++m_slot == m_scan_enabled + 2)
+			{
+				m_slot = 0;
+				m_scan_enabled = m_oscsenabled;
+			}
+			m_phase = ADDRESS;
+			m_next_tick += 8;
+			continue;
+		}
 		integrate_to(m_next_tick);
 		switch (m_phase)
 		{

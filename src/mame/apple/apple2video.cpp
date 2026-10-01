@@ -1152,7 +1152,15 @@ uint32_t a2_video_device::screen_update_GS(screen_device &screen, bitmap_rgb32 &
 				scanline[BORDER_LEFT + 40 + col] = m_GSborder_colors[a2pixel[col]];
 		}
 	}
-	return 0;
+	// Raster work must still run at each beam position, including palette and
+	// border changes.  Only the host presentation can be elided.  Compare with
+	// the displayed buffer, not this drawing buffer's contents from two frames
+	// ago: alternating frames could otherwise be mistaken for unchanged video.
+	const bitmap_rgb32 &displayed = screen.curbitmap().as_rgb32();
+	if (&bitmap == &displayed)
+		return 0; // the first frame has no separate displayed buffer yet
+	return std::memcmp(&bitmap.pix(beamy), &displayed.pix(beamy), bitmap.width() * sizeof(u32))
+			? 0 : UPDATE_HAS_NOT_CHANGED;
 }
 
 template <a2_video_device::model Model, bool Invert, bool Flip>

@@ -137,6 +137,7 @@ bool emu_timer::enable(bool enable) noexcept
 void emu_timer::adjust(attotime start_delay, s32 param, const attotime &period) noexcept
 {
 	assert(m_scheduler);
+	const attotime old_deadline = m_scheduler->first_timer()->expire();
 
 	// if this is the callback timer, mark it modified
 	if (m_scheduler->m_callback_timer == this)
@@ -159,8 +160,10 @@ void emu_timer::adjust(attotime start_delay, s32 param, const attotime &period) 
 	m_scheduler->timer_list_remove(*this);
 	m_scheduler->timer_list_insert(*this);
 
-	// if this was inserted as the head, abort the current timeslice and resync
-	if (this == m_scheduler->first_timer())
+	// The executing slice is already bounded by the old first timer. Only
+	// an earlier deadline needs to shorten it. Keep the list reinsertion:
+	// callbacks sharing a timestamp must retain their original ordering.
+	if (this == m_scheduler->first_timer() && m_expire < old_deadline)
 		m_scheduler->abort_timeslice();
 }
 

@@ -710,7 +710,13 @@ attotime sound_stream::sample_to_time(u64 index) const
 {
 	attotime res = attotime::zero;
 	res.m_seconds = index / m_sample_rate;
-	res.m_attoseconds = muldivupu_64(index % m_sample_rate, ATTOSECONDS_PER_SECOND, m_sample_rate);
+	const u64 part = index % m_sample_rate;
+	const u64 whole = ATTOSECONDS_PER_SECOND / m_sample_rate;
+	const u64 remainder = ATTOSECONDS_PER_SECOND % m_sample_rate;
+	// Split the numerator before multiplying, preserving the upward rounding.
+	// part and remainder are below the 32-bit rate, so even the rounded
+	// remainder product fits in 64 bits; no 128-bit division is required.
+	res.m_attoseconds = part * whole + (part * remainder + m_sample_rate - 1) / m_sample_rate;
 	return res;
 }
 
