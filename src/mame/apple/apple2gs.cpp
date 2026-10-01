@@ -92,6 +92,11 @@
 
 #include <bit>
 
+#define LOG_GLU (1U << 1)
+#define LOG_GLUTRACE (1U << 2)
+#define VERBOSE (LOG_GLU | LOG_GLUTRACE)
+#include "logmacro.h"
+
 namespace {
 
 // various timing standards
@@ -513,6 +518,34 @@ private:
 	float m_snd_gain_mono = -1.0f, m_snd_gain_side = -1.0f, m_snd_vca = -1.0f;
 	TIMER_CALLBACK_MEMBER(sndglu_commit_cb);
 
+	// Astra's developer diagnostics observe the existing GLU. They allocate
+	// no timers and change no transfer state; -log off skips all diagnostic work.
+	bool m_glu_log_enabled = false;
+	struct glu_log_context
+	{
+		attotime time;
+		int64_t gap = -1;
+		u32 pc = 0, cpu_hz = 0, accelerator_hz = 0;
+		u8 bank = 0;
+		const char *accelerator = "none";
+	};
+	glu_log_context m_glu_log_context;
+	u32 m_glu_log_instruction_pc = 0;
+	u8 m_glu_log_access_bank = 0;
+	u16 m_glu_log_intended_address = 0;
+	u8 m_glu_log_intended_control = 15;
+	int64_t m_glu_log_last_cycle = -1;
+	u64 m_glu_log_counts[6]{};
+	attotime m_glu_log_summary_at;
+	void sndglu_log_note(u32 address, int type);
+	bool sndglu_log_memory(u32 address, int type, u8 &data);
+	std::string sndglu_log_prefix(const glu_log_context &event) const;
+	std::string sndglu_log_cpu_state();
+	std::string sndglu_log_stack();
+	void sndglu_log_event(unsigned kind, std::string details);
+	void sndglu_log_access(unsigned port, bool read, u8 data, u8 result = 0);
+	void sndglu_log_summary();
+
 	// Key GLU variables
 	u8 m_glu_regs[12]{}, m_glu_bus = 0;
 	bool m_glu_mcu_read_kgs = false, m_glu_816_read_dstat = false, m_glu_mouse_read_stat = false;
@@ -865,6 +898,7 @@ void apple2gs_state::machine_start()
 	m_twgs_data = std::make_unique<u8[]>(0x10000);
 	m_twgs_write_timer = timer_alloc(FUNC(apple2gs_state::twgs_write_complete), this);
 	m_sndglu_timer = timer_alloc(FUNC(apple2gs_state::sndglu_commit_cb), this);
+	m_glu_log_enabled = (VERBOSE & (LOG_GLU | LOG_GLUTRACE)) && machine().allow_logging();
 	m_doc->set_host_sync([this](attotime time) { sndglu_service(time); });
 	m_a2bus->set_dma_sync([this]() { twgs_flush_due(); });
 	twgs_build_firmware();
@@ -1483,6 +1517,18 @@ void apple2gs_state::machine_reset()
 	}
 	if (!m_accel_present)
 		m_maincpu->set_data_hook(g65816_device::data_hook_delegate());
+	if (m_glu_log_enabled)
+	{
+		m_glu_log_context = glu_log_context{};
+		m_glu_log_instruction_pc = 0;
+		m_glu_log_access_bank = 0;
+		m_glu_log_intended_address = m_sndglu_addr;
+		m_glu_log_intended_control = m_sndglu_ctrl;
+		m_glu_log_last_cycle = -1;
+		std::fill(std::begin(m_glu_log_counts), std::end(m_glu_log_counts), 0);
+		m_glu_log_summary_at = machine().time() + attotime::from_seconds(10);
+		m_maincpu->set_memory_hook(g65816_device::memory_hook_delegate(&apple2gs_state::sndglu_log_memory, this));
+	}
 }
 
 void apple2gs_state::raise_irq(int irq)
@@ -1880,6 +1926,8 @@ bool apple2gs_state::twgs_shadowed(u32 address) const
 
 u8 apple2gs_state::twgs_board_read(twgs_decoded::transaction const &w, u64 begin, u64 end)
 {
+	if (m_glu_log_enabled)
+		sndglu_log_note(w.address, w.type);
 	begin /= TWGS_TIME_SCALE;
 	end /= TWGS_TIME_SCALE;
 	const bool slow = m_bt_slow;
@@ -1910,6 +1958,8 @@ u8 apple2gs_state::twgs_board_read(twgs_decoded::transaction const &w, u64 begin
 
 void apple2gs_state::twgs_board_write(twgs_decoded::transaction const &w, u64 begin, u64 end)
 {
+	if (m_glu_log_enabled)
+		sndglu_log_note(w.address, w.type);
 	begin /= TWGS_TIME_SCALE;
 	end /= TWGS_TIME_SCALE;
 	m_twgs_retired = std::max(m_twgs_retired, w.id);
@@ -2128,6 +2178,8 @@ TIMER_CALLBACK_MEMBER(apple2gs_state::twgs_write_complete)
 
 bool apple2gs_state::twgs_cached_access(u32 address, int type, u8 &data, int &cycles)
 {
+	if (m_glu_log_enabled)
+		sndglu_log_note(address, type);
 	if (m_twgs_kernel_on)
 	{
 		cycles = twgs_kernel_access(address, type, data);
@@ -3487,9 +3539,159 @@ bool apple2gs_state::sndglu_service(attotime time)
 	return m_sndglu_pending;
 }
 
+// Ported from Astra 1a93f58802. No bridge variants or transfer rules are
+// imported: warnings describe the latch and deadlines used by this driver.
+void apple2gs_state::sndglu_log_note(u32 address, int type)
+{
+	if (type == g65816_device::BUS_OPCODE)
+		m_glu_log_instruction_pc = address;
+	if ((address & 0xfffc) == 0xc03c)
+		m_glu_log_access_bank = address >> 16;
+}
+
+bool apple2gs_state::sndglu_log_memory(u32 address, int type, u8 &data)
+{
+	sndglu_log_note(address, type);
+	return m_twgs_real && m_twgs ? twgs_memory(address, type, data) : false;
+}
+
+std::string apple2gs_state::sndglu_log_prefix(const glu_log_context &event) const
+{
+	const std::string gap = event.gap < 0 ? "first" : util::string_format("%lld", (long long)event.gap);
+	return util::string_format("Sound GLU t=%.9f PC=%02X:%04X bank=%02X gap=%s bus cycles CPU=%.3fMHz accelerator=%s/%.3fMHz: ",
+		event.time.as_double(), event.pc >> 16, event.pc & 0xffff, event.bank, gap,
+		event.cpu_hz / 1.0e6, event.accelerator, event.accelerator_hz / 1.0e6);
+}
+
+std::string apple2gs_state::sndglu_log_cpu_state()
+{
+	const unsigned p = m_maincpu->state_int(g65816_device::G65816_P);
+	return util::string_format("A=%04X X=%04X Y=%04X S=%04X D=%04X DBR=%02X P=%02X (m=%u x=%u e=%u)",
+		unsigned(m_maincpu->state_int(g65816_device::G65816_A)),
+		unsigned(m_maincpu->state_int(g65816_device::G65816_X)),
+		unsigned(m_maincpu->state_int(g65816_device::G65816_Y)),
+		unsigned(m_maincpu->state_int(g65816_device::G65816_S)),
+		unsigned(m_maincpu->state_int(g65816_device::G65816_D)),
+		unsigned(m_maincpu->state_int(g65816_device::G65816_DB)), p,
+		BIT(p, 5), BIT(p, 4), unsigned(m_maincpu->state_int(g65816_device::G65816_E)));
+}
+
+std::string apple2gs_state::sndglu_log_stack()
+{
+	// Pushed data can resemble return addresses. Verify a preceding call
+	// opcode when possible, scan upward from S, and never execute CPU hooks.
+	auto const disable = machine().disable_side_effects();
+	auto &space = m_maincpu->space(AS_PROGRAM);
+	const u16 s = m_maincpu->state_int(g65816_device::G65816_S);
+	const bool emulation = m_maincpu->state_int(g65816_device::G65816_E);
+	auto stack_byte = [&space, s, emulation](unsigned offset)
+	{
+		const u16 address = emulation ? 0x100 | ((s + offset) & 0xff) : u16(s + offset);
+		return space.read_byte(address);
+	};
+	unsigned bank = m_glu_log_context.pc >> 16, found = 0;
+	std::string text;
+	for (unsigned offset = 1; offset <= 62 && found < 3; ++offset)
+	{
+		const u16 saved = stack_byte(offset) | (u16(stack_byte(offset + 1)) << 8);
+		const unsigned long_bank = stack_byte(offset + 2);
+		const bool jsl = space.read_byte((long_bank << 16) | u16(saved - 3)) == 0x22;
+		const u8 short_opcode = space.read_byte((bank << 16) | u16(saved - 2));
+		const bool jsr = short_opcode == 0x20 || short_opcode == 0xfc;
+		if (!jsl && !jsr)
+			continue;
+		if (jsl)
+			bank = long_bank;
+		if (found++)
+			text += ", ";
+		text += util::string_format("%02X:%04X (%s at S+%u)", bank, u16(saved + 1), jsl ? "JSL" : "JSR", offset);
+		offset += jsl ? 2 : 1;
+	}
+	return text.empty() ? "no plausible return addresses in 64 bytes" : text;
+}
+
+void apple2gs_state::sndglu_log_event(unsigned kind, std::string details)
+{
+	++m_glu_log_counts[kind];
+	const std::string prefix = sndglu_log_prefix(m_glu_log_context);
+	std::string state;
+	if (VERBOSE & LOG_GLUTRACE)
+		state = "; " + sndglu_log_cpu_state();
+	LOGMASKED(LOG_GLU, "%s%s%s\n", prefix, details, state);
+	static const char *const kinds[] = { "busy data write", "busy control write", "busy address-low write", "busy address-high write", "busy data read", "data setup change" };
+	LOGMASKED(LOG_GLUTRACE, "%sCPU/stack for %s%s; call trace (best guess; pushed data may look like returns): %s\n",
+		prefix, kinds[kind], state, sndglu_log_stack());
+}
+
+void apple2gs_state::sndglu_log_summary()
+{
+	if (std::none_of(std::begin(m_glu_log_counts), std::end(m_glu_log_counts), [](u64 count) { return count != 0; }))
+		return;
+	LOGMASKED(LOG_GLU | LOG_GLUTRACE, "%slast interval: busy data writes=%llu, busy control writes=%llu, busy address-low writes=%llu, busy address-high writes=%llu, busy data reads=%llu, setup changes=%llu\n",
+		sndglu_log_prefix(m_glu_log_context), (unsigned long long)m_glu_log_counts[0], (unsigned long long)m_glu_log_counts[1],
+		(unsigned long long)m_glu_log_counts[2], (unsigned long long)m_glu_log_counts[3],
+		(unsigned long long)m_glu_log_counts[4], (unsigned long long)m_glu_log_counts[5]);
+	std::fill(std::begin(m_glu_log_counts), std::end(m_glu_log_counts), 0);
+}
+
+void apple2gs_state::sndglu_log_access(unsigned port, bool read, u8 data, u8 result)
+{
+	if (machine().side_effects_disabled())
+		return;
+	const attotime now = sndglu_now();
+	const u64 ticks = now.as_ticks(A2GS_14M);
+	const int64_t cycle = (ticks / 912) * 65 + std::min<u64>((ticks % 912) / 14, 64);
+	m_glu_log_context = { now, m_glu_log_last_cycle < 0 ? -1 : cycle - m_glu_log_last_cycle,
+		m_glu_log_instruction_pc, u32(m_bt_twslow ? BT_PER_SEC / BT_FAST : (m_bt_mode == BT_OFF ? m_maincpu->clock() : BT_PER_SEC / m_bt_cycle)),
+		m_accel_present ? m_accel_speed : 0, m_glu_log_access_bank, m_accel_present ? (m_twgs ? "TransWarp GS" : "ZipGS") : "none" };
+	m_glu_log_last_cycle = cycle;
+	if (now >= m_glu_log_summary_at)
+	{
+		sndglu_log_summary();
+		m_glu_log_summary_at = now + attotime::from_seconds(10);
+	}
+	auto destination = [](u16 address, bool ram)
+	{
+		return util::string_format("%s $%04X", ram ? "sound RAM" : "DOC register", ram ? address : address & 0xff);
+	};
+	const bool busy = m_sndglu_pending && now < m_sndglu_busy_until;
+	if (busy && !read && port != 13)
+	{
+		const u16 next = port == 12 ? (BIT(data, 6) ? m_sndglu_addr : m_sndglu_addr & 0xff)
+			: port == 14 ? (m_sndglu_addr & 0xff00) | data : (m_sndglu_addr & 0xff) | (u16(data) << 8);
+		sndglu_log_event(port == 12 ? 1 : port - 12,
+			util::string_format("$C03%X write $%02X while busy; local register changes; pending %s will use %s (was %s)",
+				port, data, m_sndglu_pend_read ? "read" : "write", destination(next, m_sndglu_pend_ram), destination(m_sndglu_addr, m_sndglu_pend_ram)));
+	}
+	if (busy && port == 13)
+	{
+		const std::string requested = destination(m_glu_log_intended_address, BIT(m_glu_log_intended_control, 6));
+		const std::string target = destination(m_sndglu_addr, BIT(m_sndglu_ctrl, 6));
+		if (read)
+			sndglu_log_event(4, util::string_format("$C03D read while busy returned $%02X; pending transfer becomes a read of %s at the existing deadline; program requested %s", result, target, requested));
+		else
+		{
+			const std::string old = m_sndglu_pend_read ? "pending read" : util::string_format("pending byte $%02X", m_sndglu_pend_data);
+			sndglu_log_event(0, util::string_format("$C03D write $%02X while busy replaces %s; transfer goes to %s at the existing deadline; program requested %s", data, old, target, requested));
+			if (!m_sndglu_pend_read && !m_sndglu_pend_ram && data != m_sndglu_pend_data && m_sndglu_busy_until - now < attotime::from_nsec(150))
+				sndglu_log_event(5, util::string_format("DOC data changed $%02X -> $%02X inside 150ns setup; %.1fns before transfer to %s", m_sndglu_pend_data, data, (m_sndglu_busy_until - now).as_double() * 1.0e9, target));
+		}
+	}
+	if (port == 13 && BIT(m_glu_log_intended_control, 5))
+		++m_glu_log_intended_address;
+	else if (!read && port == 12)
+		m_glu_log_intended_control = data & 0x7f;
+	else if (!read && port == 14)
+		m_glu_log_intended_address = (m_glu_log_intended_address & 0xff00) | data;
+	else if (!read && port == 15)
+		m_glu_log_intended_address = (m_glu_log_intended_address & 0xff) | (u16(data) << 8);
+}
+
 void apple2gs_state::sndglu_ctrl_write(u8 data)
 {
 	sndglu_service();
+	if (m_glu_log_enabled)
+		sndglu_log_access(12, false, data);
 	m_sndglu_ctrl = data & 0x7f; // bit 7 (busy) is read-only
 	if (!(m_sndglu_ctrl & 0x40)) // clear hi byte of address pointer on DOC access
 		m_sndglu_addr &= 0xff;
@@ -3521,6 +3723,8 @@ void apple2gs_state::sndglu_arm(bool is_read, u8 data)
 void apple2gs_state::sndglu_addr_write(u16 reg, u8 data)
 {
 	sndglu_service();
+	if (m_glu_log_enabled)
+		sndglu_log_access(reg & 15, false, data);
 	if (reg == 0xc03e)
 		m_sndglu_addr = (m_sndglu_addr & 0xff00) | data;
 	else
@@ -3529,7 +3733,10 @@ void apple2gs_state::sndglu_addr_write(u16 reg, u8 data)
 
 void apple2gs_state::sndglu_reg_write(u8 data)
 {
-	if (sndglu_service())
+	const bool busy = sndglu_service();
+	if (m_glu_log_enabled)
+		sndglu_log_access(13, false, data);
+	if (busy)
 	{
 		logerror("Sound GLU busy: write %02x to %04x dropped\n", m_sndglu_pend_data, m_sndglu_pend_addr);
 		sndglu_tally(m_sndglu_pend_addr, false);
@@ -4013,7 +4220,11 @@ u8 apple2gs_state::c000_r(offs_t offset)
 			// Bit 7 is the DOC port. Bit 4 is reserved and reads as 1. Bits 3-0
 			// are the VCA, returned as stored (not forced on).
 			if (!machine().side_effects_disabled())
+			{
 				sndglu_service();
+				if (m_glu_log_enabled)
+					sndglu_log_access(12, true, 0);
+			}
 			return (m_sndglu_ctrl & 0x7f) | 0x10 | ((m_sndglu_pending && sndglu_now() < m_sndglu_busy_until) ? 0x80 : 0x00);
 
 		case 0x3d:  // SOUNDDATA
@@ -4028,6 +4239,8 @@ u8 apple2gs_state::c000_r(offs_t offset)
 			// yet while this CPU instruction is still executing.
 			const bool busy = sndglu_service();
 			ret = m_sndglu_dummy_read;
+			if (m_glu_log_enabled)
+				sndglu_log_access(13, true, 0, ret);
 			if (busy)
 			{
 				m_sndglu_pend_read = true;
@@ -4042,10 +4255,14 @@ u8 apple2gs_state::c000_r(offs_t offset)
 
 		case 0x3e:  // SOUNDADRL
 			sndglu_service();
+			if (m_glu_log_enabled)
+				sndglu_log_access(0xe, true, 0);
 			return m_sndglu_addr & 0xff;
 
 		case 0x3f:  // SOUNDADRH
 			sndglu_service();
+			if (m_glu_log_enabled)
+				sndglu_log_access(0xf, true, 0);
 			return (m_sndglu_addr >> 8) & 0xff;
 
 		case 0x41:  // INTEN
