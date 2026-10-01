@@ -92,7 +92,6 @@
 
 #include <bit>
 
-
 namespace {
 
 // various timing standards
@@ -244,7 +243,6 @@ private:
 		GLU_C010,       // 816 RW
 		GLU_SYSSTAT     // 816 R/(limited) W
 	};
-
 
 	static constexpr u8 KGS_ANY_KEY_DOWN = 0x01;
 	static constexpr u8 KGS_KEYSTROBE    = 0x10;
@@ -427,7 +425,6 @@ private:
 	u8 m_adb_p2_last, m_adb_p3_last;
 	int m_adb_reset_freeze = 0;
 	bool m_ram_initialized = false;
-	u32 m_ram_seed = 0;
 	void keyglu_regen_irqs();
 
 	u8 adbmicro_p0_in();
@@ -616,6 +613,10 @@ private:
 	// Bus timing model: the FPI fast cycle with DRAM refresh, the Mega II
 	// 1 MHz sync, and the ZipGS cache. Time is in units of 1/1056 of a 14M
 	// clock, so the fast, Mega II and ZipGS cycles are all whole numbers.
+	static constexpr u64 BUS_READ_RESUME = 1; // US 4,794,523 DL1/DL2 synchronizer: retain the one-card-cycle read resume.
+	static constexpr int ZIP_WRITE_DEPTH = 1; // US 4,794,523 Table I has one first-stage write latch.
+	static constexpr int TWGS_WRITE_LATCHES = 4; // Body schematic and GAL1 decode use all four write-latch columns.
+	static constexpr u32 REPSEP_SLOW_CYCLES = 1; // GAL3 OP_SLOW decodes REP/SEP; retain the model's one motherboard cycle.
 	static constexpr u64 BT_CLK = 1056;
 	static constexpr u64 BT_PER_SEC = 15'120'000'000; // 14.318181 MHz * 1056
 	static constexpr u64 BT_FAST = 5 * BT_CLK;
@@ -641,7 +642,7 @@ private:
 		BTC_MISS_OPCODE, BTC_MISS_OPERAND, BTC_MISS_DATA, BTC_WBUF_FULL, BTC_COUNT };
 
 	int m_bt_mode = BT_OFF;
-	bool m_bt_enabled = false, m_bt_resync = true, m_bt_slow = false;
+	bool m_bt_resync = true, m_bt_slow = false;
 	u64 m_bt_cycle = BT_FAST;
 	u64 m_bt_istart = 0, m_bt_istall = 0, m_bt_frac = 0, m_bt_cprev = 0;
 	u64 m_bt_charged = 0, m_bt_idx = 0;
@@ -649,8 +650,7 @@ private:
 	u64 m_bt_fanchor = 0, m_bt_busfree = 0, m_bt_slot = 0;
 	bool m_bt_slot_ok = false;
 	u64 m_bt_wbuf[4] = { 0, 0, 0, 0 };
-	int m_bt_wcount = 0, m_bt_wdepth = 1;
-	u64 m_bt_overhead = 0;
+	int m_bt_wcount = 0;
 	std::unique_ptr<u32[]> m_zip_tag;
 	std::unique_ptr<u8[]> m_zip_data;
 	bool m_zip_tag_update = false, m_zip_trash_tag = false;
@@ -661,7 +661,6 @@ private:
 	bool m_zip_iolc = false, m_zip_intcxrom = false;
 	bool m_zip_c8_slot = false; // this $C800-$CFFF access is the selected card
 	bool m_zip_hit = false;
-	u64 m_zip_hits = 0, m_zip_mismatches = 0;
 	bool zip_iolc(u32 address) const;
 	void zip_snoop(u32 address, bool write, u8 data);
 	bool zip_cacheable(u32 address) const;
@@ -669,13 +668,9 @@ private:
 	u8 zip_access(u32 address, int type, u8 data);
 	u32 m_zip_mask = 0x3fff;
 	u8 m_zip_size = 1;
-	bool m_zip_auxtag = false;   // aux-mapped bank $00/$E0 accesses get an aux tag of their own (else the tag of bank $01/$E1)
 	bool m_zip_bank_ok[256];
 	u32 m_twgs_mask = 0x1fff;
-	int m_twgs_depth = 4;
 	bool m_bt_twslow = false;    // this instruction runs at the GS speed (TransWarp GS IRQ slowdown)
-	u32 m_bt_repsep = 1;         // REP and SEP: this many of their cycles run at the motherboard speed
-	u64 m_twgs_wextra = 0;       // extra bus time of each TransWarp GS write to the motherboard
 	std::unique_ptr<u8[]> m_twgs_data;
 	bool m_twgs_80store = false, m_twgs_page2 = false, m_twgs_hires = false;
 	bool m_twgs_ramrd = false, m_twgs_ramwrt = false, m_twgs_altzp = false;
@@ -689,11 +684,6 @@ private:
 	void twgs_snoop(u32 address, bool write, u8 data);
 	u32 twgs_taddr(u32 address, int type) const;
 	u8 twdc_access(u32 offset, int type, u8 data);
-	bool m_twdc_on = false, m_twdc_nowrite = false, m_tw_iolc_cache = false;
-	bool m_tw_txt_e0 = false, m_tw_txt_stale = false;
-	bool m_twdc_armed = true;
-	u32 m_twdc_arm_pc = 0;
-	u64 m_twdc_hits = 0, m_twdc_mismatches = 0;
 	bool twgs_cached_access(u32 address, int type, u8 &data, int &cycles);
 	// The physical card shares one controller/SRAM state between data and
 	// timing. Legacy synthetic firmware mode retains its separate interface.
@@ -756,7 +746,6 @@ private:
 		m_maincpu->adjust_icount(-cycles); \
 	} \
 }
-
 
 offs_t apple2gs_state::dasm_trampoline(std::ostream &stream, offs_t pc, const util::disasm_interface::data_buffer &opcodes, const util::disasm_interface::data_buffer &params)
 {
@@ -887,10 +876,6 @@ void apple2gs_state::machine_start()
 	m_btpc = reinterpret_cast<u64 *>(m_btprof + BTP_PCS);
 	m_maincpu->set_data_hook(g65816_device::data_hook_delegate(&apple2gs_state::twdc_access, this));
 	machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([this]() {
-		if (m_twdc_on)
-			osd_printf_info("Cache totals TWGS hits=%llu differences=%llu ZipGS hits=%llu differences=%llu\n",
-				(unsigned long long)m_twdc_hits, (unsigned long long)m_twdc_mismatches,
-				(unsigned long long)m_zip_hits, (unsigned long long)m_zip_mismatches);
 		sndglu_log_table();
 	}));
 	m_maincpu->set_bus_hook(g65816_device::bus_hook_delegate(&apple2gs_state::bt_access, this));
@@ -1054,7 +1039,6 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_adb_p3_last));
 	save_item(NAME(m_adb_reset_freeze));
 	save_item(NAME(m_ram_initialized));
-	save_item(NAME(m_ram_seed));
 	save_item(NAME(m_accel_unlocked));
 	save_item(NAME(m_accel_stage));
 	save_item(NAME(m_accel_fast));
@@ -1070,7 +1054,6 @@ void apple2gs_state::machine_start()
 	// the bus timing model: a run resumed from a state has the same cache, write buffer, time
 	// base and counters as the run that saved it
 	save_item(NAME(m_bt_mode));
-	save_item(NAME(m_bt_enabled));
 	save_item(NAME(m_bt_resync));
 	save_item(NAME(m_bt_slow));
 	save_item(NAME(m_bt_cycle));
@@ -1085,12 +1068,9 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_bt_busfree));
 	save_item(NAME(m_bt_wbuf));
 	save_item(NAME(m_bt_wcount));
-	save_item(NAME(m_bt_wdepth));
-	save_item(NAME(m_bt_overhead));
 	save_item(NAME(m_bt_twslow));
 	save_item(NAME(m_zip_mask));
 	save_item(NAME(m_zip_size));
-	save_item(NAME(m_zip_auxtag));
 	save_item(NAME(m_zip_bank_ok));
 	// Decoded card state: every physical register, tag and holding latch.
 	save_item(NAME(m_twgs_kernel_on));
@@ -1207,7 +1187,6 @@ void apple2gs_state::machine_start()
 		save_item(NAME(m_twgs_kernel.c.latches[i].bus.seed), i);
 	}
 	save_item(NAME(m_twgs_mask));
-	save_item(NAME(m_twgs_depth));
 	save_item(NAME(m_twgs));
 	save_item(NAME(m_twgs_sel));
 	save_item(NAME(m_twgs_config));
@@ -1247,8 +1226,6 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_zip_intcxrom));
 	save_item(NAME(m_zip_c8_slot));
 	save_item(NAME(m_zip_hit));
-	save_item(NAME(m_zip_hits));
-	save_item(NAME(m_zip_mismatches));
 
 	save_item(NAME(m_twgs_ramrd));
 	save_item(NAME(m_twgs_ramwrt));
@@ -1263,15 +1240,6 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_twgs_access_tag));
 	save_item(NAME(m_twgs_access_cacheable));
 	save_item(NAME(m_twgs_access_hit));
-	save_item(NAME(m_twdc_on));
-	save_item(NAME(m_twdc_nowrite));
-	save_item(NAME(m_tw_iolc_cache));
-	save_item(NAME(m_tw_txt_e0));
-	save_item(NAME(m_tw_txt_stale));
-	save_item(NAME(m_twdc_armed));
-	save_item(NAME(m_twdc_arm_pc));
-	save_item(NAME(m_twdc_hits));
-	save_item(NAME(m_twdc_mismatches));
 	save_pointer(NAME(m_btprof), BTP_SIZE);
 }
 
@@ -1287,15 +1255,7 @@ void apple2gs_state::machine_reset()
 	if (!m_ram_initialized)
 	{
 		unsigned const mode = ioport("ram_start")->read();
-		m_ram_seed = ioport("ram_seed")->read();
-		if (mode == 4)
-		{
-			u64 const ticks = osd_ticks();
-			m_ram_seed = u32(ticks) ^ u32(ticks >> 32);
-		}
-		u32 state = m_ram_seed + 1;
-		if (!state)
-			state = 1;
+		u32 state = 1; // Fixed seed preserves the DRAM power-on pattern across runs.
 		auto next = [&state] ()
 		{
 			state ^= state << 13;
@@ -1308,27 +1268,24 @@ void apple2gs_state::machine_reset()
 			u8 bias = 0, row = 0, column = 0;
 			for (u32 i = 0; i < size; i++)
 			{
-				if ((mode >= 4) && !(i & 0xffff))
+				if (!(i & 0xffff))
 				{
 					bias = u8(next());
 					row = u8(next());
 					column = u8(next());
 				}
 				u32 const bits = next();
-				if (mode == 1)
-					base[i] = u8(bits);
-				else if (mode == 2)
-					base[i] = 0xff;
-				else if (mode == 3)
-					base[i] = BIT(i, 7) ? 0xff : 0x00;
-				else if (mode >= 4)
-					base[i] = bias ^ (BIT(i, 7) ? row : 0) ^ (BIT(i, 0) ? column : 0) ^ u8(bits & (bits >> 8) & (bits >> 16));
+				base[i] = bias ^ (BIT(i, 7) ? row : 0) ^ (BIT(i, 0) ? column : 0) ^ u8(bits & (bits >> 8) & (bits >> 16));
 			}
 		};
 		if (mode)
 		{
 			fill(m_ram_ptr, m_ram->size());
 			fill(m_megaii_ram, sizeof(m_megaii_ram));
+			// The sound bank is also DRAM (two 64K x 4 parts on both boards).
+			// It has no power-on clear. Apply the same selected approximation;
+			// firmware fills only the addresses its SoundBootInit loop visits.
+			fill(&m_docram[0], m_docram.bytes());
 		}
 		m_ram_initialized = true;
 	}
@@ -1381,7 +1338,6 @@ void apple2gs_state::machine_reset()
 	m_zip_lcram2 = true;
 	m_zip_iolc = m_zip_intcxrom = m_zip_c8_slot = false;
 	m_zip_hit = false;
-	m_zip_hits = m_zip_mismatches = 0;
 	std::fill_n(m_zip_data.get(), 0x10000, 0);
 	bt_config();
 	bt_setup(A2GS_2_8M.value());
@@ -1483,10 +1439,6 @@ void apple2gs_state::machine_reset()
 		osd_printf_warning("TransWarp GS (partial) requires twgs_1.8s.bin; accelerator disabled\n");
 	}
 	std::fill_n(m_twgs_data.get(), 0x10000, 0);
-	m_twdc_hits = m_twdc_mismatches = 0;
-	const char *arm_pc = std::getenv("TWDC_FAULT_PC");
-	m_twdc_arm_pc = arm_pc ? std::strtoul(arm_pc, nullptr, 16) : 0;
-	m_twdc_armed = !m_twdc_arm_pc;
 	m_twgs_iolc = m_twgs_linear = false;
 	twgs_reset_switches();
 	if (m_twgs)
@@ -2189,7 +2141,7 @@ bool apple2gs_state::twgs_memory(u32 address, int type, u8 &data)
 	}
 	if (m_bt_mode != BT_TWGS)
 		return false;
-	if (m_twgs_wcount >= m_twgs_depth)
+	if (m_twgs_wcount >= TWGS_WRITE_LATCHES)
 		twgs_drain(1);
 	m_bt_slow = twgs_shadowed(address);
 	m_twgs_waddr[m_twgs_wcount] = address;
@@ -2285,36 +2237,21 @@ u8 apple2gs_state::twgs_bus(u32 address, int type, u8 data)
 void apple2gs_state::bt_config()
 {
 	const ioport_value cfg = m_btconfig->read();
-	m_bt_enabled = BIT(cfg, 0);
 	m_zip_size = (cfg >> 1) & 3;
 	m_zip_mask = (0x2000 << m_zip_size) - 1;
 	std::fill_n(m_zip_tag.get(), 0x10000, 0);
 
 	static const u32 fastbanks[4] = { 0x10, 0x30, 0x70, 0x80 };
-	u32 limit = fastbanks[m_zip_size];
-	if (((cfg >> 3) & 3) == 1)
-		limit = 0x20;
-	else if (((cfg >> 3) & 3) == 2)
-		limit = 0x80;
+	// ZipGSX cache-size decode; 16K bank limit measured by David Empson.
+	const u32 limit = fastbanks[m_zip_size];
 	for (int bank = 0; bank < 256; bank++)
 		m_zip_bank_ok[bank] = (bank < limit) || (bank == 0xe0) || (bank == 0xe1) || (bank >= 0xfc);
 
-	m_bt_overhead = (cfg >> 5) & 3;
-	m_zip_auxtag = BIT(cfg, 9);
 	m_twgs_sel = BIT(cfg, 10);
 	m_twgs_real = BIT(ioport("twgs_rom")->read(), 0);
 	m_twgs_irq_at_reset = !BIT(cfg, 12);
 	m_twgs_mask = BIT(cfg, 11) ? 0x7fff : 0x1fff;
-	m_twgs_depth = BIT(cfg, 13) ? 3 : 4;
-	m_bt_repsep = (cfg >> 25) & 3;
-	m_twgs_wextra = ((cfg >> 28) & 7) * BT_CLK;
-	m_twdc_on = BIT(cfg, 14);
-	m_twdc_nowrite = BIT(cfg, 15);
-	m_tw_iolc_cache = BIT(cfg, 19);
-	m_tw_txt_e0 = BIT(cfg, 20);
-	m_tw_txt_stale = BIT(cfg, 27);
-	static const int depths[4] = { 1, 2, 4, 0 };
-	m_bt_wdepth = depths[(cfg >> 7) & 3];
+	// GAL1/GAL2 write service adds no whole motherboard clocks.
 	m_bt_wcount = 0;
 	m_bt_busfree = 0;
 	m_bt_fanchor = 0;
@@ -2323,7 +2260,7 @@ void apple2gs_state::bt_config()
 void apple2gs_state::bt_setup(u32 speed)
 {
 	int mode = BT_OFF;
-	if (m_bt_enabled && m_last_speed)
+	if (m_last_speed)
 		mode = (speed == A2GS_2_8M.value()) ? BT_STOCK : (m_twgs ? BT_TWGS : BT_ZIP);
 	m_bt_mode = mode;
 	m_bt_cycle = ((mode == BT_ZIP) || (mode == BT_TWGS)) ? (BT_PER_SEC / speed) : BT_FAST;
@@ -2347,7 +2284,7 @@ void apple2gs_state::bt_control()
 	header[3] = (m_bt_mode == BT_ZIP) ? (m_zip_mask + 1) : (m_bt_mode == BT_TWGS) ? (m_twgs_mask + 1) : 0;
 	header[5] = u32(m_bt_cycle);
 	header[6] = u32(BT_CLK);
-	header[7] = ((m_bt_mode == BT_TWGS) ? m_twgs_depth : m_bt_wdepth) | (u32(m_bt_overhead) << 8);
+	header[7] = ((m_bt_mode == BT_TWGS) ? TWGS_WRITE_LATCHES : ZIP_WRITE_DEPTH) | (u32(BUS_READ_RESUME) << 8);
 }
 
 u64 apple2gs_state::bt_fast(u64 t, bool refresh)
@@ -2672,7 +2609,7 @@ u32 apple2gs_state::zip_taddr(u32 address, bool write) const
 		else
 			aux = write ? m_zip_ramwrt : m_zip_ramrd;
 		if (aux)
-			tag |= m_zip_auxtag ? 0x4000000 : 0x010000;
+			tag |= 0x010000; // ZipGS mapping latches tag the physical auxiliary bank (US 4,794,523).
 	}
 	if (lc)
 	{
@@ -2706,12 +2643,6 @@ u8 apple2gs_state::zip_access(u32 address, int type, u8 data)
 	m_zip_hit = !write && (m_zip_tag[slot] == tag);
 	if (m_zip_hit)
 	{
-		m_zip_hits++;
-		if ((data != m_zip_data[slot]) && (m_zip_mismatches++ < 32) && m_twdc_on)
-			osd_printf_info("ZipGS mismatch pc=%06X addr=%06X tag=%08X cached=%02X memory=%02X switches=%d%d%d/%d%d%d/%d%d shadow=%02X\n",
-				m_maincpu->pc(), address, tag, m_zip_data[slot], data,
-				m_zip_ramrd, m_zip_ramwrt, m_zip_altzp, m_zip_store80, m_zip_page2, m_zip_hires,
-				m_zip_lcram, m_zip_lcram2, m_shadow);
 		return m_zip_data[slot];
 	}
 	m_zip_data[slot] = data;
@@ -2737,34 +2668,23 @@ u8 apple2gs_state::twdc_access(u32 offset, int type, u8 data)
 			(offset & 0xffff) == 0xc05d &&
 			(bank == 0xe0 || bank == 0xe1 || (bank < 2 && !(m_shadow & SHAD_IOLC))))
 			return bank;
-		if (m_accel_present && m_bt_enabled)
+		if (m_accel_present)
 			return zip_access(offset, type, data);
 		return data;
 	}
 	if (m_twgs_real)
 		return twgs_bus(offset, type, data);
-	if (!m_twdc_armed && type == g65816_device::BUS_OPCODE && offset == m_twdc_arm_pc)
-		m_twdc_armed = true;
 	const bool write = type == g65816_device::BUS_WRITE;
 	m_twgs_access_cacheable = type != g65816_device::BUS_VECTOR && (offset >> 16) != 0xbc &&
 		!(twgs_io_bank(offset) && (offset & 0xf000) == 0xc000);
-	if (m_tw_iolc_cache && m_twdc_armed && m_twgs_iolc
-		&& (offset >> 16) >= 0xe0 && (offset >> 16) <= 0xe1 && (offset & 0xff00) == 0xc000)
-		m_twgs_access_cacheable = true;
 	m_twgs_access_tag = twgs_taddr(offset, type) + 1;
 	m_twgs_access_hit = m_zip_tag[offset & m_twgs_mask] == m_twgs_access_tag;
 	twgs_snoop(offset, write, data);
-	// Optional legacy diagnostic; this redirection is not normal card behavior.
-	if (m_tw_txt_e0 && m_twdc_armed && !write && m_bt_mode == BT_TWGS
-		&& offset >= 0x000400 && offset < 0x000800 && (m_shadow & SHAD_TXTPG1))
-		return m_megaii_ram[offset & 0xffff];
 	if (!m_twgs_access_cacheable)
 		return data;
 	const u32 slot = offset & m_twgs_mask;
 	if (write)
 	{
-		if ((m_twdc_nowrite || (m_tw_txt_stale && offset >= 0x000400 && offset < 0x000800)) && m_twdc_armed)
-			return data;
 		m_twgs_data[slot] = data;
 		// The timing hook maintains tags at card speed. Writes still maintain
 		// coherence when acceleration or the motherboard fast mode is disabled.
@@ -2777,12 +2697,6 @@ u8 apple2gs_state::twdc_access(u32 offset, int type, u8 data)
 		? (!BIT(m_twgs_config, 3) && m_maincpu->irq_masked()) : m_bt_twslow;
 	if (m_bt_mode == BT_TWGS && !slow && (code || BIT(m_twgs_config, 1)) && m_twgs_access_hit)
 	{
-		if (m_twdc_on)
-		{
-			m_twdc_hits++;
-			if (data != m_twgs_data[slot] && m_twdc_mismatches++ < 32)
-				osd_printf_info("TWGS cache difference pc=%06X addr=%06X cached=%02X memory=%02X\n", m_maincpu->pc(), offset, m_twgs_data[slot], data);
-		}
 		return m_twgs_data[slot];
 	}
 	// Motherboard cycles fill SRAM even when the CPU cannot read the cache.
@@ -2803,7 +2717,7 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 	if (type == g65816_device::BUS_OPCODE)
 	{
 		charge = bt_instruction(address);
-		if (m_bt_repsep && ((m_bt_mode == BT_ZIP) || (m_bt_mode == BT_TWGS)))
+		if (REPSEP_SLOW_CYCLES && ((m_bt_mode == BT_ZIP) || (m_bt_mode == BT_TWGS)))
 		{
 			// The card decodes the opcode present on the CPU data pins,
 			// including a cache/EPROM hit. Do not perform another RAM read.
@@ -2813,10 +2727,10 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 				// cycles with refresh) in place of N card cycles, then the card clock again
 				const u64 t0 = m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
 				u64 end = std::max(t0, m_bt_busfree);
-				for (u32 i = 0; i < m_bt_repsep; i++)
+				for (u32 i = 0; i < REPSEP_SLOW_CYCLES; i++)
 					end = bt_fast(end, true);
 				end = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle;
-				const u64 extra = (end > t0 + m_bt_repsep * m_bt_cycle) ? (end - t0 - m_bt_repsep * m_bt_cycle) : 0;
+				const u64 extra = (end > t0 + REPSEP_SLOW_CYCLES * m_bt_cycle) ? (end - t0 - REPSEP_SLOW_CYCLES * m_bt_cycle) : 0;
 				m_bt_istall += extra;
 				charge += extra;
 			}
@@ -2874,33 +2788,24 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 					m_bt_wbuf[i - 1] = m_bt_wbuf[i];
 				m_bt_wcount--;
 			}
-			if (m_bt_wdepth == 0)
+			u64 accept = t;
+			if (m_bt_wcount >= ZIP_WRITE_DEPTH)
 			{
-				// no write buffer: the CPU waits for the motherboard write, then the ZipGS clock
-				const u64 end = bt_bus(std::max(t, m_bt_busfree), cls);
-				m_bt_busfree = end;
-				stall = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle - t - m_bt_cycle;
+				// US 4,794,523 Table I: the CPU stops until the previous byte's
+				// cycle ends, and CLR can latch the new byte only after DL1/DL2
+				// see that end (two ZipGS clocks). The byte misses the PH2 cycle
+				// that starts there, so a slow write takes the Mega II cycle after.
+				accept = ((m_bt_wbuf[0] + m_bt_cycle - 1) / m_bt_cycle + 1) * m_bt_cycle;
+				for (int i = 1; i < m_bt_wcount; i++)
+					m_bt_wbuf[i - 1] = m_bt_wbuf[i];
+				m_bt_wcount--;
+				m_btc[BTC_WBUF_FULL]++;
 			}
-			else
-			{
-				u64 accept = t;
-				if (m_bt_wcount >= m_bt_wdepth)
-				{
-					// US 4,794,523 Table I: the CPU stops until the previous byte's
-					// cycle ends, and CLR can latch the new byte only after DL1/DL2
-					// see that end (two ZipGS clocks). The byte misses the PH2 cycle
-					// that starts there, so a slow write takes the Mega II cycle after.
-					accept = ((m_bt_wbuf[0] + m_bt_cycle - 1) / m_bt_cycle + 1) * m_bt_cycle;
-					for (int i = 1; i < m_bt_wcount; i++)
-						m_bt_wbuf[i - 1] = m_bt_wbuf[i];
-					m_bt_wcount--;
-					m_btc[BTC_WBUF_FULL]++;
-				}
-				const u64 end = bt_bus(std::max(accept, m_bt_busfree), cls);
-				m_bt_busfree = end;
-				m_bt_wbuf[m_bt_wcount++] = end;
-				stall = accept - t;
-			}
+			const u64 end = bt_bus(std::max(accept, m_bt_busfree), cls);
+			m_bt_busfree = end;
+			m_bt_wbuf[m_bt_wcount++] = end;
+			stall = accept - t;
+
 		}
 		else if (m_zip_hit)
 		{
@@ -2912,7 +2817,7 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 			const u64 end = bt_bus(std::max(t, m_bt_busfree), cls);
 			m_bt_busfree = end;
 			m_bt_wcount = 0;
-			const u64 resume = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle + m_bt_overhead * m_bt_cycle;
+			const u64 resume = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle + BUS_READ_RESUME * m_bt_cycle;
 			stall = resume - t - m_bt_cycle;
 			page[1]++;
 			busread = true;
@@ -2952,7 +2857,6 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 			m_bt_busfree = end;
 			m_bt_wcount = 0;
 			stall = end - t - m_bt_cycle;
-			if (cacheable && (!write || m_twgs_real || !m_twdc_armed || !(m_twdc_nowrite || (m_tw_txt_stale && address >= 0x000400 && address < 0x000800))))
 				tag = taddr + 1;
 			if (!write)
 			{
@@ -2969,7 +2873,6 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 		}
 		else if (write)
 		{
-			if (cacheable && (m_twgs_real || !m_twdc_armed || !(m_twdc_nowrite || (m_tw_txt_stale && address >= 0x000400 && address < 0x000800))))
 				tag = taddr + 1;
 			while (m_bt_wcount && (m_bt_wbuf[0] <= t))
 			{
@@ -2978,7 +2881,7 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 				m_bt_wcount--;
 			}
 			u64 accept = t;
-			if (m_bt_wcount >= m_twgs_depth)
+			if (m_bt_wcount >= TWGS_WRITE_LATCHES)
 			{
 				// the write latches are full: wait for the oldest write
 				accept = m_bt_wbuf[0];
@@ -2987,7 +2890,7 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 				m_bt_wcount--;
 				m_btc[BTC_WBUF_FULL]++;
 			}
-			const u64 end = bt_bus(std::max(accept, m_bt_busfree), cls) + m_twgs_wextra;
+			const u64 end = bt_bus(std::max(accept, m_bt_busfree), cls);
 			m_bt_busfree = end;
 			m_bt_wbuf[m_bt_wcount++] = end;
 			stall = accept - t;
@@ -3002,7 +2905,7 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 			const u64 end = bt_bus(std::max(t, m_bt_busfree), cls);
 			m_bt_busfree = end;
 			m_bt_wcount = 0;
-			const u64 resume = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle + m_bt_overhead * m_bt_cycle;
+			const u64 resume = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle + BUS_READ_RESUME * m_bt_cycle;
 			stall = resume - t - m_bt_cycle;
 			page[1]++;
 			busread = true;
@@ -6089,46 +5992,7 @@ INPUT_PORTS_START( apple2gs )
 	PORT_START("ram_start")
 	PORT_CONFNAME(0x07, 0x05, "Power-on RAM contents")
 	PORT_CONFSETTING(0x00, "All zeroes")
-	PORT_CONFSETTING(0x01, "Seeded pseudorandom")
-	PORT_CONFSETTING(0x02, "All ones")
-	PORT_CONFSETTING(0x03, "Alternating 128-byte rows")
-	PORT_CONFSETTING(0x04, "DRAM approximation (automatic seed)")
-	PORT_CONFSETTING(0x05, "DRAM approximation (fixed seed)")
-
-	PORT_START("ram_seed")
-	PORT_CONFNAME(0xffffffff, 0x00, "Power-on RAM seed")
-	PORT_CONFSETTING(0x00, "0")
-	PORT_CONFSETTING(0x01, "1")
-	PORT_CONFSETTING(0x02, "2")
-	PORT_CONFSETTING(0x03, "3")
-	PORT_CONFSETTING(0x04, "4")
-	PORT_CONFSETTING(0x05, "5")
-	PORT_CONFSETTING(0x06, "6")
-	PORT_CONFSETTING(0x07, "7")
-	PORT_CONFSETTING(0x08, "8")
-	PORT_CONFSETTING(0x09, "9")
-	PORT_CONFSETTING(0x0a, "10")
-	PORT_CONFSETTING(0x0b, "11")
-	PORT_CONFSETTING(0x0c, "12")
-	PORT_CONFSETTING(0x0d, "13")
-	PORT_CONFSETTING(0x0e, "14")
-	PORT_CONFSETTING(0x0f, "15")
-	PORT_CONFSETTING(0x10, "16")
-	PORT_CONFSETTING(0x11, "17")
-	PORT_CONFSETTING(0x12, "18")
-	PORT_CONFSETTING(0x13, "19")
-	PORT_CONFSETTING(0x14, "20")
-	PORT_CONFSETTING(0x15, "21")
-	PORT_CONFSETTING(0x16, "22")
-	PORT_CONFSETTING(0x17, "23")
-	PORT_CONFSETTING(0x18, "24")
-	PORT_CONFSETTING(0x19, "25")
-	PORT_CONFSETTING(0x1a, "26")
-	PORT_CONFSETTING(0x1b, "27")
-	PORT_CONFSETTING(0x1c, "28")
-	PORT_CONFSETTING(0x1d, "29")
-	PORT_CONFSETTING(0x1e, "30")
-	PORT_CONFSETTING(0x1f, "31")
+	PORT_CONFSETTING(0x05, "DRAM power-on pattern")
 
 	PORT_START("a2_config")
 	PORT_CONFNAME(0x07, 0x00, "CPU type")
@@ -6139,31 +6003,11 @@ INPUT_PORTS_START( apple2gs )
 	PORT_CONFSETTING(0x07, "16 MHz ZipGS")
 
 	PORT_START("bus_timing")
-	PORT_CONFNAME(0x001, 0x001, "Bus timing")
-	PORT_CONFSETTING(0x000, "MAME default")
-	PORT_CONFSETTING(0x001, "Model: refresh, 1 MHz sync, ZipGS cache")
 	PORT_CONFNAME(0x006, 0x006, "ZipGS cache size")
 	PORT_CONFSETTING(0x000, "8 KB")
 	PORT_CONFSETTING(0x002, "16 KB")
 	PORT_CONFSETTING(0x004, "32 KB")
 	PORT_CONFSETTING(0x006, "64 KB")
-	PORT_CONFNAME(0x018, 0x000, "ZipGS cached fast RAM")
-	PORT_CONFSETTING(0x000, "By cache size (16 KB: $00-$2F measured)")
-	PORT_CONFSETTING(0x008, "Banks $00-$1F")
-	PORT_CONFSETTING(0x010, "All banks")
-	PORT_CONFNAME(0x060, 0x020, "ZipGS cycles added after a bus read")
-	PORT_CONFSETTING(0x000, "0")
-	PORT_CONFSETTING(0x020, "1")
-	PORT_CONFSETTING(0x040, "2")
-	PORT_CONFSETTING(0x060, "3")
-	PORT_CONFNAME(0x180, 0x000, "ZipGS write buffer")
-	PORT_CONFSETTING(0x000, "1 write")
-	PORT_CONFSETTING(0x080, "2 writes")
-	PORT_CONFSETTING(0x100, "4 writes")
-	PORT_CONFSETTING(0x180, "None: the CPU waits for each write")
-	PORT_CONFNAME(0x200, 0x000, "ZipGS tag of aux-mapped bank $00 (RAMRD/RAMWRT/ALTZP/80STORE)")
-	PORT_CONFSETTING(0x000, "The memory used (bank $01)")
-	PORT_CONFSETTING(0x200, "An aux tag of its own")
 	PORT_CONFNAME(0x400, 0x000, "Accelerator of the CPU type")
 	PORT_CONFSETTING(0x000, "ZipGS")
 	PORT_CONFSETTING(0x400, "TransWarp GS")
@@ -6173,24 +6017,6 @@ INPUT_PORTS_START( apple2gs )
 	PORT_CONFNAME(0x1000, 0x000, "TransWarp GS AppleTalk/IRQ slowdown")
 	PORT_CONFSETTING(0x000, "On")
 	PORT_CONFSETTING(0x1000, "Off")
-	PORT_CONFNAME(0x2000, 0x000, "TransWarp GS write latches in use")
-	PORT_CONFSETTING(0x000, "4")
-	PORT_CONFSETTING(0x2000, "3")
-	PORT_CONFNAME(0x4000, 0x0000, "Accelerator cache comparison (test)")
-	PORT_CONFSETTING(0x0000, "Off")
-	PORT_CONFSETTING(0x4000, "On")
-	PORT_CONFNAME(0x8000, 0x0000, "TransWarp GS legacy cache write inhibit (test)")
-	PORT_CONFSETTING(0x0000, "Off")
-	PORT_CONFSETTING(0x8000, "On")
-	PORT_CONFNAME(0x80000, 0x00000, "TransWarp GS legacy E0/E1 C0xx cache with IOLC (test)")
-	PORT_CONFSETTING(0x00000, "Off")
-	PORT_CONFSETTING(0x80000, "On")
-	PORT_CONFNAME(0x100000, 0x000000, "TransWarp GS legacy text-page read redirection (test)")
-	PORT_CONFSETTING(0x000000, "Off")
-	PORT_CONFSETTING(0x100000, "On")
-	PORT_CONFNAME(0x8000000, 0x0000000, "TransWarp GS legacy text-page cache write inhibit (test)")
-	PORT_CONFSETTING(0x0000000, "Off")
-	PORT_CONFSETTING(0x8000000, "On")
 	PORT_CONFNAME(0x70000, 0x00000, "Accelerator clock")
 	PORT_CONFSETTING(0x00000, "The speed of the CPU type")
 	PORT_CONFSETTING(0x50000, "10 MHz")
@@ -6198,17 +6024,6 @@ INPUT_PORTS_START( apple2gs )
 	PORT_CONFSETTING(0x20000, "13.75 MHz")
 	PORT_CONFSETTING(0x30000, "14 MHz")
 	PORT_CONFSETTING(0x40000, "15 MHz")
-	PORT_CONFNAME(0x6000000, 0x2000000, "REP and SEP cycles at the motherboard speed (early 65816 fix)")
-	PORT_CONFSETTING(0x0000000, "0")
-	PORT_CONFSETTING(0x2000000, "1")
-	PORT_CONFSETTING(0x4000000, "2")
-	PORT_CONFSETTING(0x6000000, "3")
-	PORT_CONFNAME(0x70000000, 0x20000000, "TransWarp GS extra time of each write")
-	PORT_CONFSETTING(0x00000000, "0")
-	PORT_CONFSETTING(0x10000000, "1 clock of 14M")
-	PORT_CONFSETTING(0x20000000, "2 clocks")
-	PORT_CONFSETTING(0x30000000, "3 clocks")
-	PORT_CONFSETTING(0x40000000, "4 clocks")
 INPUT_PORTS_END
 
 INPUT_PORTS_START( apple2gsrom3 )
@@ -6518,7 +6333,6 @@ ROM_START(apple2gsmt)
 ROM_END
 
 } // Anonymous namespace
-
 
 /*    YEAR  NAME          PARENT    COMPAT  MACHINE     INPUT         CLASS           INIT       COMPANY           FULLNAME */
 COMP( 1989, apple2gs,     0,        apple2, apple2gs,   apple2gsrom3, apple2gs_state, rom3_init, "Apple Computer", "Apple IIgs (ROM03)", MACHINE_SUPPORTS_SAVE )
