@@ -695,7 +695,7 @@ private:
 	u64 *m_btc = nullptr;
 	u64 *m_btpage = nullptr, *m_btpc = nullptr;
 
-	int bt_access(u32 address, int type);
+	int bt_access(u32 address, int type, u8 data);
 	u64 bt_instruction(u32 pc);
 	u64 bt_fast(u64 t, bool refresh);
 	u64 bt_mega(u64 t);
@@ -2417,7 +2417,7 @@ u8 apple2gs_state::twdc_access(u32 offset, int type, u8 data)
 	return data;
 }
 
-int apple2gs_state::bt_access(u32 address, int type)
+int apple2gs_state::bt_access(u32 address, int type, u8 data)
 {
 	const bool slow = m_bt_slow;
 	m_bt_slow = false;
@@ -2431,9 +2431,9 @@ int apple2gs_state::bt_access(u32 address, int type)
 		charge = bt_instruction(address);
 		if (m_bt_repsep && ((m_bt_mode == BT_ZIP) || (m_bt_mode == BT_TWGS)))
 		{
-			auto dis = machine().disable_side_effects();
-			const u8 op = m_maincpu->space(AS_PROGRAM).read_byte(address);
-			if ((op == 0xc2) || (op == 0xe2))
+			// The card decodes the opcode present on the CPU data pins,
+			// including a cache/EPROM hit. Do not perform another RAM read.
+			if ((data == 0xc2) || (data == 0xe2))
 			{
 				// REP and SEP: N of the instruction's cycles run at the motherboard speed (fast
 				// cycles with refresh) in place of N card cycles, then the card clock again

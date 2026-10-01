@@ -157,6 +157,9 @@
 #define CLK_W_ALX       3
 #define CLK_W_AX        3
 #define CLK_W_AY        3
+#define CLK_W_AXW       CLK_W_AX
+#define CLK_W_AYW       CLK_W_AY
+#define CLK_W_DIYW      4
 #define CLK_W_D         1
 #define CLK_W_DI        3
 #define CLK_W_DIY       3

@@ -53,14 +53,22 @@ public:
 
 	// bus hook: called after each memory access with the address and the
 	// access type; it gives the extra cycles of the access (a bus timing model)
-	enum { BUS_OPCODE = 0, BUS_OPERAND, BUS_READ, BUS_WRITE, BUS_VECTOR };
-	using bus_hook_delegate = delegate<int (u32 address, int type)>;
+	enum { BUS_OPCODE = 0, BUS_OPERAND, BUS_READ, BUS_WRITE, BUS_VECTOR, BUS_INTERNAL, BUS_INTERNAL_WRITE, BUS_INTERRUPT };
+	// Read cycle with VDA=VPA=0. The instruction's base count includes it;
+	// an observer returns only additional clocks caused by the external bus.
+	using internal_hook_delegate = delegate<int (u32 address, int type, u8 data)>;
+	void set_internal_hook(internal_hook_delegate hook) { m_internal_hook = std::move(hook); }
+	using bus_hook_delegate = delegate<int (u32 address, int type, u8 data)>;
 	// An optional external cache can satisfy a transfer before the address space is accessed.
 	using memory_hook_delegate = delegate<bool (u32 address, int type, u8 &data)>;
 	void set_memory_hook(memory_hook_delegate hook) { m_memory_hook = std::move(hook); }
 	using data_hook_delegate = delegate<u8 (u32 address, int type, u8 data)>;
 	void set_data_hook(data_hook_delegate hook) { m_data_hook = std::move(hook); }
 	void set_bus_hook(bus_hook_delegate hook) { m_bus_hook = std::move(hook); }
+	// An optional cache can complete the entire transfer, including data and timing
+	// hooks, in one call. A miss must leave the normal access untouched.
+	using cached_access_delegate = delegate<bool (u32 address, int type, u8 &data, int &cycles)>;
+	void set_cached_access(cached_access_delegate hook) { m_cached_access = std::move(hook); }
 	// the interrupt mask flag, for a model that slows down while interrupts are off
 	bool irq_masked() const { return m_flag_i != 0; }
 
@@ -203,14 +211,21 @@ protected:
 	unsigned EA_DX();
 	unsigned EA_DY();
 	unsigned EA_AX();
+	unsigned EA_AXW();
 	unsigned EA_ALX();
 	unsigned EA_AY();
+	unsigned EA_AYW();
 	unsigned EA_DI();
 	unsigned EA_DLI();
 	unsigned EA_AI();
 	unsigned EA_ALI();
 	unsigned EA_DXI();
 	unsigned EA_DIY();
+	unsigned EA_DIYW();
+	void indexed_internal(unsigned base, unsigned index);
+	void internal_read(unsigned address) { if (!m_internal_hook.isnull()) m_ICount -= m_internal_hook(address & 0xffffff, BUS_INTERNAL, 0); }
+	void internal_modify(unsigned address, u8 data) { if (!m_internal_hook.isnull()) m_ICount -= m_internal_hook(address & 0xffffff, BUS_INTERNAL_WRITE, data); }
+	void internal_interrupt(unsigned address) { if (!m_internal_hook.isnull()) m_ICount -= m_internal_hook(address & 0xffffff, BUS_INTERRUPT, 0); }
 	unsigned EA_DLIY();
 	unsigned EA_AXI();
 	unsigned EA_S();
@@ -259,8 +274,10 @@ protected:
 	unsigned m_destination;
 	int m_ICount;
 	bus_hook_delegate m_bus_hook;
+	internal_hook_delegate m_internal_hook;
 	memory_hook_delegate m_memory_hook;
 	data_hook_delegate m_data_hook;
+	cached_access_delegate m_cached_access;
 	int m_cpu_type;
 	uint8_t m_divider;
 	uint32_t m_debugger_temp;
