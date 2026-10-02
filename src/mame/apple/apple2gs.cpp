@@ -661,7 +661,7 @@ private:
 	static constexpr u64 BT_LINE = 912 * BT_CLK;
 	static constexpr u64 BT_IDLE = 64; // more cycles than one instruction: the CPU waited (WAI)
 	static constexpr u64 BT_PAGE_UNIT = 66; // per-page stall counters are in 1/16 of a 14M clock
-	enum { BT_OFF = 0, BT_STOCK, BT_ZIP, BT_TWGS };
+	enum { BT_OFF = 0, BT_STOCK, BT_ZIP, BT_TWGS, BT_NATIVE };
 	enum { BC_RAM = 0, BC_ROM, BC_FASTIO, BC_MEGA };
 
 	// profile region ":zipprof", read by Lua
@@ -676,6 +676,7 @@ private:
 		BTC_MISS_OPCODE, BTC_MISS_OPERAND, BTC_MISS_DATA, BTC_WBUF_FULL, BTC_COUNT };
 
 	int m_bt_mode = BT_OFF;
+	bool m_native_ram = false; // "Native-speed fast RAM" setting, read at reset
 	bool m_bt_resync = true, m_bt_slow = false;
 	u64 m_bt_cycle = BT_FAST;
 	u64 m_bt_istart = 0, m_bt_istall = 0, m_bt_frac = 0, m_bt_cprev = 0;
@@ -1089,6 +1090,7 @@ void apple2gs_state::machine_start()
 	// the bus timing model: a run resumed from a state has the same cache, write buffer, time
 	// base and counters as the run that saved it
 	save_item(NAME(m_bt_mode));
+	save_item(NAME(m_native_ram));
 	save_item(NAME(m_bt_resync));
 	save_item(NAME(m_bt_slow));
 	save_item(NAME(m_bt_cycle));
@@ -2394,7 +2396,9 @@ void apple2gs_state::bt_config()
 	for (int bank = 0; bank < 256; bank++)
 		m_zip_bank_ok[bank] = (bank < limit) || (bank == 0xe0) || (bank == 0xe1) || (bank >= 0xfc);
 
-	m_twgs_sel = BIT(cfg, 10);
+	// the native-speed setting replaces the accelerator of the CPU type
+	m_native_ram = BIT(cfg, 13);
+	m_twgs_sel = BIT(cfg, 10) && !m_native_ram;
 	m_twgs_real = BIT(ioport("twgs_rom")->read(), 0);
 	m_twgs_irq_at_reset = !BIT(cfg, 12);
 	m_twgs_mask = BIT(cfg, 11) ? 0x7fff : 0x1fff;
@@ -2408,9 +2412,9 @@ void apple2gs_state::bt_setup(u32 speed)
 {
 	int mode = BT_OFF;
 	if (m_last_speed)
-		mode = (speed == A2GS_2_8M.value()) ? BT_STOCK : (m_twgs ? BT_TWGS : BT_ZIP);
+		mode = (speed == A2GS_2_8M.value()) ? BT_STOCK : (m_twgs ? BT_TWGS : (m_native_ram ? BT_NATIVE : BT_ZIP));
 	m_bt_mode = mode;
-	m_bt_cycle = ((mode == BT_ZIP) || (mode == BT_TWGS)) ? (BT_PER_SEC / speed) : BT_FAST;
+	m_bt_cycle = ((mode == BT_ZIP) || (mode == BT_TWGS) || (mode == BT_NATIVE)) ? (BT_PER_SEC / speed) : BT_FAST;
 	m_bt_twslow = false;
 	m_bt_resync = true;
 	m_bt_slow = false;
@@ -2431,7 +2435,7 @@ void apple2gs_state::bt_control()
 	header[3] = (m_bt_mode == BT_ZIP) ? (m_zip_mask + 1) : (m_bt_mode == BT_TWGS) ? (m_twgs_mask + 1) : 0;
 	header[5] = u32(m_bt_cycle);
 	header[6] = u32(BT_CLK);
-	header[7] = ((m_bt_mode == BT_TWGS) ? TWGS_WRITE_LATCHES : ZIP_WRITE_DEPTH) | (u32(BUS_READ_RESUME) << 8);
+	header[7] = (m_bt_mode == BT_NATIVE) ? 0 : (((m_bt_mode == BT_TWGS) ? TWGS_WRITE_LATCHES : ZIP_WRITE_DEPTH) | (u32(BUS_READ_RESUME) << 8));
 }
 
 u64 apple2gs_state::bt_fast(u64 t, bool refresh)
@@ -2815,7 +2819,7 @@ u8 apple2gs_state::twdc_access(u32 offset, int type, u8 data)
 			(offset & 0xffff) == 0xc05d &&
 			(bank == 0xe0 || bank == 0xe1 || (bank < 2 && !(m_shadow & SHAD_IOLC))))
 			return bank;
-		if (m_accel_present)
+		if (m_accel_present && !m_native_ram)
 			return zip_access(offset, type, data);
 		return data;
 	}
@@ -2999,6 +3003,22 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 			}
 			else
 				m_btc[BTC_UNCACHED]++;
+		}
+	}
+	else if (m_bt_mode == BT_NATIVE)
+	{
+		// Not a real card. Fast RAM, ROM and the FPI registers take one CPU cycle each, with
+		// no refresh, cache or write buffer. An access to the Mega II side waits for its 1 MHz
+		// cycle. Then the CPU continues at its next clock edge.
+		if (cls == BC_MEGA)
+		{
+			const u64 end = bt_bus(t, cls);
+			stall = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle - t - m_bt_cycle;
+			if (!write)
+			{
+				page[1]++;
+				busread = true;
+			}
 		}
 	}
 	else
@@ -3505,7 +3525,7 @@ attotime apple2gs_state::sndglu_now() const
 {
 	if (m_snd_force_on)
 		return m_snd_force;
-	if (m_bt_mode == BT_ZIP)
+	if (m_bt_mode == BT_ZIP || m_bt_mode == BT_NATIVE)
 	{
 		// ZipGS writes arrive forced, so this is a $C03C-$C03F read. The GLU
 		// select is a PH0 strobe: the read gets there only in the Mega II
@@ -4601,7 +4621,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 			break;
 
 		case 0x3c:  // SOUNDCTL
-			if (!m_snd_force_on && ((m_bt_mode == BT_ZIP) || (m_bt_mode == BT_TWGS)))
+			if (!m_snd_force_on && ((m_bt_mode == BT_ZIP) || (m_bt_mode == BT_TWGS) || (m_bt_mode == BT_NATIVE)))
 			{
 				m_glu_hold = true;
 				m_glu_hold_reg = 0xc03c;
@@ -4615,7 +4635,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 			// The CPU core writes the device before the bus hook. On a Zip or
 			// a TransWarp the byte is not on the GLU until that hook's cycle
 			// (its own bus cycle). Judge the collision there.
-			if (!m_snd_force_on && (m_bt_mode == BT_ZIP || m_bt_mode == BT_TWGS))
+			if (!m_snd_force_on && (m_bt_mode == BT_ZIP || m_bt_mode == BT_TWGS || m_bt_mode == BT_NATIVE))
 			{
 				m_glu_hold = true;
 				m_glu_hold_reg = 0xc03d;
@@ -4628,7 +4648,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 		case 0x3e:  // SOUNDADRL
 		case 0x3f:  // SOUNDADRH
 			// On a Zip or a TransWarp the store reaches the GLU at its own bus cycle.
-			if (!m_snd_force_on && (m_bt_mode == BT_ZIP || m_bt_mode == BT_TWGS))
+			if (!m_snd_force_on && (m_bt_mode == BT_ZIP || m_bt_mode == BT_TWGS || m_bt_mode == BT_NATIVE))
 			{
 				m_glu_hold = true;
 				m_glu_hold_reg = 0xc000 | offset;
@@ -6355,6 +6375,9 @@ INPUT_PORTS_START( apple2gs )
 	PORT_CONFSETTING(0x20000, "13.75 MHz")
 	PORT_CONFSETTING(0x30000, "14 MHz")
 	PORT_CONFSETTING(0x40000, "15 MHz")
+	PORT_CONFNAME(0x2000, 0x0000, "Native-speed fast RAM (not a real card)")
+	PORT_CONFSETTING(0x0000, DEF_STR( Off ))
+	PORT_CONFSETTING(0x2000, DEF_STR( On ))
 INPUT_PORTS_END
 
 INPUT_PORTS_START( apple2gsrom3 )
