@@ -825,6 +825,10 @@ void lua_engine::initialize()
 	emu["wait"] = sol::yielding(
 			[this] (sol::this_state s, sol::object duration, sol::variadic_args args)
 			{
+				// the stop notice resumes waiting tasks after the timer is gone: leave a task that waits again suspended
+				if (!m_timer)
+					return sol::variadic_results(args.begin(), args.end());
+
 				attotime delay;
 				if (!duration)
 				{
@@ -2341,6 +2345,15 @@ bool lua_engine::frame_hook()
 
 void lua_engine::close()
 {
+	// notifiers and taps live in the emulated machine and can outlast the Lua state
+	for (auto const &weak : m_change_callbacks)
+	{
+		if (auto const callback = weak.lock())
+			callback->reset();
+	}
+	m_change_callbacks.clear();
+	release_taps();
+
 	m_notifiers.reset();
 	m_menu.clear();
 	m_update_tasks.clear();

@@ -206,7 +206,8 @@ public:
 			offs_t end,
 			std::string &&name,
 			sol::protected_function &&callback)
-		: m_callback(host.m_lua_state, std::move(callback))
+		: m_host(host)
+		, m_callback(host.m_lua_state, std::move(callback))
 		, m_space(space)
 		, m_handler()
 		, m_name(std::move(name))
@@ -215,12 +216,21 @@ public:
 		, m_mode(mode)
 		, m_installing(0U)
 	{
+		m_host.m_taps.push_back(this);
 		reinstall();
 	}
 
 	~tap_helper()
 	{
+		m_host.m_taps.erase(std::remove(m_host.m_taps.begin(), m_host.m_taps.end(), this), m_host.m_taps.end());
 		remove();
+	}
+
+	// called by the engine before the Lua state closes
+	void release()
+	{
+		remove();
+		m_callback.reset();
 	}
 
 	offs_t start() const noexcept { return m_start; }
@@ -305,6 +315,7 @@ private:
 		--m_installing;
 	};
 
+	lua_engine &m_host;
 	sol::protected_function m_callback;
 	address_space &m_space;
 	memory_passthrough_handler m_handler;
@@ -314,6 +325,19 @@ private:
 	read_or_write const m_mode;
 	unsigned m_installing;
 };
+
+
+//-------------------------------------------------
+//  release_taps - remove every tap and drop its
+//  Lua callback, before the Lua state closes
+//-------------------------------------------------
+
+void lua_engine::release_taps()
+{
+	for (tap_helper *tap : m_taps)
+		tap->release();
+	m_taps.clear();
+}
 
 
 //-------------------------------------------------
@@ -652,9 +676,17 @@ void lua_engine::initialize_memory(sol::table &emu)
 	addr_space_type.set_function("add_change_notifier",
 			[this] (addr_space &sp, sol::protected_function &&cb)
 			{
+				// a reference made on a coroutine dies with it, so anchor the function to the main state
+				auto callback = std::make_shared<sol::protected_function>(m_lua_state, std::move(cb));
+				m_change_callbacks.erase(
+						std::remove_if(m_change_callbacks.begin(), m_change_callbacks.end(), [] (auto const &w) { return w.expired(); }),
+						m_change_callbacks.end());
+				m_change_callbacks.emplace_back(callback);
 				return sp.space.add_change_notifier(
-						[this, callback = std::move(cb)] (read_or_write mode)
+						[this, callback] (read_or_write mode)
 						{
+							if (!callback->valid()) // released when the Lua state closed
+								return;
 							char const *modestr = "";
 							switch (mode)
 							{
@@ -662,7 +694,7 @@ void lua_engine::initialize_memory(sol::table &emu)
 							case read_or_write::WRITE:     modestr = "w";  break;
 							case read_or_write::READWRITE: modestr = "rw"; break;
 							}
-							auto status = invoke(callback, modestr);
+							auto status = invoke(*callback, modestr);
 							if (!status.valid())
 							{
 								sol::error err = status;
