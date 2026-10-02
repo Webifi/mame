@@ -28,6 +28,38 @@
 
 DEFINE_DEVICE_TYPE(ES5503, es5503_device, "es5503", "Ensoniq ES5503")
 
+namespace {
+
+// Optional model of the IIgs WVREF path: volume op-amp output V = 5 V * D / 256
+// drives a 1N914 in series with 1 kOhm to ground. The modeled waveform-DAC
+// reference is the resistor voltage, so small D lose more than large D.
+// Is and n are fitted to recordings of one IIgs, not measured part parameters
+// or a calibration applicable to every board. Rs is zero
+// and Vt is kT/q at 300 K. gain[D] is the volume that a linear law needs for the
+// same output, 256 * WVREF / 5 V, times unit. The linear law gives D * unit.
+void fill_knee_gain(int32_t (&gain)[256], double unit)
+{
+	constexpr double IS = 2.5e-9, N = 1.75, VT = 0.025852, R = 1000.0, VFULL = 5.0;
+	gain[0] = 0;
+	for (int d = 1; d < 256; ++d)
+	{
+		// I * R + N * VT * ln(1 + I / IS) = V rises with I, so bisect for the current.
+		const double v = VFULL * d / 256;
+		double low = 0.0, high = v / R;
+		for (int step = 0; step < 64; ++step)
+		{
+			const double mid = (low + high) / 2;
+			if (mid * R + N * VT * std::log1p(mid / IS) > v)
+				high = mid;
+			else
+				low = mid;
+		}
+		gain[d] = int32_t(std::lround(256 * ((low + high) / 2) * R / VFULL * unit));
+	}
+}
+
+} // anonymous namespace
+
 es5503_device::es5503_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock) :
 	device_t(mconfig, ES5503, tag, owner, clock),
 	device_sound_interface(mconfig, *this),
@@ -47,6 +79,9 @@ void es5503_device::device_start()
 	if (m_filter_mode_count)
 		m_output_filter.configure(m_input_clock, AUDIO_RATE, m_filter_poles, m_filter_gains, m_filter_mode_count);
 	m_timer = timer_alloc(FUNC(es5503_device::wakeup), this);
+	for (int d = 0; d < 256; ++d)
+		m_volume_gain[0][d] = d << VOLUME_BITS;
+	fill_knee_gain(m_volume_gain[1], VOLUME_UNIT);
 
 	save_pointer(STRUCT_MEMBER(m_oscillators, freq), 32);
 	save_pointer(STRUCT_MEMBER(m_oscillators, control), 32);
@@ -219,8 +254,9 @@ void es5503_device::integrate_to(uint64_t tick)
 		for (int channel = 0; channel < m_output_channels; ++channel)
 		{
 			// Preserve the established 32-oscillator calibration (34 / 8).
+			// The samples carry VOLUME_BITS fraction bits of volume.
 			const double sum = m_filter_enabled ? (channel ? 0 : m_filter_sum) : double(m_audio_sum[channel]);
-			output[channel] = m_audio_clocks ? sum * 17.0 / (4.0 * 32768.0 * m_audio_clocks) : 0;
+			output[channel] = m_audio_clocks ? sum * 17.0 / (4.0 * 32768.0 * VOLUME_UNIT * m_audio_clocks) : 0;
 			m_audio_sum[channel] = 0;
 		}
 		m_audio_clocks = 0;
@@ -400,7 +436,7 @@ void es5503_device::sample_phase()
 	uint8_t volume = m_fetch_volume;
 	if (m_slot && !(m_slot & 1) && ((m_oscillators[m_slot - 1].control >> 1) & 3) == SYNCAM)
 		volume = m_oscillators[m_slot - 1].data;
-	m_dac_sample = (int(o.data) - 128) * volume;
+	m_dac_sample = (int(o.data) - 128) * m_volume_gain[m_volume_knee][volume];
 }
 
 void es5503_device::complete_oscillator(uint8_t osc, bool zero)
