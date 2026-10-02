@@ -24,6 +24,8 @@ public:
 		m_filter_enabled = true;
 	}
 	void set_output_filter_enabled(bool enabled) { m_filter_enabled = enabled && m_filter_mode_count; }
+	// The board's volume path (diode and resistor ahead of WVREF) can bend the volume law.
+	void set_volume_knee(bool knee) { m_volume_knee = knee; }
 	auto irq_func() { return m_irq_func.bind(); }
 	auto adc_func() { return m_adc_func.bind(); }
 	// Complete externally scheduled host transfers before advancing the chip.
@@ -112,6 +114,13 @@ private:
 	double m_filter_sum = 0;
 	uint64_t m_filter_tick = 0;
 	int32_t m_filter_sample = 0;
+
+	// Effective volume of each register value, with VOLUME_BITS fraction bits.
+	// Index 0 is the linear data sheet law, index 1 is the diode law of the board.
+	static constexpr unsigned VOLUME_BITS = 14;
+	static constexpr double VOLUME_UNIT = 1 << VOLUME_BITS;
+	int32_t m_volume_gain[2][256]{};
+	bool m_volume_knee = false;
 
 	TIMER_CALLBACK_MEMBER(wakeup);
 	void synchronize();

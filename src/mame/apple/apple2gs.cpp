@@ -1400,6 +1400,7 @@ void apple2gs_state::machine_reset()
 	std::fill(&m_glu_repl[0][0], &m_glu_repl[0][0] + 32 * 7, 0);
 	m_snd_demux = ioport("snd_demux")->read() != 0;
 	m_doc->set_output_filter_enabled(!m_snd_demux);
+	m_doc->set_volume_knee(ioport("doc_volume_law")->read() != 0);
 	m_snd_vca = -1.0f;
 	sndglu_apply_vca();
 
@@ -6339,6 +6340,11 @@ INPUT_PORTS_START( apple2gs )
 	PORT_CONFNAME(0x01, 0x00, "DOC stereo demultiplexer")
 	PORT_CONFSETTING(0x00, "Off (stock mono)")
 	PORT_CONFSETTING(0x01, "On (even right, odd left)")
+
+	PORT_START("doc_volume_law")
+	PORT_CONFNAME(0x01, 0x00, "DOC volume law")
+	PORT_CONFSETTING(0x00, "Linear (data sheet)")
+	PORT_CONFSETTING(0x01, "Knee fitted to one real IIgs (test)")
 
 	PORT_START("ram_start")
 	PORT_CONFNAME(0x07, 0x05, "Power-on RAM contents")
