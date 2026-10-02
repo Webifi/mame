@@ -175,6 +175,10 @@ private:
 	// machine event notifiers
 	std::optional<notifiers> m_notifiers;
 
+	// Lua objects that other parts of MAME keep alive; released before the Lua state closes
+	std::vector<std::weak_ptr<sol::protected_function> > m_change_callbacks;
+	std::vector<tap_helper *> m_taps;
+
 	// deferred coroutines
 	std::vector<std::pair<attotime, int> > m_waiting_tasks;
 	std::vector<int> m_update_tasks;
@@ -209,6 +213,7 @@ private:
 	void initialize_debug(sol::table &emu);
 	void initialize_input(sol::table &emu);
 	void initialize_memory(sol::table &emu);
+	void release_taps();
 	void initialize_render(sol::table &emu);
 };
 
