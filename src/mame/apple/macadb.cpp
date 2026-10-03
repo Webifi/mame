@@ -242,6 +242,8 @@ macadb_device::macadb_device(const machine_config &mconfig, const char *tag, dev
 		write_adb_irq(*this),
 		write_adb_power(*this),
 		write_adb_akd(*this),
+		m_keyboard_connected(*this, 1),
+		m_standard_timing(*this, 0),
 		m_waiting_cmd(false),
 		m_datasize(0),
 		m_command(0),
@@ -316,6 +318,9 @@ static char const *const adb_statenames[4] = { "NEW", "EVEN", "ODD", "IDLE" };
 
 bool macadb_device::adb_pollkbd(int update)
 {
+	if (!m_keyboard_connected())
+		return false;
+
 	int report, codes[2];
 	int akd = 0;
 	bool result;
@@ -561,7 +566,7 @@ void macadb_device::adb_talk()
 
 			case 2: // listen
 				m_datasize = 0;
-				if ((addr == m_keybaddr) || (addr == m_mouseaddr))
+				if ((m_keyboard_connected() && addr == m_keybaddr) || (addr == m_mouseaddr))
 				{
 					LOGMASKED(LOG_TALK_LISTEN, "ADB LISTEN: reg %x address %x\n", reg, addr);
 					m_direction = 1;    // input from Mac
@@ -634,7 +639,7 @@ void macadb_device::adb_talk()
 							break;
 					}
 				}
-				else if (addr == m_keybaddr)
+				else if (m_keyboard_connected() && addr == m_keybaddr)
 				{
 					LOGMASKED(LOG_TALK_LISTEN, "Talking to keyboard, register %x\n", reg);
 
@@ -754,7 +759,7 @@ void macadb_device::adb_talk()
 				}
 			}
 		}
-		else if (m_listenaddr == m_keybaddr)
+		else if (m_keyboard_connected() && m_listenaddr == m_keybaddr)
 		{
 			if (m_listenreg == 3)
 			{
@@ -1074,7 +1079,11 @@ void macadb_device::adb_linechange_w(int state)
 						}
 						LOGMASKED(LOG_TALK_LISTEN, "\n");
 						m_linestate = LST_TSTOPSTART; // T1t
-						m_timer->adjust(attotime::from_ticks(324 / 4, adb_timebase));
+						// Apple FDB 062-0267 rev. B, table 3: stop-to-start
+						// is 140-260 us.  Use 200 us in the optional IIgs J13
+						// hardware path; TSTOPSTART adds adb_short before the
+						// start edge.  Other users retain their legacy timing.
+						m_timer->adjust(attotime::from_ticks(m_standard_timing() ? 400 - adb_short : 324 / 4, adb_timebase));
 						m_stream_ptr = 0;
 					}
 					else if (m_direction)   // if direction is set, we LISTENed to a valid device
