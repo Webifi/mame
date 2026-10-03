@@ -19,6 +19,8 @@ public:
 	// construction/destruction
 	macadb_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock);
 
+	auto keyboard_connected_callback() { return m_keyboard_connected.bind(); }
+	auto standard_timing_callback() { return m_standard_timing.bind(); }
 	auto adb_data_callback() { return write_adb_data.bind(); }
 	auto adb_irq_callback() { return write_adb_irq.bind(); }
 	auto adb_power_callback() { return write_adb_power.bind(); }
@@ -39,6 +41,8 @@ protected:
 	virtual void device_reset() override ATTR_COLD;
 
 private:
+	devcb_read_line m_keyboard_connected;
+	devcb_read_line m_standard_timing;
 	u64 m_last_adb_time;
 	emu_timer *m_timer;
 

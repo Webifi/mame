@@ -11,7 +11,7 @@
     Unique hardware configurations:
     - ROM 00/01: original motherboard, 256K of RAM (banks 00/01/E0/E1 only), FPI chip manages fast/slow side
     - ROM 03: revised motherboard, 1M of RAM (banks 00/01/->0F/E0/E1), CYA chip replaces FPI
-    - Expanded IIe: ROM 00/01 motherboard in a IIe case with a IIe keyboard rather than ADB
+    - Expanded IIe: ROM 00/01 motherboard in a IIe case with a IIe keyboard on J13
     - "Mark Twain" prototype: ROM 3 hardware, SWIM1 instead of IWM, built-in floppy, integrated High-Speed SCSI Card
       and internal SCSI HDD, 2 SIMM slots for RAM expansion instead of the proprietary memory slot of the previous IIgs.
       Only 5 slots: slots 5 and 7 are missing (5 for the SuperDrive, 7 for the SCSI).
@@ -181,7 +181,10 @@ public:
 		  m_iwm(*this, "fdc"),
 		  m_floppy(*this, "fdc:%d", 0U),
 		  m_sysconfig(*this, "a2_config"),
-		  m_btconfig(*this, "bus_timing")
+		  m_btconfig(*this, "bus_timing"),
+		  m_j13_config_port(*this, "j13_config"),
+		  m_j13_keys(*this, "j13_y%u", 0U),
+		  m_j13_special(*this, "j13_special")
 
 	{
 		m_cur_floppy = nullptr;
@@ -192,6 +195,11 @@ public:
 	void apple2gs(machine_config &config);
 	void apple2gsr1(machine_config &config);
 	void apple2gsmt(machine_config &config);
+
+	void j13_config_postload();
+	DECLARE_INPUT_CHANGED_MEMBER(j13_config_changed);
+	int adb_keyboard_connected() { return !BIT(m_j13_config, 1); }
+	int j13_enabled() { return BIT(m_j13_config, 0); }
 
 	void rom1_init() { m_is_rom3 = false; }
 	void rom3_init() { m_is_rom3 = true; }
@@ -229,6 +237,10 @@ private:
 	required_device_array<floppy_connector, 4> m_floppy;
 	required_ioport m_sysconfig;
 	required_ioport m_btconfig;
+	optional_ioport m_j13_config_port;
+	optional_ioport_array<10> m_j13_keys;
+	optional_ioport m_j13_special;
+	u8 m_j13_config = 0;
 
 	static constexpr int CNXX_UNCLAIMED = -1;
 
@@ -1063,6 +1075,8 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_glu_816_read_dstat));
 	save_item(NAME(m_glu_mouse_read_stat));
 	save_item(NAME(m_glu_kbd_y));
+	save_item(NAME(m_j13_config));
+	machine().save().register_postload(save_prepost_delegate(FUNC(apple2gs_state::j13_config_postload), this));
 	save_item(NAME(m_intflag));
 	save_item(NAME(m_vgcint));
 	save_item(NAME(m_inten));
@@ -1286,6 +1300,7 @@ void apple2gs_state::machine_start()
 
 void apple2gs_state::machine_reset()
 {
+	m_j13_config = m_j13_config_port.read_safe(0);
 	m_zip_tag_update = m_zip_trash_tag = false;
 	bool const cold_start = !m_ram_initialized;
 	// Configuration is loaded after machine_start.  Initialise physical RAM only
@@ -5891,6 +5906,27 @@ void apple2gs_state::a2gs_es5503_map(address_map &map)
     http://llx.com/Neil/a2/adb.html
 ***************************************************************************/
 
+void apple2gs_state::j13_config_postload()
+{
+	if (!m_j13_config_port)
+		return;
+
+	// Keep the configuration UI and the next cfg write consistent with the state.
+	for (ioport_value mask : { 0x01, 0x02 })
+	{
+		ioport_field *const field = m_j13_config_port->field(mask);
+		ioport_field::user_settings settings;
+		field->get_user_settings(settings);
+		settings.value = m_j13_config & mask;
+		field->set_user_settings(settings);
+	}
+}
+
+INPUT_CHANGED_MEMBER(apple2gs_state::j13_config_changed)
+{
+	m_j13_config = m_j13_config_port->read();
+}
+
 u8 apple2gs_state::adbmicro_p0_in()
 {
 	return m_glu_bus;
@@ -5900,6 +5936,28 @@ u8 apple2gs_state::adbmicro_p1_in()
 {
 	if (!m_is_rom3)
 	{
+		// ROM01 sheet 5: GLU SC0-SC9 -> Y0-Y9, J13 X0-X7 -> P10-P17.
+		if (BIT(m_j13_config, 0) && m_glu_kbd_y < 10)
+		{
+			// Apple 699-0076-C sheet 4 is a passive switch matrix.  The
+			// 10 March 1986 FDB microcontroller ERS, p. 2, explicitly
+			// retains its ghost/phantom keys.  Follow all closed-switch
+			// paths from the selected low scan line, including paths back
+			// through other rows; there are no per-switch isolation diodes.
+			u8 switches[10];
+			for (unsigned row = 0; row < 10; ++row)
+				switches[row] = ~m_j13_keys[row]->read();
+			u8 columns = switches[m_glu_kbd_y];
+			u8 previous;
+			do
+			{
+				previous = columns;
+				for (u8 row : switches)
+					if (row & columns)
+						columns |= row;
+			} while (columns != previous);
+			return ~columns;
+		}
 		return 0xff;
 	}
 	else
@@ -5914,7 +5972,9 @@ u8 apple2gs_state::adbmicro_p2_in()
 
 	if (!m_is_rom3)
 	{
-		rv |= 0x40;     // no reset, must be 0 on ROM 3
+		// J13 /KRESET -> P26. The IIe keyboard's normal solder link
+		// returns Reset through Control (699-0076-C sheet 4).
+		rv |= (BIT(m_j13_config, 0) && !(m_j13_special->read() & 0x42)) ? 0 : 0x40;
 	}
 	rv |= (m_adb_line) ? 0x00 : 0x80;
 
@@ -5934,6 +5994,12 @@ u8 apple2gs_state::adbmicro_p3_in()
 	}
 	else
 	{
+		// Shift/Control/Caps are active low; KSW0/KSW1 active high.
+		if (BIT(m_j13_config, 0))
+		{
+			u8 const keys = m_j13_special->read();
+			return (keys & 0x07) | (BIT(keys, 4) << 7) | (BIT(keys, 5) << 6);
+		}
 		return 0x07;
 	}
 }
@@ -6051,14 +6117,17 @@ void  apple2gs_state::keyglu_mcu_write(u8 offset, u8 data)
 		case GLU_KEY_DATA:
 			// if this is the first key pressed within a certain time frame, don't raise the strobe
 			// so that the emulated system doesn't see the keypress used to start the emulation.
-			if (m_sysconfig->read() & 0x01)
+			// Retain the legacy input-start workaround with J13 off only.
+			// Hardware has no CPU-cycle qualification: Hardware Reference,
+			// second edition, table 6-4, and FDB MCU ERS p. 3.
+			if (!j13_enabled() && (m_sysconfig->read() & 0x01))
 			{ // bump the cycle count way up for a 16 Mhz ZipGS
 				if (m_maincpu->total_cycles() < 700000)
 				{
 					return;
 				}
 			}
-			else
+			else if (!j13_enabled())
 			{
 				if (m_maincpu->total_cycles() < 25000)
 				{
@@ -6101,7 +6170,7 @@ void  apple2gs_state::keyglu_mcu_write(u8 offset, u8 data)
 /*
    Keyglu registers map as follows on the 816:
 
-   C000           = key data + any key down, clears strobe
+   C000           = key data + strobe (not cleared by this read)
    C010           = clears keystrobe
    C024 MOUSEDATA = reads GLU mouseX and mouseY
    C025 KEYMODREG = reads GLU keymod register
@@ -6212,6 +6281,11 @@ void apple2gs_state::keyglu_816_write(u8 offset, u8 data)
 		case GLU_SYSSTAT:
 			m_glu_regs[GLU_SYSSTAT] &= 0xab;  // clear the non-read-only fields
 			m_glu_regs[GLU_SYSSTAT] |= (data & ~0xab);
+			// Table 6-7: IRQ is enabled AND data full, including when an
+			// enable changes while data is already pending.  Preserve the
+			// legacy default path when the optional J13 model is disabled.
+			if (j13_enabled())
+				keyglu_regen_irqs();
 			break;
 	}
 }
@@ -6225,6 +6299,10 @@ void apple2gs_state::keyglu_regen_irqs()
 		bIRQ = true;
 	}
 
+	// Unresolved silicon detail: Hardware Reference table 6-7 specifies a
+	// separate keyboard IRQ latch, but the 10/24/86 Firmware Reference,
+	// appendix E p. E-4, warns that C027 bits 3 and 2 do not work.  Keep the
+	// legacy approximation until the actual KEYGLU behavior is established.
 	if ((m_glu_regs[GLU_KG_STATUS] & KGS_KEYSTROBE) && (m_glu_regs[GLU_SYSSTAT] & GLU_STATUS_KEYDATIRQEN))
 	{
 		bIRQ = true;
@@ -6386,6 +6464,121 @@ INPUT_PORTS_START( apple2gs )
 	PORT_CONFSETTING(0x2000, DEF_STR( On ))
 INPUT_PORTS_END
 
+INPUT_PORTS_START( apple2gsj13 )
+	PORT_INCLUDE( apple2gs )
+
+	PORT_START("j13_config")
+	PORT_CONFNAME(0x01, 0x00, "Built-in keyboard (J13)") PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(apple2gs_state::j13_config_changed), 0)
+	PORT_CONFSETTING(0x00, "None (stock)")
+	PORT_CONFSETTING(0x01, "Apple IIe keyboard")
+	PORT_CONFNAME(0x02, 0x00, "ADB keyboard") PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(apple2gs_state::j13_config_changed), 0)
+	PORT_CONFSETTING(0x00, "Connected (stock)")
+	PORT_CONFSETTING(0x02, "None")
+
+	// Apple drawing 699-0076-C, sheet 4: IIe matrix, indexed by Y then X.
+	// The external numeric pad (X4-X7, Y0-Y5) is not connected.
+	PORT_START("j13_y0")
+	PORT_BIT(0x01, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Escape") PORT_CODE(KEYCODE_ESC) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x02, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Tab") PORT_CODE(KEYCODE_TAB) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x04, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 A") PORT_CODE(KEYCODE_A) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x08, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Z") PORT_CODE(KEYCODE_Z) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x10, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x20, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x40, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x80, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_START("j13_y1")
+	PORT_BIT(0x01, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 1") PORT_CODE(KEYCODE_1) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x02, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Q") PORT_CODE(KEYCODE_Q) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x04, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 D") PORT_CODE(KEYCODE_D) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x08, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 X") PORT_CODE(KEYCODE_X) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x10, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x20, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x40, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x80, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_START("j13_y2")
+	PORT_BIT(0x01, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 2") PORT_CODE(KEYCODE_2) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x02, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 W") PORT_CODE(KEYCODE_W) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x04, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 S") PORT_CODE(KEYCODE_S) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x08, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 C") PORT_CODE(KEYCODE_C) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x10, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x20, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x40, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x80, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_START("j13_y3")
+	PORT_BIT(0x01, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 3") PORT_CODE(KEYCODE_3) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x02, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 E") PORT_CODE(KEYCODE_E) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x04, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 H") PORT_CODE(KEYCODE_H) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x08, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 V") PORT_CODE(KEYCODE_V) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x10, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x20, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x40, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x80, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_START("j13_y4")
+	PORT_BIT(0x01, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 4") PORT_CODE(KEYCODE_4) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x02, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 R") PORT_CODE(KEYCODE_R) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x04, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 F") PORT_CODE(KEYCODE_F) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x08, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 B") PORT_CODE(KEYCODE_B) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x10, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x20, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x40, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x80, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_START("j13_y5")
+	PORT_BIT(0x01, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 6") PORT_CODE(KEYCODE_6) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x02, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Y") PORT_CODE(KEYCODE_Y) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x04, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 G") PORT_CODE(KEYCODE_G) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x08, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 N") PORT_CODE(KEYCODE_N) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x10, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x20, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x40, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_BIT(0x80, IP_ACTIVE_LOW, IPT_UNUSED)
+	PORT_START("j13_y6")
+	PORT_BIT(0x01, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 5") PORT_CODE(KEYCODE_5) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x02, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 T") PORT_CODE(KEYCODE_T) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x04, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 J") PORT_CODE(KEYCODE_J) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x08, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 M") PORT_CODE(KEYCODE_M) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x10, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Backslash") PORT_CODE(KEYCODE_BACKSLASH) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x20, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Grave") PORT_CODE(KEYCODE_TILDE) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x40, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Return") PORT_CODE(KEYCODE_ENTER) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x80, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Delete") PORT_CODE(KEYCODE_BACKSPACE) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_START("j13_y7")
+	PORT_BIT(0x01, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 7") PORT_CODE(KEYCODE_7) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x02, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 U") PORT_CODE(KEYCODE_U) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x04, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 K") PORT_CODE(KEYCODE_K) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x08, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Comma") PORT_CODE(KEYCODE_COMMA) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x10, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Equals") PORT_CODE(KEYCODE_EQUALS) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x20, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 P") PORT_CODE(KEYCODE_P) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x40, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Up") PORT_CODE(KEYCODE_UP) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x80, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Down") PORT_CODE(KEYCODE_DOWN) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_START("j13_y8")
+	PORT_BIT(0x01, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 8") PORT_CODE(KEYCODE_8) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x02, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 I") PORT_CODE(KEYCODE_I) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x04, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Semicolon") PORT_CODE(KEYCODE_COLON) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x08, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Period") PORT_CODE(KEYCODE_STOP) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x10, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 0") PORT_CODE(KEYCODE_0) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x20, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Left bracket") PORT_CODE(KEYCODE_OPENBRACE) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x40, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Space") PORT_CODE(KEYCODE_SPACE) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x80, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Left") PORT_CODE(KEYCODE_LEFT) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_START("j13_y9")
+	PORT_BIT(0x01, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 9") PORT_CODE(KEYCODE_9) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x02, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 O") PORT_CODE(KEYCODE_O) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x04, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 L") PORT_CODE(KEYCODE_L) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x08, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Slash") PORT_CODE(KEYCODE_SLASH) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x10, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Minus") PORT_CODE(KEYCODE_MINUS) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x20, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Right bracket") PORT_CODE(KEYCODE_CLOSEBRACE) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x40, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Quote") PORT_CODE(KEYCODE_QUOTE) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+	PORT_BIT(0x80, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Right") PORT_CODE(KEYCODE_RIGHT) PORT_CONDITION("j13_config", 0x01, EQUALS, 0x01)
+
+	PORT_START("j13_special")
+	PORT_BIT(0x01, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Shift") PORT_CODE(KEYCODE_LSHIFT) PORT_CODE(KEYCODE_RSHIFT)
+	PORT_BIT(0x02, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Control") PORT_CODE(KEYCODE_LCONTROL) PORT_CODE(KEYCODE_RCONTROL)
+	PORT_BIT(0x04, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Caps Lock") PORT_CODE(KEYCODE_CAPSLOCK) PORT_TOGGLE
+	PORT_BIT(0x08, IP_ACTIVE_HIGH, IPT_UNUSED)
+	PORT_BIT(0x10, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("J13 Open Apple") PORT_CODE(KEYCODE_LALT)
+	PORT_BIT(0x20, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("J13 Closed Apple") PORT_CODE(KEYCODE_RALT)
+	PORT_BIT(0x40, IP_ACTIVE_LOW, IPT_KEYBOARD) PORT_NAME("J13 Reset") PORT_CODE(KEYCODE_F12)
+	PORT_BIT(0x80, IP_ACTIVE_HIGH, IPT_UNUSED)
+INPUT_PORTS_END
+
 INPUT_PORTS_START( apple2gsrom3 )
 	PORT_INCLUDE( apple2gs )
 
@@ -6537,6 +6730,8 @@ void apple2gs_state::apple2gs(machine_config &config)
 void apple2gs_state::apple2gsr1(machine_config &config)
 {
 	apple2gs(config);
+	m_macadb->keyboard_connected_callback().set(FUNC(apple2gs_state::adb_keyboard_connected));
+	m_macadb->standard_timing_callback().set(FUNC(apple2gs_state::j13_enabled));
 
 	// ROM01 sound sheet 8 omits ROM03 SR51/SR2/SC24. Its first follower
 	// is a single SR15(15k)/SC14(220pF) pole, followed by the same second pair.
@@ -6697,8 +6892,8 @@ ROM_END
 /*    YEAR  NAME          PARENT    COMPAT  MACHINE     INPUT         CLASS           INIT       COMPANY           FULLNAME */
 COMP( 1989, apple2gs,     0,        apple2, apple2gs,   apple2gsrom3, apple2gs_state, rom3_init, "Apple Computer", "Apple IIgs (ROM03)", MACHINE_SUPPORTS_SAVE )
 COMP( 198?, apple2gsr3p,  apple2gs, 0,      apple2gs,   apple2gsrom3, apple2gs_state, rom3_init, "Apple Computer", "Apple IIgs (ROM03 prototype)", MACHINE_NOT_WORKING )
-COMP( 1987, apple2gsr1,   apple2gs, 0,      apple2gsr1, apple2gs,     apple2gs_state, rom1_init, "Apple Computer", "Apple IIgs (ROM01)", MACHINE_SUPPORTS_SAVE )
-COMP( 1986, apple2gsr0,   apple2gs, 0,      apple2gsr1, apple2gs,     apple2gs_state, rom1_init, "Apple Computer", "Apple IIgs (ROM00)", MACHINE_SUPPORTS_SAVE )
-COMP( 1986, apple2gsr0p,  apple2gs, 0,      apple2gsr1, apple2gs,     apple2gs_state, rom1_init, "Apple Computer", "Apple IIgs (ROM00 prototype 6/19/1986)", MACHINE_SUPPORTS_SAVE )
-COMP( 1986, apple2gsr0p2, apple2gs, 0,      apple2gsr1, apple2gs,     apple2gs_state, rom1_init, "Apple Computer", "Apple IIgs (ROM00 prototype 3/10/1986)", MACHINE_SUPPORTS_SAVE )
+COMP( 1987, apple2gsr1,   apple2gs, 0,      apple2gsr1, apple2gsj13,  apple2gs_state, rom1_init, "Apple Computer", "Apple IIgs (ROM01)", MACHINE_SUPPORTS_SAVE )
+COMP( 1986, apple2gsr0,   apple2gs, 0,      apple2gsr1, apple2gsj13,  apple2gs_state, rom1_init, "Apple Computer", "Apple IIgs (ROM00)", MACHINE_SUPPORTS_SAVE )
+COMP( 1986, apple2gsr0p,  apple2gs, 0,      apple2gsr1, apple2gsj13,  apple2gs_state, rom1_init, "Apple Computer", "Apple IIgs (ROM00 prototype 6/19/1986)", MACHINE_SUPPORTS_SAVE )
+COMP( 1986, apple2gsr0p2, apple2gs, 0,      apple2gsr1, apple2gsj13,  apple2gs_state, rom1_init, "Apple Computer", "Apple IIgs (ROM00 prototype 3/10/1986)", MACHINE_SUPPORTS_SAVE )
 COMP( 1991, apple2gsmt,   apple2gs, 0,      apple2gsmt, apple2gsrom3, apple2gs_state, rom3_init, "Apple Computer", "Apple IIgs (1991 Mark Twain prototype)", MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
