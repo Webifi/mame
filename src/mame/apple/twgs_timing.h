@@ -25,8 +25,10 @@ struct hit_jump {
 };
 inline const hit_jump composed_hit;
 // Motherboard timing inputs follow Apple IIgs TN68. The card's clock-source
-// selection and CPU completion are exclusively the GAL recurrence in card.h.
-// Units are the existing motherboard model's 1/15,120,000,000 second ticks.
+// selection and CPU completion follow the GAL recurrence in twgs_card.h.
+// Time fields use 1/(15,120,000,000 * Scale) seconds per tick. The finer
+// integer grid represents supported accelerator periods without rounding
+// each edge; convert to scheduler time only at the owner's boundary.
 template<uint64_t Scale> struct timing_scaled {
  static constexpr uint64_t CLK=1056*Scale, FAST=5*CLK, MEGA=14*CLK, LINE=912*CLK;
  uint64_t now=0, early=0, late=Scale, gs_event=2*CLK, gs_start=0, x4=270*Scale;
@@ -42,7 +44,8 @@ template<uint64_t Scale> struct timing_scaled {
   void write(transaction const&,uint64_t,uint64_t) const noexcept {}
  };
  // The unspecified propagation interval is an explicit phase parameter.
- // Default EARLY then LATE at the same ideal instant, ordered by one tick.
+ // Default EARLY then LATE, separated by Scale ticks (one motherboard-model
+ // tick). late_phase is expressed in this template's finer tick units.
  void start(uint64_t t,unsigned late_phase=Scale) noexcept {
   now=t;early=(t/x4+1)*x4;late=early+late_phase;
   gs_start=(t/FAST)*FAST;gs_event=gs_start+2*CLK;

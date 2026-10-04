@@ -5,6 +5,9 @@
 #include <array>
 #include <cstdint>
 namespace twgs_decoded {
+// One CPU bus cycle. type uses the g65816 BUS_* numbering: opcode, operand,
+// read, write, vector, internal read, internal write, interrupt. id follows
+// the cycle through the latches so a buffered write can be identified later.
 struct transaction {
  uint32_t address=0;
  uint64_t id=0;
@@ -12,6 +15,8 @@ struct transaction {
  bool seed=false;
  bool read() const noexcept {return type!=3&&type!=6;}
 };
+// A transparent latch can hold either the bank byte or the data byte of
+// its transaction. Keep that captured byte separate from bus.data.
 struct payload {
  transaction bus{};
  uint8_t byte=0;
@@ -27,6 +32,8 @@ struct card {
  cache_decode decode;
  fpga_copy fpga;
  std::array<payload,4> latches{};
+ // active is the motherboard cycle in progress; bank_candidate is its
+ // preceding bank-address phase. A finished write is exposed as retired.
  payload active{},bank_candidate{},retired{};
  unsigned active_column=0,bank_column=0;
  uint32_t mask=32767;
@@ -35,6 +42,8 @@ struct card {
  uint64_t fp=0;
  bool comparator_enable=true,cpu=true,we=false,forced_write=false,bank_valid=false;
  uint64_t completions=0,deliveries=0,strobe_changes=0,bank_errors=0,high_errors=0;
+ // completed/delivered are cleared by each edge handler. CPU completion
+ // can precede delivery for a buffered write; the counters above accumulate.
  bool completed=false,delivered=false,from_sram=false;
  bool external_advance=false; // owner supplies next address before the next edge
  uint8_t receipt=0;
