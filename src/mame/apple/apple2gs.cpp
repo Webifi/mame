@@ -57,6 +57,7 @@
 #include "emu.h"
 #include "twgs_timing.h"
 #include "twgs_clock.h"
+#include "applesqueezer.h"
 #include "osdcore.h"
 
 #include "apple2video.h"
@@ -194,6 +195,8 @@ public:
 
 	void apple2gs(machine_config &config);
 	void apple2gsr1(machine_config &config);
+	void apple2gsas(machine_config &config);
+	void apple2gs1as(machine_config &config);
 	void apple2gsmt(machine_config &config);
 
 	void j13_config_postload();
@@ -599,6 +602,38 @@ private:
 	void process_clock();
 	void clear_vgcint(u8 data);
 
+	// CPU stores update private RAM immediately. The FIFO separately owns
+	// pending motherboard writes, including their physical slow-RAM address.
+	// Its IIgs fast/Mega II service periods are an AppleSqueezer approximation.
+	bool m_as_model = false; // fixed by machine configuration
+	bool m_as_cpu_access = false;
+	u8 m_as_speed = 255;
+	u32 m_as_hz = 14'000'000;
+	u32 m_as_capture = 0xffffffff;
+	s16 m_as_palette = -1;
+	u64 m_as_mapping_until = 0;
+	u64 m_as_io_until = 0;
+	u32 m_as_io_delay_us = 500;
+	u8 m_as_slow_ram[0x20000]{};
+	std::unique_ptr<u8[]> m_as_extended;
+	applesqueezer::dram_port m_as_dram;
+	applesqueezer::write_fifo m_as_fifo;
+	emu_timer *m_as_timer = nullptr;
+	emu_timer *m_as_io_timer = nullptr;
+	bool as_access(u32 address, int type, u8 &data, int &cycles);
+	bool as_shadowed(u32 address);
+	int as_io_class(u32 address, bool write) const;
+	u8 as_api_r(u32 address);
+	void as_api_w(u32 address, u8 data);
+	u8 as_slow_r(u32 address) const;
+	void as_slow_w(u32 address, u8 data);
+	void as_flush(u64 time);
+	void as_schedule();
+	void as_postload();
+	void as_io_access(u64 end);
+	TIMER_CALLBACK_MEMBER(as_write_complete);
+	TIMER_CALLBACK_MEMBER(as_io_complete);
+
 	// ZipGS stuff
 	bool m_accel_unlocked = false;
 	bool m_accel_fast = false;
@@ -674,7 +709,7 @@ private:
 	static constexpr u64 BT_LINE = 912 * BT_CLK;
 	static constexpr u64 BT_IDLE = 64; // more cycles than one instruction: the CPU waited (WAI)
 	static constexpr u64 BT_PAGE_UNIT = 66; // per-page stall counters are in 1/16 of a 14M clock
-	enum { BT_OFF = 0, BT_STOCK, BT_ZIP, BT_TWGS, BT_NATIVE };
+	enum { BT_OFF = 0, BT_STOCK, BT_ZIP, BT_TWGS, BT_NATIVE, BT_APPLESQUEEZER };
 	enum { BC_RAM = 0, BC_ROM, BC_FASTIO, BC_MEGA };
 
 	// profile region ":zipprof", read by Lua
@@ -906,6 +941,33 @@ void apple2gs_state::machine_start()
 {
 	m_ram_ptr = m_ram->pointer();
 	m_ram_size = m_ram->size();
+	if (m_as_model)
+	{
+		m_as_extended = std::make_unique<u8[]>(applesqueezer::extended_ram_bytes);
+		m_as_timer = timer_alloc(FUNC(apple2gs_state::as_write_complete), this);
+		m_as_io_timer = timer_alloc(FUNC(apple2gs_state::as_io_complete), this);
+		save_pointer(NAME(m_as_extended), applesqueezer::extended_ram_bytes);
+		save_item(NAME(m_as_slow_ram));
+		save_item(NAME(m_as_speed));
+		save_item(NAME(m_as_hz));
+		save_item(NAME(m_as_mapping_until));
+		save_item(NAME(m_as_io_until));
+		save_item(NAME(m_as_io_delay_us));
+		save_item(NAME(m_as_dram.main_bank));
+		save_item(NAME(m_as_dram.offset));
+		save_item(NAME(m_as_dram.at_bank_end));
+		save_item(NAME(m_as_fifo.head));
+		save_item(NAME(m_as_fifo.count));
+		save_item(STRUCT_MEMBER(m_as_fifo.entries, address));
+		save_item(STRUCT_MEMBER(m_as_fifo.entries, data));
+		save_item(STRUCT_MEMBER(m_as_fifo.entries, start));
+		save_item(STRUCT_MEMBER(m_as_fifo.entries, end));
+		save_item(STRUCT_MEMBER(m_as_fifo.entries, slow_address));
+		save_item(STRUCT_MEMBER(m_as_fifo.entries, palette));
+		save_item(STRUCT_MEMBER(m_as_fifo.entries, io));
+		save_item(STRUCT_MEMBER(m_as_fifo.entries, mapping));
+		machine().save().register_postload(save_prepost_delegate(FUNC(apple2gs_state::as_postload), this));
+	}
 
 	m_zip_tag = std::make_unique<u32[]>(0x10000);
 	m_zip_data = std::make_unique<u8[]>(0x10000);
@@ -1301,6 +1363,8 @@ void apple2gs_state::machine_start()
 
 void apple2gs_state::machine_reset()
 {
+	if (m_as_model && m_as_fifo.count)
+		as_flush(m_as_fifo.entries[(m_as_fifo.head + m_as_fifo.count - 1) % applesqueezer::write_fifo::capacity].end);
 	m_j13_config = m_j13_config_port.read_safe(0);
 	m_zip_tag_update = m_zip_trash_tag = false;
 	bool const cold_start = !m_ram_initialized;
@@ -1473,7 +1537,7 @@ void apple2gs_state::machine_reset()
 	m_accel_warm_boot = false;
 
 	// is Zip enabled?
-	if (m_sysconfig->read() & 0x01)
+	if (!m_as_model && (m_sysconfig->read() & 0x01))
 	{
 		static const int speeds[4] = { 7000000, 8000000, 12000000, 16000000 };
 		m_accel_present = true;
@@ -1548,6 +1612,27 @@ void apple2gs_state::machine_reset()
 		m_glu_log_summary_at = machine().time() + attotime::from_seconds(10);
 		m_maincpu->set_memory_hook(g65816_device::memory_hook_delegate(&apple2gs_state::sndglu_log_memory, this));
 	}
+	if (m_as_model)
+	{
+		// Warm reset retains RAM and the runtime speed; pending posted writes
+		// are completed in order before the reset starts a fresh queue.
+		m_as_fifo = {};
+		m_as_mapping_until = 0;
+		m_as_io_until = 0;
+		m_as_cpu_access = false;
+		m_as_timer->adjust(attotime::never);
+		m_as_io_timer->adjust(attotime::never);
+		std::copy(std::begin(m_megaii_ram), std::end(m_megaii_ram), std::begin(m_as_slow_ram));
+		if (cold_start)
+		{
+			m_as_speed = u8(ioport("as_clock")->read());
+			m_as_hz = applesqueezer::nominal_speed(m_as_speed) * 1'000'000;
+			m_as_dram = {};
+		}
+		as_postload();
+		update_speed();
+		m_maincpu->reset();
+	}
 }
 
 void apple2gs_state::raise_irq(int irq)
@@ -1586,6 +1671,20 @@ void apple2gs_state::lower_irq(int irq)
 
 void apple2gs_state::update_speed()
 {
+	if (m_as_model)
+	{
+		const u32 fast = m_as_io_until ? std::min(m_as_hz, A2GS_2_8M.value()) : m_as_hz;
+		const u32 speed = (m_speed & SPEED_HIGH) ? fast : A2GS_1M.value();
+		if (m_maincpu->executing() && speed != m_maincpu->unscaled_clock())
+		{
+			machine().scheduler().synchronize(timer_expired_delegate(FUNC(apple2gs_state::apply_speed), this));
+			return;
+		}
+		m_last_speed = true;
+		m_maincpu->set_unscaled_clock(speed);
+		bt_setup(speed);
+		return;
+	}
 	if (m_twgs_kernel_on)
 	{
 		// Keep the accounting clock fixed at the card oscillator / 4. Actual
@@ -2400,6 +2499,290 @@ u8 apple2gs_state::twgs_bus(u32 address, int type, u8 data)
 // logic is on, the card runs at the GS speed.
 // ---------------------------------------------------------------------------
 
+// AppleSqueezer working model: private memory at the selected native rate;
+// ordered posted writes drained by the existing IIgs motherboard scheduler.
+u8 apple2gs_state::as_slow_r(u32 address) const
+{
+	return (m_as_model && m_as_cpu_access) ? m_as_slow_ram[address] : m_megaii_ram[address];
+}
+
+void apple2gs_state::as_slow_w(u32 address, u8 data)
+{
+	if (m_as_model && m_as_cpu_access)
+	{
+		m_as_slow_ram[address] = data;
+		m_as_capture = address;
+	}
+	else
+		m_megaii_ram[address] = data;
+}
+
+int apple2gs_state::as_io_class(u32 address, bool write) const
+{
+	const u16 low = address;
+	if (low < 0xc080)
+	{
+		if (write)
+			return (low == 0xc035 || low == 0xc036 || low == 0xc037) ? BC_FASTIO : BC_MEGA;
+		return (low >= 0xc071 || low == 0xc02d || low == 0xc035 || low == 0xc036 || low == 0xc037 || low == 0xc068) ? BC_FASTIO : BC_MEGA;
+	}
+	return BC_MEGA;
+}
+
+bool apple2gs_state::as_shadowed(u32 address)
+{
+	const u8 bank = address >> 16;
+	const u16 low = address;
+	if (bank == 0xe0 || bank == 0xe1)
+		return true;
+	if (bank >= 0xe0 || (bank >= 2 && !(m_speed & SPEED_ALLBANKS)))
+		return false;
+	const bool aux = bank == 0 ? bt_aux(low, true) : BIT(bank, 0);
+	if (low >= 0x0400 && low < 0x0800)
+		return !(m_shadow & SHAD_TXTPG1);
+	if (low >= 0x0800 && low < 0x0c00)
+		return m_is_rom3 && !(m_shadow & SHAD_TXTPG2);
+	if (low >= 0x2000 && low < 0x4000)
+		return (!(m_shadow & SHAD_HIRESPG1) && (!aux || !(m_shadow & SHAD_AUXHIRES))) || (aux && !(m_shadow & SHAD_SUPERHIRES));
+	if (low >= 0x4000 && low < 0x6000)
+		return (!(m_shadow & SHAD_HIRESPG2) && (!aux || !(m_shadow & SHAD_AUXHIRES))) || (aux && !(m_shadow & SHAD_SUPERHIRES));
+	return aux && low >= 0x6000 && low < 0xa000 && !(m_shadow & SHAD_SUPERHIRES);
+}
+
+void apple2gs_state::as_schedule()
+{
+	if (!m_as_fifo.count)
+	{
+		m_as_timer->adjust(attotime::never);
+		return;
+	}
+	const attotime when = bt_at(m_as_fifo.entries[m_as_fifo.head].end);
+	const attotime now = machine().time();
+	m_as_timer->adjust(when > now ? when - now : attotime::zero);
+}
+
+void apple2gs_state::as_flush(u64 time)
+{
+	while (m_as_fifo.count && m_as_fifo.entries[m_as_fifo.head].end <= time)
+	{
+		applesqueezer::write_entry entry;
+		m_as_fifo.retire(entry);
+		if (entry.io)
+		{
+			const bool slow = m_bt_slow;
+			m_snd_force = bt_at(entry.start);
+			m_snd_force_on = true;
+			m_maincpu->space(AS_PROGRAM).write_byte(entry.address, entry.data);
+			m_snd_force_on = false;
+			m_bt_slow = slow;
+		}
+		else if (entry.slow_address != 0xffffffff)
+		{
+			m_megaii_ram[entry.slow_address] = entry.data;
+			if (entry.palette >= 0)
+			{
+				const int color = entry.palette;
+				m_video->set_SHR_color(color, rgb_t(
+					((m_megaii_ram[0x19f00 + color] >> 0) & 0x0f) * 17,
+					((m_megaii_ram[0x15f00 + color] >> 4) & 0x0f) * 17,
+					((m_megaii_ram[0x15f00 + color] >> 0) & 0x0f) * 17));
+			}
+		}
+	}
+	if (time >= m_as_mapping_until)
+		m_as_mapping_until = 0;
+	as_schedule();
+}
+
+TIMER_CALLBACK_MEMBER(apple2gs_state::as_write_complete)
+{
+	as_flush(u64(machine().time().as_double() * double(BT_PER_SEC)) + 1);
+}
+
+TIMER_CALLBACK_MEMBER(apple2gs_state::as_io_complete)
+{
+	m_as_io_until = 0;
+	update_speed();
+}
+
+void apple2gs_state::as_io_access(u64 end)
+{
+	if (!m_as_io_delay_us)
+		return;
+	// Inferred compatibility interval, not a published FPGA constant.
+	// The physical board's DOC-polled NOP test reports about 2.87 MHz;
+	// its longer batch takes about 0.3 ms at the motherboard CPU rate.
+	// Retain that rate for 0.5 ms after external I/O, including write-only
+	// device sequences. Posted RAM writes do not start this interval.
+	m_as_io_until = end + u64(m_as_io_delay_us) * (BT_PER_SEC / 1'000'000);
+	m_as_io_timer->adjust(std::max(attotime::zero, bt_at(m_as_io_until) - machine().time()));
+	if ((m_speed & SPEED_HIGH) && m_maincpu->unscaled_clock() > A2GS_2_8M.value())
+		update_speed();
+}
+
+void apple2gs_state::as_postload()
+{
+	m_as_cpu_access = false;
+	m_maincpu->set_cached_access(g65816_device::cached_access_delegate(&apple2gs_state::as_access, this));
+	m_maincpu->set_data_hook(g65816_device::data_hook_delegate());
+	m_maincpu->set_memory_hook(g65816_device::memory_hook_delegate());
+	m_maincpu->set_internal_hook(g65816_device::internal_hook_delegate());
+	as_schedule();
+	if (m_as_io_until)
+		m_as_io_timer->adjust(std::max(attotime::zero, bt_at(m_as_io_until) - machine().time()));
+	else
+		m_as_io_timer->adjust(attotime::never);
+}
+
+u8 apple2gs_state::as_api_r(u32 address)
+{
+	switch (address)
+	{
+	case applesqueezer::presence_register: return 1;
+	case applesqueezer::version_register: return 14;
+	case 0xe20008: return 1; // flash byte interface idle; updating is not implemented
+	case 0xe4000e: return 1; // SD controller idle
+	case 0xe40012: return 0; // no SD card attached
+	case applesqueezer::dram_data_register:
+	{
+		u8 value = 0xff;
+		m_as_dram.read(value, [this](u32 a) { return m_as_extended[a]; }, !machine().side_effects_disabled());
+		return value;
+	}
+	default: return 0xff;
+	}
+}
+
+void apple2gs_state::as_api_w(u32 address, u8 data)
+{
+	if (machine().side_effects_disabled())
+		return;
+	if (m_as_dram.set_address_byte(address, data))
+		return;
+	if (address == applesqueezer::dram_data_register)
+		m_as_dram.write(data, [this](u32 a, u8 v) { m_as_extended[a] = v; });
+	else if (address == applesqueezer::speed_register)
+	{
+		const unsigned nominal = applesqueezer::nominal_speed(data);
+		if (nominal)
+		{
+			m_as_speed = data;
+			m_as_hz = nominal * 1'000'000;
+			update_speed();
+		}
+		else
+			logerror("AppleSqueezer: unmodeled speed byte %02x; retaining previous speed\n", data);
+	}
+}
+
+bool apple2gs_state::as_access(u32 address, int type, u8 &data, int &cycles)
+{
+	if (m_glu_log_enabled)
+		sndglu_log_note(address, type);
+	u64 charge = type == g65816_device::BUS_OPCODE ? bt_instruction(address) : 0;
+	const u64 begin = m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
+	u64 now = begin;
+	as_flush(now);
+	const u8 bank = address >> 16;
+	const u16 low = address;
+	const bool write = type == g65816_device::BUS_WRITE;
+	const bool mapped = bank < 2 || bank == 0xe0 || bank == 0xe1;
+	// A posted switch change must reach the motherboard before resolving an
+	// access whose mapping it controls. Unrelated high-bank RAM stays native.
+	if (m_as_mapping_until && (mapped || write))
+	{
+		now = std::max(now, m_as_mapping_until);
+		as_flush(now);
+	}
+	const bool io_bank = bank == 0xe0 || bank == 0xe1 || (bank < 2 && !(m_shadow & SHAD_IOLC));
+	const bool io = io_bank && low >= 0xc000 && low < 0xd000;
+	const bool posted = write && (mapped || as_shadowed(address));
+	if (posted && m_as_fifo.count == applesqueezer::write_fifo::capacity)
+	{
+		now = std::max(now, m_as_fifo.entries[m_as_fifo.head].end);
+		as_flush(now);
+		m_btc[BTC_WBUF_FULL]++;
+	}
+
+	address_space &space = m_maincpu->space(AS_PROGRAM);
+	m_bt_slow = false;
+	m_as_capture = 0xffffffff;
+	m_as_palette = -1;
+	u64 stall = now - begin;
+	if (!write && io)
+	{
+		// Uncached reads observe all older posted writes. This conservative
+		// ordering is a model assumption, not recovered FPGA forwarding logic.
+		now = std::max(now, m_bt_busfree);
+		as_flush(now);
+		const u64 end = bt_bus(now, as_io_class(address, false));
+		m_bt_busfree = end;
+		m_snd_force = bt_at(m_bt_slot);
+		m_snd_force_on = true;
+		data = space.read_byte(address);
+		m_snd_force_on = false;
+		const u64 resume = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle;
+		stall = resume > begin + m_bt_cycle ? resume - begin - m_bt_cycle : 0;
+		if (as_io_class(address, false) == BC_MEGA)
+			as_io_access(end);
+		m_btc[BTC_UNCACHED]++;
+		m_btpage[(address >> 8) * 4 + 1]++;
+	}
+	else
+	{
+		if (!io)
+		{
+			m_as_cpu_access = true;
+			if (write)
+				space.write_byte(address, data);
+			else if (type == g65816_device::BUS_VECTOR)
+				data = m_maincpu->space(g65816_device::AS_VECTORS).read_byte(address & 0x1f);
+			else
+				data = space.read_byte(address);
+			m_as_cpu_access = false;
+		}
+		if (posted)
+		{
+			const int cls = io ? as_io_class(address, true) : ((m_as_capture != 0xffffffff || bank == 0xe0 || bank == 0xe1) ? BC_MEGA : BC_RAM);
+			const u64 end = bt_bus(std::max(now, m_bt_busfree), cls);
+			m_bt_busfree = end;
+			applesqueezer::write_entry entry;
+			entry.address = address;
+			entry.data = data;
+			entry.start = m_bt_slot;
+			entry.end = end;
+			entry.slow_address = m_as_capture;
+			entry.palette = m_as_palette;
+			entry.io = io;
+			entry.mapping = io && (low < 0xc03c || low > 0xc03f);
+			if (entry.mapping)
+				m_as_mapping_until = end;
+			if (!m_as_fifo.push(entry))
+				fatalerror("AppleSqueezer write FIFO overflow");
+			as_schedule();
+			if (io && cls == BC_MEGA)
+				as_io_access(end);
+		}
+		else if (!write)
+			m_btc[BTC_HITS]++; // native private-memory access, no tag lookup
+	}
+
+	m_bt_idx++;
+	m_btc[write ? BTC_WRITES : BTC_READS]++;
+	u64 *const page = &m_btpage[(address >> 8) * 4];
+	page[write ? 2 : 0]++;
+	m_bt_istall += stall;
+	m_btc[write ? BTC_STALL_WRITE : BTC_STALL_READ] += stall;
+	page[3] += stall / BT_PAGE_UNIT;
+	m_btpc[m_bt_ipc * 3] += stall / BT_PAGE_UNIT;
+	m_bt_frac += charge + stall;
+	cycles = int(m_bt_frac / m_bt_cycle);
+	m_bt_frac -= u64(cycles) * m_bt_cycle;
+	m_bt_charged += cycles;
+	m_bt_slow = false;
+	return true;
+}
+
 void apple2gs_state::bt_config()
 {
 	const ioport_value cfg = m_btconfig->read();
@@ -2414,9 +2797,9 @@ void apple2gs_state::bt_config()
 		m_zip_bank_ok[bank] = (bank < limit) || (bank == 0xe0) || (bank == 0xe1) || (bank >= 0xfc);
 
 	// the native-speed setting replaces the accelerator of the CPU type
-	m_native_ram = BIT(cfg, 13);
-	m_twgs_sel = BIT(cfg, 10) && !m_native_ram;
-	m_twgs_real = BIT(ioport("twgs_rom")->read(), 0);
+	m_native_ram = !m_as_model && BIT(cfg, 13);
+	m_twgs_sel = !m_as_model && BIT(cfg, 10) && !m_native_ram;
+	m_twgs_real = !m_as_model && BIT(ioport("twgs_rom")->read(), 0);
 	m_twgs_irq_at_reset = !BIT(cfg, 12);
 	m_twgs_mask = BIT(cfg, 11) ? 0x7fff : 0x1fff;
 	// GAL1/GAL2 write service adds no whole motherboard clocks.
@@ -2430,8 +2813,10 @@ void apple2gs_state::bt_setup(u32 speed)
 	int mode = BT_OFF;
 	if (m_last_speed)
 		mode = (speed == A2GS_2_8M.value()) ? BT_STOCK : (m_twgs ? BT_TWGS : (m_native_ram ? BT_NATIVE : BT_ZIP));
+	if (m_as_model)
+		mode = BT_APPLESQUEEZER;
 	m_bt_mode = mode;
-	m_bt_cycle = ((mode == BT_ZIP) || (mode == BT_TWGS) || (mode == BT_NATIVE)) ? (BT_PER_SEC / speed) : BT_FAST;
+	m_bt_cycle = ((mode == BT_ZIP) || (mode == BT_TWGS) || (mode == BT_NATIVE) || (mode == BT_APPLESQUEEZER)) ? (BT_PER_SEC / speed) : BT_FAST;
 	m_bt_twslow = false;
 	m_bt_resync = true;
 	m_bt_slow = false;
@@ -2452,7 +2837,7 @@ void apple2gs_state::bt_control()
 	header[3] = (m_bt_mode == BT_ZIP) ? (m_zip_mask + 1) : (m_bt_mode == BT_TWGS) ? (m_twgs_mask + 1) : 0;
 	header[5] = u32(m_bt_cycle);
 	header[6] = u32(BT_CLK);
-	header[7] = (m_bt_mode == BT_NATIVE) ? 0 : (((m_bt_mode == BT_TWGS) ? TWGS_WRITE_LATCHES : ZIP_WRITE_DEPTH) | (u32(BUS_READ_RESUME) << 8));
+	header[7] = (m_bt_mode == BT_APPLESQUEEZER) ? 31 : (m_bt_mode == BT_NATIVE) ? 0 : (((m_bt_mode == BT_TWGS) ? TWGS_WRITE_LATCHES : ZIP_WRITE_DEPTH) | (u32(BUS_READ_RESUME) << 8));
 }
 
 u64 apple2gs_state::bt_fast(u64 t, bool refresh)
@@ -3242,6 +3627,8 @@ TIMER_DEVICE_CALLBACK_MEMBER(apple2gs_state::apple2_interrupt)
 
 TIMER_DEVICE_CALLBACK_MEMBER(apple2gs_state::apple2_vgc)
 {
+	if (m_as_model)
+		as_flush(u64(machine().time().as_double() * double(BT_PER_SEC)));
 	twgs_flush_due();
 	// flush the previous scanline to ensure SCB or palette changes are visible
 	m_screen->update_now();
@@ -5070,6 +5457,8 @@ void apple2gs_state::c800_w(offs_t offset, u8 data)
 // 65816 bank register is left on floating bus
 u8 apple2gs_state::floatingbank_r(offs_t offset)
 {
+	if (m_as_model && offset >= 0xe20000 && offset <= 0xe50000)
+		return as_api_r(offset);
 	if (m_twgs && ((offset >> 16) == 0xbc))
 		return twgs_r(offset & 0xffff);
 
@@ -5080,6 +5469,11 @@ u8 apple2gs_state::floatingbank_r(offs_t offset)
 
 void apple2gs_state::floatingbank_w(offs_t offset, u8 data)
 {
+	if (m_as_model && offset >= 0xe20000 && offset <= 0xe50000)
+	{
+		as_api_w(offset, data);
+		return;
+	}
 	if (m_twgs && ((offset >> 16) == 0xbc) && !machine().side_effects_disabled())
 		twgs_w(offset & 0xffff, data);
 }
@@ -5139,7 +5533,7 @@ void apple2gs_state::expansion_shadow_w(offs_t offset, u8 data)
 		else
 		{
 			slow_cycle();
-			m_megaii_ram[offset & 0x1ffff] = data;
+			as_slow_w(offset & 0x1ffff, data);
 		}
 	}
 }
@@ -5174,15 +5568,15 @@ u8 apple2gs_state::lc_r(offs_t offset)
 		{
 			if (m_lcram2)
 			{
-				return m_megaii_ram[(offset & 0xfff) + 0x1c000];
+				return as_slow_r((offset & 0xfff) + 0x1c000);
 			}
 			else
 			{
-				return m_megaii_ram[(offset & 0xfff) + 0x1d000];
+				return as_slow_r((offset & 0xfff) + 0x1d000);
 			}
 		}
 
-		return m_megaii_ram[(offset & 0x1fff) + 0x1e000];
+		return as_slow_r((offset & 0x1fff) + 0x1e000);
 	}
 	else
 	{
@@ -5190,15 +5584,15 @@ u8 apple2gs_state::lc_r(offs_t offset)
 		{
 			if (m_lcram2)
 			{
-				return m_megaii_ram[(offset & 0xfff) + 0xc000];
+				return as_slow_r((offset & 0xfff) + 0xc000);
 			}
 			else
 			{
-				return m_megaii_ram[(offset & 0xfff) + 0xd000];
+				return as_slow_r((offset & 0xfff) + 0xd000);
 			}
 		}
 
-		return m_megaii_ram[(offset & 0x1fff) + 0xe000];
+		return as_slow_r((offset & 0x1fff) + 0xe000);
 	}
 }
 
@@ -5216,16 +5610,16 @@ void apple2gs_state::lc_w(offs_t offset, u8 data)
 		{
 			if (m_lcram2)
 			{
-				m_megaii_ram[(offset & 0xfff) + 0x1c000] = data;
+				as_slow_w((offset & 0xfff) + 0x1c000, data);
 			}
 			else
 			{
-				m_megaii_ram[(offset & 0xfff) + 0x1d000] = data;
+				as_slow_w((offset & 0xfff) + 0x1d000, data);
 			}
 			return;
 		}
 
-		m_megaii_ram[(offset & 0x1fff) + 0x1e000] = data;
+		as_slow_w((offset & 0x1fff) + 0x1e000, data);
 	}
 	else
 	{
@@ -5233,16 +5627,16 @@ void apple2gs_state::lc_w(offs_t offset, u8 data)
 		{
 			if (m_lcram2)
 			{
-				m_megaii_ram[(offset & 0xfff) + 0xc000] = data;
+				as_slow_w((offset & 0xfff) + 0xc000, data);
 			}
 			else
 			{
-				m_megaii_ram[(offset & 0xfff) + 0xd000] = data;
+				as_slow_w((offset & 0xfff) + 0xd000, data);
 			}
 			return;
 		}
 
-		m_megaii_ram[(offset & 0x1fff) + 0xe000] = data;
+		as_slow_w((offset & 0x1fff) + 0xe000, data);
 	}
 }
 
@@ -5253,15 +5647,15 @@ u8 apple2gs_state::lc_aux_r(offs_t offset)
 	{
 		if (m_lcram2)
 		{
-			return m_megaii_ram[(offset & 0xfff) + 0x1c000];
+			return as_slow_r((offset & 0xfff) + 0x1c000);
 		}
 		else
 		{
-			return m_megaii_ram[(offset & 0xfff) + 0x1d000];
+			return as_slow_r((offset & 0xfff) + 0x1d000);
 		}
 	}
 
-	return m_megaii_ram[(offset & 0x1fff) + 0x1e000];
+	return as_slow_r((offset & 0x1fff) + 0x1e000);
 }
 
 void apple2gs_state::lc_aux_w(offs_t offset, u8 data)
@@ -5276,16 +5670,16 @@ void apple2gs_state::lc_aux_w(offs_t offset, u8 data)
 	{
 		if (m_lcram2)
 		{
-			m_megaii_ram[(offset & 0xfff) + 0x1c000] = data;
+			as_slow_w((offset & 0xfff) + 0x1c000, data);
 		}
 		else
 		{
-			m_megaii_ram[(offset & 0xfff) + 0x1d000] = data;
+			as_slow_w((offset & 0xfff) + 0x1d000, data);
 		}
 		return;
 	}
 
-	m_megaii_ram[(offset & 0x1fff) + 0x1e000] = data;
+	as_slow_w((offset & 0x1fff) + 0x1e000, data);
 }
 
 u8 apple2gs_state::lc_00_r(offs_t offset)
@@ -5456,16 +5850,16 @@ u8 apple2gs_state::read_floatingbus()
 ***************************************************************************/
 
 template <int Addr>
-u8 apple2gs_state::e0ram_r(offs_t offset) { slow_cycle(); return m_megaii_ram[offset + Addr]; }
+u8 apple2gs_state::e0ram_r(offs_t offset) { slow_cycle(); return as_slow_r(offset + Addr); }
 
 template <int Addr>
-void apple2gs_state::e0ram_w(offs_t offset, u8 data) { slow_cycle(); m_megaii_ram[offset + Addr] = data; }
+void apple2gs_state::e0ram_w(offs_t offset, u8 data) { slow_cycle(); as_slow_w(offset + Addr, data); }
 
 template <int Addr>
-u8 apple2gs_state::e1ram_r(offs_t offset) { slow_cycle(); return m_megaii_ram[offset + Addr + 0x10000]; }
+u8 apple2gs_state::e1ram_r(offs_t offset) { slow_cycle(); return as_slow_r(offset + Addr + 0x10000); }
 
 template <int Addr>
-void apple2gs_state::e1ram_w(offs_t offset, u8 data) { slow_cycle(); m_megaii_ram[offset + Addr + 0x10000] = data; }
+void apple2gs_state::e1ram_w(offs_t offset, u8 data) { slow_cycle(); as_slow_w(offset + Addr + 0x10000, data); }
 
 template u8 apple2gs_state::e0ram_r<0x0000>(offs_t offset);
 template u8 apple2gs_state::e0ram_r<0x0200>(offs_t offset);
@@ -5509,7 +5903,7 @@ u8 apple2gs_state::auxram0000_r(offs_t offset)
 			offset = ((offset - 0x2000) >> 1) + 0x2000;
 		}
 	}
-	return m_megaii_ram[offset+0x10000];
+	return as_slow_r(offset+0x10000);
 }
 
 void apple2gs_state::auxram0000_w(offs_t offset, u8 data)
@@ -5530,11 +5924,16 @@ void apple2gs_state::auxram0000_w(offs_t offset, u8 data)
 		}
 	}
 
-	m_megaii_ram[offset+0x10000] = data;
+	as_slow_w(offset+0x10000, data);
 
 	if ((orig_addr >= 0x9e00) && (orig_addr <= 0x9fff))
 	{
 		int color = (orig_addr - 0x9e00) >> 1;
+		if (m_as_model && m_as_cpu_access)
+		{
+			m_as_palette = color;
+			return;
+		}
 		m_video->set_SHR_color(color, rgb_t(
 			((m_megaii_ram[0x19f00 + color] >> 0) & 0x0f) * 17,
 			((m_megaii_ram[0x15f00 + color] >> 4) & 0x0f) * 17,
@@ -5558,7 +5957,7 @@ void apple2gs_state::b0ram0400_w(offs_t offset, u8 data)
 	if (!(m_shadow & SHAD_TXTPG1))
 	{
 		slow_cycle();
-		m_megaii_ram[offset+0x0400] = data;
+		as_slow_w(offset+0x0400, data);
 	}
 }
 u8 apple2gs_state::b0ram0800_r(offs_t offset)  { return m_ram_ptr[offset+0x800]; }
@@ -5570,7 +5969,7 @@ void apple2gs_state::b0ram0800_w(offs_t offset, u8 data)
 		if (!(m_shadow & SHAD_TXTPG2) && m_is_rom3)
 		{
 			slow_cycle();
-			m_megaii_ram[offset+0x800] = data;
+			as_slow_w(offset+0x800, data);
 		}
 	}
 }
@@ -5581,7 +5980,7 @@ void apple2gs_state::b0ram2000_w(offs_t offset, u8 data)
 	if (!(m_shadow & SHAD_HIRESPG1))
 	{
 		slow_cycle();
-		m_megaii_ram[offset+0x2000] = data;
+		as_slow_w(offset+0x2000, data);
 	}
 }
 u8 apple2gs_state::b0ram4000_r(offs_t offset)  { return m_ram_ptr[offset+0x4000]; }
@@ -5593,7 +5992,7 @@ void apple2gs_state::b0ram4000_w(offs_t offset, u8 data)
 		if (!(m_shadow & SHAD_HIRESPG2))
 		{
 			slow_cycle();
-			m_megaii_ram[offset+0x4000] = data;
+			as_slow_w(offset+0x4000, data);
 		}
 	}
 }
@@ -5609,7 +6008,7 @@ void apple2gs_state::b1ram0400_w(offs_t offset, u8 data)
 	if (!(m_shadow & SHAD_TXTPG1))
 	{
 		slow_cycle();
-		m_megaii_ram[offset+0x10400] = data;
+		as_slow_w(offset+0x10400, data);
 	}
 }
 u8 apple2gs_state::b1ram0800_r(offs_t offset) { return m_ram_ptr[offset+0x10800]; }
@@ -5621,7 +6020,7 @@ void apple2gs_state::b1ram0800_w(offs_t offset, u8 data)
 		if (!(m_shadow & SHAD_TXTPG2) && m_is_rom3)
 		{
 			slow_cycle();
-			m_megaii_ram[offset+0x10800] = data;
+			as_slow_w(offset+0x10800, data);
 		}
 	}
 }
@@ -5698,7 +6097,7 @@ void apple2gs_state::bank1_0000_sh_w(offs_t offset, u8 data)
 			if (!(m_shadow & SHAD_TXTPG1))
 			{
 				slow_cycle();
-				m_megaii_ram[offset + 0x10000] = data;
+				as_slow_w(offset + 0x10000, data);
 			}
 			break;
 
@@ -5706,7 +6105,7 @@ void apple2gs_state::bank1_0000_sh_w(offs_t offset, u8 data)
 			if ((!(m_shadow & SHAD_TXTPG2)) && (m_is_rom3))
 			{
 				slow_cycle();
-				m_megaii_ram[offset + 0x10000] = data;
+				as_slow_w(offset + 0x10000, data);
 			}
 			break;
 
@@ -6589,6 +6988,34 @@ INPUT_PORTS_START( apple2gsrom3 )
 	PORT_CONFSETTING(0x08, DEF_STR(Yes))
 INPUT_PORTS_END
 
+INPUT_PORTS_START( applesqueezer )
+	PORT_MODIFY("a2_config")
+	PORT_CONFNAME(0x07, 0x00, "CPU type")
+	PORT_CONFSETTING(0x00, "AppleSqueezer GS")
+	PORT_MODIFY("twgs_rom")
+	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_UNUSED)
+	PORT_MODIFY("bus_timing")
+	PORT_BIT(0xffffffff, IP_ACTIVE_HIGH, IPT_UNUSED)
+
+	PORT_START("as_clock")
+	PORT_CONFNAME(0xff, 0xff, "AppleSqueezer starting speed")
+	PORT_CONFSETTING(0xff, "14 MHz (nominal)")
+	PORT_CONFSETTING(0xfb, "10 MHz (nominal)")
+	PORT_CONFSETTING(0xf7, "8 MHz (nominal)")
+	PORT_CONFSETTING(0xef, "5 MHz (nominal)")
+	PORT_CONFSETTING(0xdf, "3 MHz (nominal)")
+INPUT_PORTS_END
+
+INPUT_PORTS_START( apple2gsas )
+	PORT_INCLUDE(apple2gsrom3)
+	PORT_INCLUDE(applesqueezer)
+INPUT_PORTS_END
+
+INPUT_PORTS_START( apple2gs1as )
+	PORT_INCLUDE(apple2gsj13)
+	PORT_INCLUDE(applesqueezer)
+INPUT_PORTS_END
+
 void apple2gs_state::apple2gs(machine_config &config)
 {
 	/* basic machine hardware */
@@ -6776,6 +7203,20 @@ void apple2gs_state::apple2gsmt(machine_config &config)
   Game driver(s)
 
 ***************************************************************************/
+void apple2gs_state::apple2gsas(machine_config &config)
+{
+	apple2gs(config);
+	m_as_model = true;
+	m_ram->set_default_size("14M").set_extra_options("14M");
+}
+
+void apple2gs_state::apple2gs1as(machine_config &config)
+{
+	apple2gsr1(config);
+	m_as_model = true;
+	m_ram->set_default_size("14M").set_extra_options("14M");
+}
+
 ROM_START(apple2gs)
 	ROM_REGION(0x8000, "twgs", ROMREGION_ERASEFF)
 	ROM_LOAD_OPTIONAL("twgs_1.8s.bin", 0, 0x8000, CRC(f42c1e38) SHA1(65fa112b68cd804a63081aa8ff5bf7a600d5cbba))
@@ -6898,3 +7339,11 @@ COMP( 1986, apple2gsr0,   apple2gs, 0,      apple2gsr1, apple2gsj13,  apple2gs_s
 COMP( 1986, apple2gsr0p,  apple2gs, 0,      apple2gsr1, apple2gsj13,  apple2gs_state, rom1_init, "Apple Computer", "Apple IIgs (ROM00 prototype 6/19/1986)", MACHINE_SUPPORTS_SAVE )
 COMP( 1986, apple2gsr0p2, apple2gs, 0,      apple2gsr1, apple2gsj13,  apple2gs_state, rom1_init, "Apple Computer", "Apple IIgs (ROM00 prototype 3/10/1986)", MACHINE_SUPPORTS_SAVE )
 COMP( 1991, apple2gsmt,   apple2gs, 0,      apple2gsmt, apple2gsrom3, apple2gs_state, rom3_init, "Apple Computer", "Apple IIgs (1991 Mark Twain prototype)", MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
+
+// These configurations use the motherboard ROMs. Flash updating, HDMI and SD
+// boot are not emulated; the SD API reports that no card is inserted.
+// Core-14 interface subset; native local memory and inferred I/O compatibility timing.
+#define rom_apple2gsas rom_apple2gs
+#define rom_apple2gs1as rom_apple2gsr1
+COMP( 2023, apple2gsas,  apple2gs,   0, apple2gsas,  apple2gsas, apple2gs_state, rom3_init, "Apple Computer / AppleSqueezer", "Apple IIgs (ROM03, AppleSqueezer GS, preliminary)", MACHINE_SUPPORTS_SAVE )
+COMP( 2023, apple2gs1as, apple2gs,   0, apple2gs1as, apple2gs1as, apple2gs_state, rom1_init, "Apple Computer / AppleSqueezer", "Apple IIgs (ROM01, AppleSqueezer GS, preliminary)", MACHINE_SUPPORTS_SAVE )
