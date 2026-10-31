@@ -345,51 +345,61 @@ void m5074x_device::ports_w(offs_t offset, uint8_t data)
 	{
 		case 0: // p0
 			send_port(0, (data & m_ddrs[0]) | (m_pullups[0] & ~m_ddrs[0]));
+			if (access_to_be_redone_noclear()) return;
 			m_ports[0] = data;
 			break;
 
 		case 1: // p0 ddr
 			send_port(0, (m_ports[0] & data) | (m_pullups[0] & ~data));
+			if (access_to_be_redone_noclear()) return;
 			m_ddrs[0] = data;
 			break;
 
 		case 2: // p1
 			send_port(1, (data & m_ddrs[1]) | (m_pullups[1] & ~m_ddrs[1]));
+			if (access_to_be_redone_noclear()) return;
 			m_ports[1] = data;
 			break;
 
 		case 3: // p1 ddr
 			send_port(1, (m_ports[1] & data) | (m_pullups[1] & ~data));
+			if (access_to_be_redone_noclear()) return;
 			m_ddrs[1] = data;
 			break;
 
 		case 4: // p2
 			send_port(2, (data & m_ddrs[2]) | (m_pullups[2] & ~m_ddrs[2]));
+			if (access_to_be_redone_noclear()) return;
 			m_ports[2] = data;
 			break;
 
 		case 5: // p2 ddr
 			send_port(2, (m_ports[2] & data) | (m_pullups[2] & ~data));
+			if (access_to_be_redone_noclear()) return;
 			m_ddrs[2] = data;
 			break;
 
 		case 8: // p3
 			send_port(3, (data & m_ddrs[3]) | (m_pullups[3] & ~m_ddrs[3]));
+			if (access_to_be_redone_noclear()) return;
 			m_ports[3] = data;
 			break;
 
 		case 9: // p3 ddr
 			send_port(3, (m_ports[3] & data) | (m_pullups[3] & ~data));
+			if (access_to_be_redone_noclear()) return;
 			m_ddrs[3] = data;
 			break;
 
 		case 0xa: // p4 (4-bit open drain)
 			send_port(4, (data & m_ddrs[4] & 0x0f) | (m_pullups[4] & ~m_ddrs[4]));
+			if (access_to_be_redone_noclear()) return;
 			m_ports[4] = data & 0x0f;
 			break;
 
 		case 0xb: // p4 ddr
 			send_port(4, (m_ports[4] & data & 0x0f) | (m_pullups[4] & ~data));
+			if (access_to_be_redone_noclear()) return;
 			m_ddrs[4] = data & 0x0f;
 			break;
 	}

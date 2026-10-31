@@ -168,6 +168,8 @@ a2bus_device::a2bus_device(const machine_config &mconfig, device_type type, cons
 	, m_out_nmi_cb(*this)
 	, m_out_inh_cb(*this)
 	, m_out_dma_cb(*this)
+	, m_out_rdy_cb(*this)
+	, m_out_read_complete_cb(*this)
 	, m_slot_irq_mask(0), m_slot_nmi_mask(0)
 	, m_dma_bank(0)
 {
@@ -185,6 +187,10 @@ void a2bus_device::device_start()
 	m_slot_irq_mask = m_slot_nmi_mask = 0;
 	m_dma_bank = 0;
 	save_item(NAME(m_dma_bank));
+	save_item(NAME(m_rdy_low_mask));
+	save_item(NAME(m_mega_drive_mask)); save_item(NAME(m_mega_data));
+	save_item(NAME(m_dma_line)); save_item(NAME(m_dma_active));
+	machine().save().register_postload(save_prepost_delegate(FUNC(a2bus_device::invalidate_mega_phase_permissions), this));
 }
 
 //-------------------------------------------------
@@ -193,7 +199,22 @@ void a2bus_device::device_start()
 
 void a2bus_device::device_reset()
 {
+	invalidate_mega_phase_permissions();
 	m_dma_bank = 0;
+	m_rdy_low_mask = 0;
+	m_dma_line = m_dma_active = false;
+	m_dma_depth = 0;
+	m_out_rdy_cb(1);
+}
+
+void a2bus_device::set_rdy_line(bool ready, int slot)
+{
+	invalidate_mega_phase_permissions();
+	if (ready)
+		m_rdy_low_mask &= ~(1U << slot);
+	else
+		m_rdy_low_mask |= 1U << slot;
+	m_out_rdy_cb(m_rdy_low_mask == 0);
 }
 
 device_a2bus_card_interface *a2bus_device::get_a2bus_card(int slot)
@@ -213,11 +234,125 @@ device_a2bus_card_interface *a2bus_device::get_a2bus_card(int slot)
 
 void a2bus_device::add_a2bus_card(int slot, device_a2bus_card_interface *card)
 {
+	invalidate_mega_phase_permissions();
 	m_device_list[slot] = card;
+	if (card->observes_mega_cycles())
+		m_mega_observers.push_back(card);
+}
+
+void a2bus_device::complete_mega_read(int slot, uint8_t data)
+{
+	// DMA's live data pins cannot complete the disconnected CPU's read.
+	if (m_dma_active) return;
+	if (!BIT(m_mega_drive_mask, slot)) return;
+	m_mega_data[slot] = data;
+	uint8_t result = 0xff;
+	for (int i = 0; i != 8; ++i)
+		if (BIT(m_mega_drive_mask, i)) result &= m_mega_data[i];
+	m_out_read_complete_cb(result);
+}
+
+bool a2bus_device::compute_mega_idle_permission() const
+{
+ if (m_dma_active || m_mega_drive_mask || m_rdy_low_mask) return false;
+ for (auto *card : m_mega_observers) if (!card->can_defer_mega_idle()) return false;
+ return true;
+}
+
+bool a2bus_device::compute_mega_read_permission(u32 address, u8 data) const
+{
+ // M2B0 is constant low for an even CPU bank, including wired slots.
+ // Odd banks on a wired bus retain their individual bank-window edges.
+ if (m_dma_active || m_mega_drive_mask || m_rdy_low_mask || (m_m2b0_slot_mask && BIT(address,16))) return false;
+ for (auto *card : m_mega_observers) if (!card->can_defer_mega_read(u16(address), data)) return false;
+ return true;
+}
+
+bool a2bus_device::can_defer_mega_transition(u32 address, bool read) const
+{
+ if (m_dma_active || m_mega_drive_mask || m_rdy_low_mask || (m_m2b0_slot_mask && BIT(address,16))) return false;
+ for(auto *card:m_mega_observers)if(!card->can_defer_mega_transition(u16(address),read))return false;
+ return true;
+}
+void a2bus_device::defer_mega_transition(u64 clock,u16 address,u8 data,bool unselected)
+{
+ invalidate_mega_phase_permissions();
+ for(auto *card:m_mega_observers)card->defer_mega_transition(clock,address,data,unselected);
+}
+
+bool a2bus_device::defer_mega_idle(u64 clock)
+{
+ if (!can_defer_mega_idle()) return false;
+ advance_mega_idle(clock);
+ return true;
+}
+
+void a2bus_device::advance_mega_idle(u64 clock)
+{
+ // Permission is invalidated at every input/state mutation outside this
+ // admitted recurrence; advancing its clocks preserves the predicate.
+ for (auto *card : m_mega_observers) card->defer_mega_idle(clock);
+}
+
+bool a2bus_device::synchronize_mega(attotime when)
+{
+	for (auto *card : m_mega_observers)
+		if (!card->synchronize_mega(when)) return false;
+	return true;
+}
+
+bool a2bus_device::synchronize_mega_irq(attotime when)
+{
+	for (auto *card : m_mega_observers)
+		if (!card->synchronize_mega_irq(when)) return false;
+	return true;
+}
+
+uint8_t a2bus_device::mega_cycle(a2bus_mega_cycle const &cycle)
+{
+	invalidate_mega_phase_permissions();
+	// A phase-aware CPU host may keep its clocks running while /DMA is
+	// asserted. Its retained address is not connected to the slot bus then.
+	if (m_dma_active && !m_dma_depth)
+		return mega_read_data(cycle.data);
+	// The read-driver journal belongs to the CPU transfer. A DMA byte has
+	// its own result and must not replace a held CPU read's drivers/data.
+	if (!m_dma_depth) m_mega_drive_mask = 0;
+	uint8_t result = 0xff;
+	bool driven = false;
+	for (auto *card : m_mega_observers)
+	{
+		a2bus_mega_cycle pins = cycle;
+		pins.m2b0_valid = BIT(m_m2b0_slot_mask, card->slotno());
+		uint8_t data = 0xff;
+		if (card->observe_mega_cycle(pins, data) && cycle.read)
+		{
+			// Multiple drivers are a bus conflict; AND is a deterministic
+			// emulator convention, not an electrical model of that conflict.
+			if (!m_dma_depth)
+			{
+				m_mega_drive_mask |= 1U << card->slotno();
+				m_mega_data[card->slotno()] = data;
+			}
+			result &= data;
+			driven = true;
+		}
+	}
+	return driven ? result : cycle.data;
+}
+
+uint8_t a2bus_device::mega_read_data(uint8_t fallback) const
+{
+	if (!m_mega_drive_mask) return fallback;
+	uint8_t data = 0xff;
+	for (unsigned slot = 0; slot != 8; ++slot)
+		if (BIT(m_mega_drive_mask, slot)) data &= m_mega_data[slot];
+	return data;
 }
 
 void a2bus_device::reset_bus()
 {
+	invalidate_mega_phase_permissions();
 	for (int slot = 0; slot <= 7; slot++)
 	{
 		auto card = get_a2bus_card(slot);
@@ -268,22 +403,64 @@ void a2bus_device::set_nmi_line(int state, int slot)
 
 void a2bus_device::set_dma_line(int state)
 {
-	m_out_dma_cb(state);
+	if (m_mega_observers.empty())
+	{
+		m_out_dma_cb(state);
+		return;
+	}
+	m_dma_line = state != CLEAR_LINE;
+	update_dma_owner();
+}
+
+void a2bus_device::update_dma_owner()
+{
+	invalidate_mega_phase_permissions();
+	const bool active = m_dma_line || m_dma_depth;
+	if (m_dma_active == active) return;
+	m_dma_active = active;
+	for (auto *card : m_mega_observers)
+		card->mega_dma_w(active);
+	m_out_dma_cb(active ? ASSERT_LINE : CLEAR_LINE);
+}
+
+void a2bus_device::begin_dma()
+{
+	if (m_dma_sync)
+		m_dma_sync();
+	if (m_mega_observers.empty()) return;
+	++m_dma_depth;
+	update_dma_owner();
+}
+
+void a2bus_device::end_dma()
+{
+	if (m_mega_observers.empty()) return;
+	--m_dma_depth;
+	// A master can release /DMA by writing its own register. Keep ownership
+	// through that byte's observer callback, including its trailing phase.
+	update_dma_owner();
 }
 
 uint8_t a2bus_device::dma_r(uint16_t offset)
 {
-	if (m_dma_sync)
-		m_dma_sync();
+	begin_dma();
 	// Slot /DMA supplies A0-A15 only. The FPI/CYA prepends $C037.
-	return m_maincpu_space->read_byte((uint32_t(m_dma_bank) << 16) | offset);
+	const uint32_t address = (uint32_t(m_dma_bank) << 16) | offset;
+	uint8_t data = m_maincpu_space->read_byte(address);
+	if (m_dma_observer)
+		m_dma_observer(address, true, data);
+	end_dma();
+	return data;
 }
 
 void a2bus_device::dma_w(uint16_t offset, uint8_t data)
 {
-	if (m_dma_sync)
-		m_dma_sync();
-	m_maincpu_space->write_byte((uint32_t(m_dma_bank) << 16) | offset, data);
+	begin_dma();
+	const uint32_t address = (uint32_t(m_dma_bank) << 16) | offset;
+	m_maincpu_space->write_byte(address, data);
+	if (m_dma_observer)
+		m_dma_observer(address, false, data);
+	end_dma();
 }
 
 void a2bus_device::recalc_inh(int slot)

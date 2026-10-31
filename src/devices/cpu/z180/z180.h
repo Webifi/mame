@@ -10,6 +10,8 @@
 
 #include "machine/z80daisy.h"
 
+#include <csetjmp>
+
 
 enum
 {
@@ -108,6 +110,46 @@ enum {
 class z180_device : public cpu_device, public z80_daisy_chain_interface
 {
 public:
+	// The resumable engine counts half-PHI ticks so opcode (T3 rising) and
+	// data (T3 falling) samples remain distinct. Board delays use phi_time().
+	void set_machine_cycle_engine(bool enabled) { m_cycle_engine = enabled; }
+	void set_machine_cycle_reference(bool enabled) { m_cycle_reference = enabled; }
+	void set_grant_continuation(bool enabled) { m_cycle_grants = enabled; }
+	// Configuration-time electrical level, before the first RESET. A tied
+	// pin is not a request edge; RESET clears its detector, not the wire.
+	void set_dma_request_initial_level(unsigned channel, bool asserted)
+	{
+		assert(channel < 2 && !started());
+		uint32_t const mask = 0x800U << channel;
+		m_iol = (m_iol & ~mask) | (asserted ? mask : 0);
+	}
+	bool machine_cycle_engine() const { return m_cycle_engine; }
+	bool bus_acknowledged() const { return m_bus_acknowledged; }
+	attotime phi_time(unsigned phi) const { return cycles_to_attotime(phi * (m_cycle_engine ? 2 : 1)); }
+	// External registered logic uses PHI, including while BUSACK/HALT/SLEEP
+	// is active. Locate its next rising edge without adding a per-clock hook.
+	attotime next_phi_edge(attotime when) const
+	{
+		attotime edge = local_time() - cycles_to_attotime(m_cycle_engine ? m_phi_half : 0);
+		if (edge <= when)
+		{
+			unsigned const half = m_cycle_engine ? 2 : 1;
+			edge += cycles_to_attotime((attotime_to_cycles(when - edge) / half + 1) * half);
+			// attotime clock conversion truncates fractions of an attosecond.
+			if (edge <= when) edge += phi_time(1);
+		}
+		return edge;
+	}
+	void wait_w(bool asserted) { m_instruction_fast=false; m_wait_line = asserted; }
+	// IORQ edges, separate from the T3 data sample/write. A board may
+	// acknowledge DREQ at select assertion before the data transfer ends.
+	void set_io_strobe(std::function<void (offs_t, bool, u8, bool)> callback) { m_io_strobe = std::move(callback); }
+	// INT0 acknowledge asserts IORQ with RD inactive; never a normal I/O read.
+	void set_irq0_ack_strobe(std::function<void (bool)> callback) { m_irq0_ack_strobe=std::move(callback); }
+	void set_bus_wait(std::function<unsigned (offs_t, bool, bool)> callback) { m_bus_wait = std::move(callback); }
+	void set_cycle_observer(std::function<void (u64, u8, u8, offs_t, u8)> callback) { m_cycle_observer = std::move(callback); }
+	void set_busack(std::function<void (bool)> callback) { m_busack_cb = std::move(callback); }
+	u64 retired_instructions() const { return m_retired; }
 	auto tend0_wr_callback() { return m_tend0_cb.bind(); }
 	auto tend1_wr_callback() { return m_tend1_cb.bind(); }
 	auto txa0_wr_callback() { return m_asci[0].lookup()->txa_handler(); }
@@ -115,20 +157,58 @@ public:
 	auto rts0_wr_callback() { return m_asci[0].lookup()->rts_handler(); }
 	auto cka0_wr_callback() { return m_asci[0].lookup()->cka_handler(); }
 	auto cka1_wr_callback() { return m_asci[1].lookup()->cka_handler(); }
+	void set_asci_idle_clock_gating(bool enabled)
+	{
+		for (auto &channel : m_asci) channel.lookup()->set_idle_receive_clock_gating(enabled);
+	}
 	auto cks_wr_callback() { return m_csio.lookup()->cks_handler(); }
 	auto txs_wr_callback() { return m_csio.lookup()->txs_handler(); }
 
 	bool get_tend0();
 	bool get_tend1();
+	// Boards with timed external bus masters require a timer update after
+	// every DMA beat, even when the scheduler supplies a large time slice.
+	void set_instruction_boundary_timing(bool enabled) { m_instruction_boundary_timing = enabled; }
+	// Optional board-certified 64K read pages: opcode/data views must be
+	// identical plain storage, with no external wait or read side effect
+	// except driving the retained data bus (including the wait query).
+	// The board must clear these views on taps/remaps, and rebuild them
+	// after reset/overlay changes/load.
+	void set_direct_read_page(unsigned page, u8 const *data, u8 &bus)
+	{
+		m_direct_read[page]=data;m_direct_read_bus=&bus;m_instruction_fast=false;
+		cycle_update_direct_reads();
+	}
+	void clear_direct_read_pages()
+	{
+		m_direct_read.fill(nullptr);m_direct_logical.fill(nullptr);m_direct_read_bus=nullptr;m_instruction_fast=false;
+	}
 
-	void rxa0_w(int state)     { m_asci[0]->rxa_wr(state); }
-	void rxa1_w(int state)     { m_asci[1]->rxa_wr(state); }
-	void cts0_w(int state)     { m_asci[0]->cts_wr(state); }
-	void rxs_cts1_w(int state) { m_asci[1]->cts_wr(state); m_csio->rxs_wr(state); }
-	void dcd0_w(int state)     { m_asci[0]->dcd_wr(state); }
-	void cka0_w(int state)     { m_asci[0]->cka_wr(state); }
-	void cka1_w(int state)     { m_asci[1]->cka_wr(state); }
-	void cks_w(int state)      { m_csio->cks_wr(state); }
+	// The board must use the multiplexed pin, not the MMU's A18, when
+	// TCR.TOC selects TOUT (UM0050 table 2 and table 23).
+	offs_t a18_tout_address(offs_t address) const
+	{
+		return (m_tcr & 0x0c) ? (address & ~offs_t(0x40000)) | (offs_t(m_tout) << 18) : address;
+	}
+	bool tout_r() const { return m_tout; }
+
+	// The board supplies the grant interval. Instructions and DMA stop, but
+	// PHI and its peripheral dividers continue (UM0050 pp26-27,89,113).
+	void bus_release_w(bool released)
+	{
+		m_instruction_fast=false;
+		m_bus_released = released;
+		if (released && executing()) abort_timeslice();
+	}
+
+	void rxa0_w(int state)     { m_instruction_fast=false; m_asci[0]->rxa_wr(state); }
+	void rxa1_w(int state)     { m_instruction_fast=false; m_asci[1]->rxa_wr(state); }
+	void cts0_w(int state)     { m_instruction_fast=false; m_asci[0]->cts_wr(state); }
+	void rxs_cts1_w(int state) { m_instruction_fast=false; m_asci[1]->cts_wr(state); m_csio->rxs_wr(state); }
+	void dcd0_w(int state)     { m_instruction_fast=false; m_asci[0]->dcd_wr(state); }
+	void cka0_w(int state)     { m_instruction_fast=false; m_asci[0]->cka_wr(state); }
+	void cka1_w(int state)     { m_instruction_fast=false; m_asci[1]->cka_wr(state); }
+	void cks_w(int state)      { m_instruction_fast=false; m_csio->cks_wr(state); }
 
 protected:
 	// construction/destruction
@@ -142,8 +222,18 @@ protected:
 	// device_execute_interface implementation
 	virtual uint32_t execute_min_cycles() const noexcept override { return 1; }
 	virtual uint32_t execute_max_cycles() const noexcept override { return 16; }
-	virtual uint64_t execute_clocks_to_cycles(uint64_t clocks) const noexcept override { return (clocks + 2 - 1) / 2; }
-	virtual uint64_t execute_cycles_to_clocks(uint64_t cycles) const noexcept override { return (cycles * 2); }
+	virtual uint64_t execute_clocks_to_cycles(uint64_t clocks) const noexcept override { return m_cycle_engine ? clocks : (clocks + 1) / 2; }
+	virtual uint64_t execute_cycles_to_clocks(uint64_t cycles) const noexcept override { return m_cycle_engine ? cycles : cycles * 2; }
+	virtual attotime execute_cycles_to_attotime(u64 cycles) const override
+	{
+		return m_cycle_engine ? attotime::from_ticks(cycles, clocks_to_cycles(clock())) : device_execute_interface::execute_cycles_to_attotime(cycles);
+	}
+	virtual u64 execute_attotime_to_cycles(const attotime &duration) const override
+	{
+		if (!m_cycle_engine) return device_execute_interface::execute_attotime_to_cycles(duration);
+		u64 const rate=clocks_to_cycles(clock());
+		return rate ? u64(duration.seconds())*rate + u64(duration.attoseconds())/(ATTOSECONDS_PER_SECOND/rate) : 0;
+	}
 	virtual uint32_t execute_default_irq_vector(int inputnum) const noexcept override { return 0xff; }
 	virtual bool execute_input_edge_triggered(int inputnum) const noexcept override { return inputnum == INPUT_LINE_NMI; }
 	virtual void execute_run() override;
@@ -174,11 +264,18 @@ protected:
 	void set_address_width(int bits);
 
 private:
+#include "z180cycles.h"
+	bool m_instruction_boundary_timing = false;
+	int halt_cycles() const;
 	uint8_t z180_read_memory(offs_t addr) { return m_program.read_byte(addr); }
 	void z180_write_memory(offs_t addr, uint8_t data) { m_program.write_byte(addr, data); }
 
 	int memory_wait_states() const { return (m_dcntl & 0xc0) >> 6; }
-	int io_wait_states() const { return (m_dcntl & 0x30) == 0 ? 0 : ((m_dcntl & 0x30) >> 4) + 1; }
+	// UM0050 Table 4: every external I/O access inserts 1-4 wait states.
+	int io_wait_states() const { return ((m_dcntl & 0x30) >> 4) + 1; }
+	// Only called from the SLP/HALT path, never from ordinary instructions.
+	virtual u8 power_control() const { return 0; }
+	virtual unsigned power_recovery_ticks() const { return 0; }
 	bool is_internal_io_address(uint16_t port) const { return ((port ^ m_iocr) & (m_extended_io ? 0xff80 : 0xffc0)) == 0; }
 
 	const bool m_extended_io;
@@ -188,12 +285,15 @@ private:
 	uint8_t   m_R,m_R2,m_IFF1,m_IFF2,m_HALT,m_IM,m_I;
 	uint8_t   m_tmdr_latch;                     // flag latched TMDR0H, TMDR1H values
 	uint8_t   m_read_tcr_tmdr[2];               // flag to indicate that TCR or TMDR was read
-	uint32_t  m_iol;                            // I/O line status bits
+	uint32_t  m_iol = 0;                        // I/O line status bits; initial undriven convention
 	PAIR16    m_tmdr[2];                        // PRT data register ch 0-1
 	PAIR16    m_rldr[2];                        // PRT reload register ch 0-1
-	uint8_t   m_tcr;                            // PRT control register
+	uint8_t   m_tcr = 0;                        // PRT control register
+	bool      m_prt1_timeout_odd = false;       // includes timeouts while the pin is A18
+	bool      m_tout = true;
 	uint8_t   m_frc;                            // free running counter (also time base for ASCI, CSI/O & PRT)
 	uint8_t   m_frc_prescale;                   // divide CPU clock by 10
+	bool      m_bus_released = false;
 	PAIR      m_dma_sar0;                       // DMA source address register ch 0
 	PAIR      m_dma_dar0;                       // DMA destination address register ch 0
 	PAIR16    m_dma_bcr[2];                     // DMA byte register ch 0-1
@@ -210,7 +310,7 @@ private:
 	uint8_t   m_mmu_cbar;                       // MMU common/bank area register
 	uint8_t   m_omcr;                           // operation mode control register
 	uint8_t   m_iocr;                           // I/O control register
-	offs_t    m_mmu[16];                        // MMU address translation
+	offs_t    m_mmu[16]{};                      // MMU address translation
 	uint8_t   m_tmdrh[2];                       // latched TMDR0H and TMDR1H values
 	uint16_t  m_tmdr_value[2];                  // TMDR values used byt PRT0 and PRT1 as down counter
 	uint8_t   m_nmi_state;                      // NMI line state
@@ -233,14 +333,15 @@ private:
 	static const opcode_func s_z180ops[6][0x100];
 
 	inline void z180_mmu();
-	inline u8 RM(offs_t addr);
+	ATTR_FORCE_INLINE u8 RM(offs_t addr);
+	ATTR_FORCE_INLINE void write_mem(offs_t addr, u8 data);
 	inline u8 IN(u16 port);
 	inline void OUT(u16 port, u8 value);
-	inline void RM16( offs_t addr, PAIR *r );
-	inline void WM16( offs_t addr, PAIR *r );
-	inline uint8_t ROP();
-	inline uint8_t ARG();
-	inline uint32_t ARG16();
+	ATTR_FORCE_INLINE void RM16( offs_t addr, PAIR *r );
+	ATTR_FORCE_INLINE void WM16( offs_t addr, PAIR *r );
+	ATTR_FORCE_INLINE uint8_t ROP();
+	ATTR_FORCE_INLINE uint8_t ARG();
+	ATTR_FORCE_INLINE uint32_t ARG16();
 	inline uint8_t INC(uint8_t value);
 	inline uint8_t DEC(uint8_t value);
 	inline uint8_t RLC(uint8_t value);
@@ -260,8 +361,11 @@ private:
 	inline int exec_fd(const uint8_t opcode);
 	inline int exec_xycb(const uint8_t opcode);
 	int take_interrupt(int irq);
+	int take_trap(bool third);
+	int take_nmi();
 	uint8_t z180_readcontrol(offs_t port);
 	void z180_writecontrol(offs_t port, uint8_t data);
+	bool dma0_ready() const;
 	int z180_dma0(int max_cycles);
 	int z180_dma1();
 	void z180_write_iolines(uint32_t data);
@@ -1830,7 +1934,7 @@ public:
 	z8s180_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock);
 
 protected:
-	z8s180_device(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, uint32_t clock);
+	z8s180_device(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, uint32_t clock, bool enhanced = true);
 
 	// device_t implementation
 	virtual void device_start() override ATTR_COLD;
@@ -1839,15 +1943,41 @@ protected:
 	virtual void device_add_mconfig(machine_config &config) override ATTR_COLD;
 
 	// device_execute_interface implementation
-	virtual uint64_t execute_clocks_to_cycles(uint64_t clocks) const noexcept override { return BIT(m_cmr, 7) ? (clocks * 2) : BIT(m_ccr, 7) ? clocks : (clocks + 2 - 1) / 2; }
-	virtual uint64_t execute_cycles_to_clocks(uint64_t cycles) const noexcept override { return BIT(m_cmr, 7) ? (cycles + 2 - 1) / 2 : BIT(m_ccr, 7) ? cycles : (cycles * 2); }
+	virtual uint64_t execute_clocks_to_cycles(uint64_t clocks) const noexcept override {
+		if (machine_cycle_engine()) return clock_multiplier_enabled() ? clocks * 4 : BIT(m_ccr, 7) ? clocks * 2 : clocks;
+		return clock_multiplier_enabled() ? clocks * 2 : BIT(m_ccr, 7) ? clocks : (clocks + 1) / 2;
+	}
+	virtual uint64_t execute_cycles_to_clocks(uint64_t cycles) const noexcept override {
+		if (machine_cycle_engine()) return clock_multiplier_enabled() ? (cycles + 3) / 4 : BIT(m_ccr, 7) ? (cycles + 1) / 2 : cycles;
+		return clock_multiplier_enabled() ? (cycles + 1) / 2 : BIT(m_ccr, 7) ? cycles : cycles * 2;
+	}
 
+	virtual u8 power_control() const override { return m_ccr; }
+	virtual unsigned power_recovery_ticks() const override {
+		if (!m_enhanced) return (m_ccr & 0x40) ? 2U * (1U << 19) : 0;
+		switch (m_ccr & 0x48) {
+		case 0x08: return 2U * 8 + 3;
+		case 0x40: return 2U * (1U << 17) + 3;
+		case 0x48: return 2U * 64 + 3;
+		default: return 0;
+		}
+	}
 	virtual uint8_t z180_internal_port_read(uint8_t port) override;
 	virtual void z180_internal_port_write(uint8_t port, uint8_t data) override;
 
 private:
-	uint8_t   m_cmr;                            // clock multiplier
-	uint8_t   m_ccr;                            // chip control register
+	// Zilog DS006002 p52: the doubler accepts only 10-16 MHz EXTAL. Outside that
+	// range retain CMR, but use CCR's divide/bypass path (an assumption).
+	bool clock_multiplier_enabled() const noexcept { return m_enhanced && BIT(m_cmr, 7) && clock() >= 10'000'000 && clock() <= 16'000'000; }
+	const bool m_enhanced;                     // N/SL1919 peripherals; absent on K/SL1960
+	uint8_t   m_cmr = 0;                        // clock multiplier
+	uint8_t   m_ccr = 0;                        // chip control register
+};
+
+class z8s180k_device : public z8s180_device
+{
+public:
+	z8s180k_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock);
 };
 
 class z80182_device : public z8s180_device
@@ -1860,6 +1990,7 @@ public:
 DECLARE_DEVICE_TYPE(Z80180, z80180_device)
 DECLARE_DEVICE_TYPE(HD64180RP, hd64180rp_device)
 DECLARE_DEVICE_TYPE(Z8S180, z8s180_device)
+DECLARE_DEVICE_TYPE(Z8S180_K, z8s180k_device)
 DECLARE_DEVICE_TYPE(Z80182, z80182_device)
 
 #endif // MAME_CPU_Z180_Z180_H

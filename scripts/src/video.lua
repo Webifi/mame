@@ -180,7 +180,7 @@ end
 --@src/devices/video/bt48x.h,VIDEOS["BT48X"] = true
 --------------------------------------------------
 
-if VIDEOS["BT48X"] then
+if VIDEOS["BT48X"] or VIDEOS["PC_VGA_OTI087"] then
 	files {
 		MAME_DIR .. "src/devices/video/bt48x.cpp",
 		MAME_DIR .. "src/devices/video/bt48x.h",
@@ -1032,10 +1032,23 @@ end
 --@src/devices/video/pc_vga.h,VIDEOS["PC_VGA"] = true
 --------------------------------------------------
 
-if VIDEOS["PC_VGA"] then
+if VIDEOS["PC_VGA"] or VIDEOS["PC_VGA_OTI087"] then
 	files {
 		MAME_DIR .. "src/devices/video/pc_vga.cpp",
 		MAME_DIR .. "src/devices/video/pc_vga.h",
+	}
+end
+
+--------------------------------------------------
+--
+--@src/devices/video/pc_vga_oti087.h,VIDEOS["PC_VGA_OTI087"] = true
+--------------------------------------------------
+
+if VIDEOS["PC_VGA_OTI087"] then
+	MACHINES["EEPROMDEV"] = true
+	files {
+		MAME_DIR .. "src/devices/video/pc_vga_oti087.cpp",
+		MAME_DIR .. "src/devices/video/pc_vga_oti087.h",
 	}
 end
 

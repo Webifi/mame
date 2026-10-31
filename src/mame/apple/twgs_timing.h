@@ -37,6 +37,38 @@ template<uint64_t Scale> struct timing_scaled {
  uint8_t speed=128,shadow=0;
  bool next_gs_level=true;
  bool had_bus=false;
+ // U2B selects the address latch column for the motherboard cycle. A
+ // later CPU cache miss can change word before this GS cycle finishes;
+ // it must not change the address already presented to the FPI.
+ payload socket{};
+ // A scheduler rendezvous may stop before either motherboard strobe. Keep
+ // the unfinished edge and any already-delivered write, without clocking
+ // the GALs or accepting a placeholder read into the CPU/cache.
+ uint8_t bus_stage=0;
+ bool bus_waiting=false;
+ template<class Bus> bool finish_bus(Bus&&bus,bool complete=true) noexcept {
+  bus_waiting=false;
+  auto prepare=[&](transaction const&w) {
+   if constexpr(requires { bus.prepare(w,now); }) return bus.prepare(w,now);
+   else return true;
+  };
+  if(!bus_stage){
+   if(c.active.valid&&!c.active.bus.read()){
+    if(!prepare(c.active.bus)){bus_waiting=true;return false;}
+    if constexpr(requires {bus.write(c.active.bus,slot_start,now,complete);})
+     bus.write(c.active.bus,slot_start,now,complete);
+    else bus.write(c.active.bus,slot_start,now);
+   }
+   bus_stage=1;
+  }
+  if(!c.ctl.sync&&c.word.read()&&socket.valid){
+   transaction r=socket.bus;r.type=c.word.type;r.id=c.word.id;
+   if(!prepare(r)){bus_waiting=true;return false;}
+   bus.read(r,slot_start,now);c.word.data=r.data;
+  }
+  bus_stage=0;
+  return true;
+ }
  bool fast_hits=true;
  struct observed_bus {
   uint8_t data;
@@ -51,7 +83,7 @@ template<uint64_t Scale> struct timing_scaled {
   gs_start=(t/FAST)*FAST;gs_event=gs_start+2*CLK;
   if(gs_event<=t){c.ctl.gs=true;next_gs_level=false;gs_event=gs_start+FAST;}
  }
- unsigned bus_class(transaction const&w) const noexcept {
+ [[gnu::always_inline]] unsigned bus_class(transaction const&w) const noexcept {
   const auto a=w.address;const unsigned b=a>>16,l=a&65535;const bool wr=!w.read();
   if(!(speed&128))return 3;
   const bool io_bank=b==0xe0||b==0xe1||(b<2&&!cache_decode::pad(c.fp,36));
@@ -89,7 +121,8 @@ template<uint64_t Scale> struct timing_scaled {
    now=gs_event;
    if(next_gs_level){
     c.gs_edge(true,next);
-    const transaction &w=c.active.valid?c.active.bus:c.word;
+    socket=c.latches[c.ctl.output_column()];
+    const transaction &w=c.active.valid?c.active.bus:(socket.valid?socket.bus:c.word);
     const bool external=(c.ctl.service&&c.ctl.sync)||!c.ctl.sync;
     const unsigned cls=external?bus_class(w):0;
     slot_start=gs_start;slot_end=end_of_cycle(gs_start,cls);gs_event=slot_end;++board_cycles;
@@ -99,8 +132,7 @@ template<uint64_t Scale> struct timing_scaled {
     // write window and registered CPU-side logic see that byte before the
     // same edge can complete the CPU transfer. Buffered stores reach the
     // motherboard only when their physical output latch finishes service.
-    if(c.active.valid&&!c.active.bus.read())bus.write(c.active.bus,slot_start,now);
-    if(!c.ctl.sync&&c.word.read())bus.read(c.word,slot_start,now);
+    if(!finish_bus(bus))return;
     c.gs_edge(false,next);gs_start=now;gs_event=now+2*CLK;
    }
    next_gs_level=!next_gs_level;
@@ -192,8 +224,7 @@ template<uint64_t Scale> struct timing_scaled {
   now=gs_event;
   const bool level=next_gs_level;
   if(!level){
-   if(c.active.valid&&!c.active.bus.read())bus.write(c.active.bus,slot_start,now);
-   if(!c.ctl.sync&&c.word.read())bus.read(c.word,slot_start,now);
+   if(!finish_bus(bus))return;
   }
   uint64_t a;std::memcpy(&a,&c.ctl.q1,8);
   const uint64_t b=key_b|uint64_t(c.ctl.r16_sample)|(uint64_t(c.ctl.r17_sample)<<8)|((card_byte(fixed)|(uint64_t(level)<<7))<<24);
@@ -225,7 +256,8 @@ template<uint64_t Scale> struct timing_scaled {
   if(eff&gs_memo::SRAM_AFTER)c.write_sram();
   c.strobe_changes+=eff>>16;
   if(level){
-   const transaction &w=c.active.valid?c.active.bus:c.word;
+   socket=c.latches[c.ctl.output_column()];
+   const transaction &w=c.active.valid?c.active.bus:(socket.valid?socket.bus:c.word);
    const bool external=(c.ctl.service&&c.ctl.sync)||!c.ctl.sync;
    const unsigned cls=external?bus_class(w):0;
    slot_start=gs_start;slot_end=end_of_cycle(gs_start,cls);gs_event=slot_end;++board_cycles;
@@ -236,14 +268,14 @@ template<uint64_t Scale> struct timing_scaled {
  // Same edges, same order and the same results as access_reference: GS
  // edges and each run of EARLY/LATE edges before the next GS edge are
  // applied from gs_memo and x4_memo, which the per-edge recurrence fills.
- template<class Bus> uint64_t access(transaction const&w,Bus&&bus) noexcept {
-  if(!fast_hits||std::endian::native!=std::endian::little)return access_reference(w,bus);
-  c.external_advance=true;c.setword_inline<true>(w);c.completed=false;had_bus=false;
+ template<class Bus> uint64_t access(transaction const&w,Bus&&bus,bool resume=false) noexcept {
+  if(!fast_hits||std::endian::native!=std::endian::little)return access_reference(w,bus,resume);
+  if(!resume){c.external_advance=true;c.setword_inline<true>(w);c.completed=false;had_bus=false;}
   // Word B bytes of this transfer, from the fields just stored byte-wise.
   const uint64_t key_b=(uint64_t(c.ctl.read)<<16)|(uint64_t(c.ctl.eligible)<<32)|(uint64_t(c.ctl.slow)<<40)|(uint64_t(c.ctl.pause)<<48)|(uint64_t(c.ctl.use_gal2a)<<56);
   const uint64_t fixed=(uint64_t(c.ctl.pin7_card_phase)<<4)|(uint64_t(cache_decode::pad(c.fp,53))<<6);
   for(;;){
-   if(gs_event<=early&&gs_event<=late){gs_step(bus,key_b,fixed);if(c.completed)return now;}
+   if(gs_event<=early&&gs_event<=late){gs_step(bus,key_b,fixed);if(bus_waiting||c.completed)return now;}
    else if(early<=late){
     // The cached chains assume each EARLY edge falls within one X4 period
     // before its LATE edge, as start() sets up; other phases go edge by edge.
@@ -258,8 +290,8 @@ template<uint64_t Scale> struct timing_scaled {
  // access and advance_until use individual edges; with it set, this path
  // can also compose cache-hit transitions and skip fixed points below.
  // Memoized execution must retain the same card state and bus events.
- template<class Bus> uint64_t access_reference(transaction w,Bus&&bus) noexcept {
-  c.external_advance=true;c.setword_reference(w);c.completed=false;had_bus=false;
+ template<class Bus> uint64_t access_reference(transaction w,Bus&&bus,bool resume=false) noexcept {
+  if(!resume){c.external_advance=true;c.setword_reference(w);c.completed=false;had_bus=false;}
   // A cached transfer gets its driven data from the physical SRAM, not
   // from a second motherboard lookup. Supplied trace data is merely input
   // for the observed_bus adapter used by the standalone reference tests.
@@ -303,6 +335,7 @@ template<uint64_t Scale> struct timing_scaled {
    const bool was_late=late<early&&late<gs_event;
    const uint8_t old_q1=c.ctl.q1,old_q2=c.ctl.q2;
    edge(hold,bus);
+   if(bus_waiting)return now;
    // After a LATE edge reaches a fixed point, with both U60 samples equal
    // to GS, further EARLY/LATE edges have identical inputs and outputs.
    // SRAM and transparent latches have already settled on that edge. No
@@ -320,19 +353,21 @@ template<uint64_t Scale> struct timing_scaled {
  // The held bus after a transfer: the same edges as edge() up to and
  // including the deadline, through the same caches as access. CPU
  // completions of the held word are repeated exactly as observe_cpu does.
- template<class Bus> void advance_until(uint64_t deadline,Bus&&bus) noexcept {
+ // The optional stop input lets the motherboard stretch a completed bus
+ // strobe asynchronously; leave the following edges for the resumed call.
+ template<class Bus> void advance_until(uint64_t deadline,Bus&&bus,bool const*stop=nullptr) noexcept {
   auto hold=[](transaction const&a,uint8_t){return a;};
   if(!fast_hits||!c.external_advance||std::endian::native!=std::endian::little){
-   while(std::min(gs_event,std::min(early,late))<=deadline)edge(hold,bus);
+   while((!stop||!*stop)&&std::min(gs_event,std::min(early,late))<=deadline){edge(hold,bus);if(bus_waiting)return;}
    return;
   }
   {const unsigned i=c.word.address&c.mask;c.raw_match=c.valid[i]&&c.tags[i]==c.pins.tag;}
   const uint64_t key_b=(uint64_t(c.ctl.read)<<16)|(uint64_t(c.ctl.eligible)<<32)|(uint64_t(c.ctl.slow)<<40)|(uint64_t(c.ctl.pause)<<48)|(uint64_t(c.ctl.use_gal2a)<<56);
   const uint64_t fixed=(uint64_t(c.ctl.pin7_card_phase)<<4)|(uint64_t(cache_decode::pad(c.fp,53))<<6);
   const uint64_t after=deadline==~0ULL?~0ULL:deadline+1;
-  while(std::min(gs_event,std::min(early,late))<=deadline){
+  while((!stop||!*stop)&&std::min(gs_event,std::min(early,late))<=deadline){
    const uint64_t bound=std::min(gs_event,after);
-   if(gs_event<=early&&gs_event<=late)gs_step(bus,key_b,fixed);
+   if(gs_event<=early&&gs_event<=late){gs_step(bus,key_b,fixed);if(bus_waiting)return;}
    else if(early<=late){
     if(late<bound&&late-early<x4)x4_span<true>(key_b,fixed,bound);
     else{now=early;early+=x4;c.early_edge();}

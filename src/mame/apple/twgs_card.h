@@ -165,7 +165,7 @@ struct card {
  template<class Next> void gs_edge(bool level,Next &&next) noexcept {
   completed=delivered=false;memory_settle();transparent();
   if(!level){
-   if(active.valid&&!active.bus.read()){
+   if(ctl.pause&&active.valid&&!active.bus.read()){
     if(!(active==latches[active_column]))++high_errors;
     retired=active;delivered=true;++deliveries;
    }

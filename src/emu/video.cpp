@@ -215,6 +215,12 @@ void video_manager::frame_update(bool from_debugger)
 {
 	// only render sound and video if we're in the running phase
 	machine_phase const phase = machine().phase();
+	// Materialize deferred clock domains before rendering or publishing frame
+	// observations. VBLANK callbacks run after frame_update on primary screens.
+	if (phase == machine_phase::RUNNING && !machine().paused() && !from_debugger)
+		for (auto &exec : execute_interface_enumerator(machine().root_device()))
+			if (exec.deferred_execution())
+				machine().scheduler().synchronize_domain(exec, machine().time());
 	bool skipped_it = m_skipping_this_frame;
 	bool const update_screens = (phase == machine_phase::RUNNING) && (!machine().paused() || machine().options().update_in_pause());
 	bool anything_changed = update_screens && finish_screen_updates();
@@ -622,7 +628,10 @@ bool video_manager::finish_screen_updates()
 	bool has_live_screen = false;
 	for (screen_device &screen : iter)
 	{
-		screen.update_partial(screen.visible_area().max_y);
+		// Independent screens complete on their own clock, never at another
+		// screen's frame edge (which may be halfway through their active area).
+		if (!screen.independent_frame())
+			screen.update_partial(screen.visible_area().max_y);
 
 		if (machine().render().is_live(screen))
 			has_live_screen = true;

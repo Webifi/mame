@@ -9,7 +9,8 @@ OP(illegal,2)
 /**********************************************************
  * special opcodes (ED prefix)
  **********************************************************/
-OP(ed,00) { unsigned n = ARG(); _B = IN( n );                       } /* IN0  B,(n)       */
+// IN0 affects SZHPN exactly like IN g,(C), preserving carry (UM0050 p231).
+OP(ed,00) { unsigned n = ARG(); _B = IN( n ); _F = (_F & CF) | SZP[_B];                       } /* IN0  B,(n)       */
 OP(ed,01) { unsigned n = ARG(); OUT( n, _B );                       } /* OUT0 (n),B       */
 OP(ed,02) { illegal_2();                                            } /* DB   ED          */
 OP(ed,03) { illegal_2();                                            } /* DB   ED          */
@@ -18,7 +19,7 @@ OP(ed,05) { illegal_2();                                            } /* DB   ED
 OP(ed,06) { illegal_2();                                            } /* DB   ED          */
 OP(ed,07) { illegal_2();                                            } /* DB   ED          */
 
-OP(ed,08) { unsigned n = ARG(); _C = IN( n );                       } /* IN0  C,(n)       */
+OP(ed,08) { unsigned n = ARG(); _C = IN( n ); _F = (_F & CF) | SZP[_C];                       } /* IN0  C,(n)       */
 OP(ed,09) { unsigned n = ARG(); OUT( n, _C );                       } /* OUT0 (n),C       */
 OP(ed,0a) { illegal_2();                                            } /* DB   ED          */
 OP(ed,0b) { illegal_2();                                            } /* DB   ED          */
@@ -27,7 +28,7 @@ OP(ed,0d) { illegal_2();                                            } /* DB   ED
 OP(ed,0e) { illegal_2();                                            } /* DB   ED          */
 OP(ed,0f) { illegal_2();                                            } /* DB   ED          */
 
-OP(ed,10) { unsigned n = ARG(); _D = IN( n );                       } /* IN0  D,(n)       */
+OP(ed,10) { unsigned n = ARG(); _D = IN( n ); _F = (_F & CF) | SZP[_D];                       } /* IN0  D,(n)       */
 OP(ed,11) { unsigned n = ARG(); OUT( n, _D );                       } /* OUT0 (n),D       */
 OP(ed,12) { illegal_2();                                            } /* DB   ED          */
 OP(ed,13) { illegal_2();                                            } /* DB   ED          */
@@ -36,7 +37,7 @@ OP(ed,15) { illegal_2();                                            } /* DB   ED
 OP(ed,16) { illegal_2();                                            } /* DB   ED          */
 OP(ed,17) { illegal_2();                                            } /* DB   ED          */
 
-OP(ed,18) { unsigned n = ARG(); _E = IN( n );                       } /* IN0  E,(n)       */
+OP(ed,18) { unsigned n = ARG(); _E = IN( n ); _F = (_F & CF) | SZP[_E];                       } /* IN0  E,(n)       */
 OP(ed,19) { unsigned n = ARG(); OUT( n, _E );                       } /* OUT0 (n),E       */
 OP(ed,1a) { illegal_2();                                            } /* DB   ED          */
 OP(ed,1b) { illegal_2();                                            } /* DB   ED          */
@@ -45,7 +46,7 @@ OP(ed,1d) { illegal_2();                                            } /* DB   ED
 OP(ed,1e) { illegal_2();                                            } /* DB   ED          */
 OP(ed,1f) { illegal_2();                                            } /* DB   ED          */
 
-OP(ed,20) { unsigned n = ARG(); _H = IN( n );                       } /* IN0  H,(n)       */
+OP(ed,20) { unsigned n = ARG(); _H = IN( n ); _F = (_F & CF) | SZP[_H];                       } /* IN0  H,(n)       */
 OP(ed,21) { unsigned n = ARG(); OUT( n, _H );                       } /* OUT0 (n),H       */
 OP(ed,22) { illegal_2();                                            } /* DB   ED          */
 OP(ed,23) { illegal_2();                                            } /* DB   ED          */
@@ -54,7 +55,7 @@ OP(ed,25) { illegal_2();                                            } /* DB   ED
 OP(ed,26) { illegal_2();                                            } /* DB   ED          */
 OP(ed,27) { illegal_2();                                            } /* DB   ED          */
 
-OP(ed,28) { unsigned n = ARG(); _L = IN( n );                       } /* IN0  L,(n)       */
+OP(ed,28) { unsigned n = ARG(); _L = IN( n ); _F = (_F & CF) | SZP[_L];                       } /* IN0  L,(n)       */
 OP(ed,29) { unsigned n = ARG(); OUT( n, _L );                       } /* OUT0 (n),L       */
 OP(ed,2a) { illegal_2();                                            } /* DB   ED          */
 OP(ed,2b) { illegal_2();                                            } /* DB   ED          */
@@ -63,7 +64,7 @@ OP(ed,2d) { illegal_2();                                            } /* DB   ED
 OP(ed,2e) { illegal_2();                                            } /* DB   ED          */
 OP(ed,2f) { illegal_2();                                            } /* DB   ED          */
 
-OP(ed,30) { unsigned n = ARG(); IN( n );                          } /* IN0  (n)         */
+OP(ed,30) { unsigned n = ARG(); uint8_t res = IN(n); _F = (_F & CF) | SZP[res];                          } /* IN0  (n)         */
 OP(ed,31) { unsigned n = ARG(); OUT( n, 0 );                      } /* OUT0 (n)         */
 OP(ed,32) { illegal_2();                                            } /* DB   ED          */
 OP(ed,33) { illegal_2();                                            } /* DB   ED          */
@@ -72,7 +73,7 @@ OP(ed,35) { illegal_2();                                            } /* DB   ED
 OP(ed,36) { illegal_2();                                            } /* DB   ED          */
 OP(ed,37) { illegal_2();                                            } /* DB   ED          */
 
-OP(ed,38) { unsigned n = ARG(); _A = IN( n );                       } /* IN0  A,(n)       */
+OP(ed,38) { unsigned n = ARG(); _A = IN( n ); _F = (_F & CF) | SZP[_A];                       } /* IN0  A,(n)       */
 OP(ed,39) { unsigned n = ARG(); OUT( n, _A );                       } /* OUT0 (n),A       */
 OP(ed,3a) { illegal_2();                                            } /* DB   ED          */
 OP(ed,3b) { illegal_2();                                            } /* DB   ED          */
@@ -139,7 +140,8 @@ OP(ed,70) { uint8_t res = IN(_BC); _F = (_F & CF) | SZP[res];         } /* IN   
 OP(ed,71) { OUT(_BC,0);                                             } /* OUT  (C),0       */
 OP(ed,72) { SBC16( SP );                                            } /* SBC  HL,SP       */
 OP(ed,73) { m_ea = ARG16(); WM16( m_ea, &m_SP );                  } /* LD   (w),SP      */
-OP(ed,74) { unsigned m = ARG(); _F = (_F & CF) | SZP[IN(_C) & m];   } /* TSTIO m          */
+// UM0050 p233: TSTIO is a test/AND, not IN; H is set and C is cleared.
+OP(ed,74) { unsigned m = ARG(); _F = HF | SZP[IN(_C) & m];          } /* TSTIO m          */
 OP(ed,75) { RETN;                                                   } /* RETN;            */
 OP(ed,76) { SLP;                                                    } /* SLP              */
 OP(ed,77) { illegal_2();                                            } /* DB   ED,77       */

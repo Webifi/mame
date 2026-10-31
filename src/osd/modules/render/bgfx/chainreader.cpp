@@ -126,7 +126,7 @@ std::unique_ptr<bgfx_chain> chain_reader::read_from_value(
 		}
 	}
 
-	return std::make_unique<bgfx_chain>(
+	auto chain = std::make_unique<bgfx_chain>(
 			std::move(name),
 			std::move(author),
 			transform,
@@ -136,6 +136,8 @@ std::unique_ptr<bgfx_chain> chain_reader::read_from_value(
 			std::move(entries),
 			std::move(target_list),
 			screen_index);
+	chain->set_interlace_fields(value.HasMember("interlace_fields") && value["interlace_fields"].GetBool());
+	return chain;
 }
 
 bool chain_reader::validate_parameters(const Value& value, const std::string &prefix)
@@ -149,5 +151,6 @@ bool chain_reader::validate_parameters(const Value& value, const std::string &pr
 	if (!READER_CHECK(!value.HasMember("sliders") || value["sliders"].IsArray(), "%sValue 'sliders' must be an array\n", prefix)) return false;
 	if (!READER_CHECK(!value.HasMember("parameters") || value["parameters"].IsArray(), "%sValue 'parameters' must be an array\n", prefix)) return false;
 	if (!READER_CHECK(!value.HasMember("targets") || value["targets"].IsArray(), "%sValue 'targets' must be an array\n", prefix)) return false;
+	if (!READER_CHECK(!value.HasMember("interlace_fields") || value["interlace_fields"].IsBool(), "%sValue 'interlace_fields' must be boolean\n", prefix)) return false;
 	return true;
 }

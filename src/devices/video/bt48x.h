@@ -20,10 +20,22 @@ public:
 	bt481_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0);
 
 	// color lookup
-	rgb_t pixel_select(uint8_t index) const { return pen_color(index & m_read_mask); } // P0-P7
-	rgb_t overlay_select(uint8_t index) const { return pen_color((256 + index) & m_overlay_mask); } // OL0-OL3
+	rgb_t pixel_select(uint8_t index, uint8_t overlay = 0) const; // P0-P7 and OL0-OL3
+	rgb_t overlay_select(uint8_t index) const;
 
 	void map(address_map &map);
+
+	// Four-register interface with RS2 grounded. L481A_C pp9-11,19-20.
+	uint8_t vga_r(offs_t rs);
+	void vga_w(offs_t rs, uint8_t data);
+	void set_6_8_pin(bool state) { m_6_8_pin = state; }
+	uint8_t command_r() const { return m_cra; }
+	unsigned bytes_per_pixel() const;
+	unsigned pixels_per_clock_divisor() const;
+	rgb_t direct_color(uint32_t pixel, uint8_t overlay = 0) const;
+	// Output remains blank during Bt481 color chip (RAMDAC) wake-up recovery,
+	// even with B0 clear.
+	bool asleep() const { return (m_6_8_pin && BIT(m_crb, 0)) || m_sleep_recovering; }
 
 	// accessable with RS0 and RS1
 	uint8_t address_r();
@@ -46,6 +58,7 @@ protected:
 	bt481_device(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, uint32_t clock);
 
 	virtual void device_start() override ATTR_COLD;
+	virtual void device_reset() override ATTR_COLD;
 
 	// 256 color palette, 1 reserved entry, 15 overlay colors, 1 reserved entry, 3 cursor colors
 	virtual uint32_t palette_entries() const noexcept override { return 256 + 1 + 15 + 1 + 3; }
@@ -73,7 +86,16 @@ protected:
 
 	uint8_t m_read_mask;
 	uint8_t m_overlay_mask;
+	uint8_t m_overlay_mask_pending;
 	uint8_t m_cursor;
+	uint8_t m_hidden_reads = 0;
+	bool m_6_8_pin = true;
+	bool m_sleep_recovering = false;
+	emu_timer *m_sleep_recovery_timer = nullptr;
+	bool eight_bit() const { return m_6_8_pin && BIT(m_crb, 1); }
+	void palette_read_load(unsigned base);
+	void command_b_w(uint8_t data);
+	TIMER_CALLBACK_MEMBER(sleep_recovery_done);
 };
 
 class bt482_device : public bt481_device

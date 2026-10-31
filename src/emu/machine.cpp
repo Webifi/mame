@@ -856,6 +856,7 @@ void running_machine::add_logerror_callback(logerror_callback callback)
 
 void running_machine::strlog(const char *str) const
 {
+	std::lock_guard lock(m_log_mutex);
 	// log to all callbacks
 	for (auto &cb : m_logerror_list)
 		cb->m_func(str);

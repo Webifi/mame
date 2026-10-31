@@ -689,6 +689,9 @@ void screen_device::device_validity_check(validity_checker &valid) const
 			osd_printf_error("Non-raster display cannot have a variable width\n");
 	}
 
+	if (independent_frame() && (m_type != SCREEN_TYPE_RASTER || (m_video_attributes & (VIDEO_VARIABLE_WIDTH | VIDEO_SELF_RENDER))))
+		osd_printf_error("Independent frames require a fixed-width raster bitmap\n");
+
 	// check for invalid frame rate
 	if (m_refresh == 0 || m_refresh > ATTOSECONDS_PER_SECOND)
 		osd_printf_error("Invalid (under 1Hz) refresh rate\n");
@@ -816,18 +819,21 @@ void screen_device::device_start()
 	const bool screen16 = !m_screen_update_ind16.isnull();
 	texture_format texformat = screen16 ? TEXFORMAT_PALETTE16 : TEXFORMAT_RGB32;
 
-	for (auto & elem : m_bitmap)
+	for (unsigned i = 0; i < bitmap_count(); ++i)
 	{
-		elem.set_format(format(), texformat);
-		register_screen_bitmap(elem);
+		m_bitmap[i].set_format(format(), texformat);
+		register_screen_bitmap(m_bitmap[i]);
 	}
+	if (independent_frame())
+		m_curtexture = 1;
 	register_screen_bitmap(m_priority);
 
 	// allocate raw textures
-	m_texture[0] = machine().render().texture_alloc();
-	m_texture[0]->set_id(u64(m_unique_id) << 57);
-	m_texture[1] = machine().render().texture_alloc();
-	m_texture[1]->set_id((u64(m_unique_id) << 57) | 1);
+	for (unsigned i = 0; i < bitmap_count(); ++i)
+	{
+		m_texture[i] = machine().render().texture_alloc();
+		m_texture[i]->set_id((u64(m_unique_id) << 57) | i);
+	}
 
 	// configure the default cliparea
 	render_container::user_settings settings = m_container->get_user_settings();
@@ -875,6 +881,13 @@ void screen_device::device_start()
 		load_effect_overlay(overname);
 
 	// register items for saving
+	if (independent_frame())
+	{
+		save_item(NAME(m_curbitmap));
+		save_item(NAME(m_curtexture));
+		save_item(NAME(m_completed_bitmap));
+		save_item(NAME(m_frame_pending));
+	}
 	save_item(NAME(m_width));
 	save_item(NAME(m_height));
 	save_item(NAME(m_visarea.min_x));
@@ -889,6 +902,7 @@ void screen_device::device_start()
 	save_item(NAME(m_pixeltime));
 	save_item(NAME(m_vblank_period));
 	save_item(NAME(m_vblank_start_time));
+	save_item(NAME(m_coordinate_phase));
 	save_item(NAME(m_vblank_end_time));
 	save_item(NAME(m_frame_number));
 	if (m_oldstyle_vblank_supplied)
@@ -918,6 +932,8 @@ void screen_device::device_stop()
 {
 	machine().render().texture_free(m_texture[0]);
 	machine().render().texture_free(m_texture[1]);
+	if (m_texture[2])
+		machine().render().texture_free(m_texture[2]);
 	if (m_burnin.valid())
 		finalize_burnin();
 }
@@ -975,7 +991,7 @@ TIMER_CALLBACK_MEMBER(screen_device::scanline_tick)
 //  configure - configure screen parameters
 //-------------------------------------------------
 
-void screen_device::configure(int width, int height, const rectangle &visarea, attoseconds_t frame_period)
+void screen_device::configure(int width, int height, const rectangle &visarea, attoseconds_t frame_period, attotime coordinate_phase)
 {
 	// validate arguments
 	assert(width > 0);
@@ -987,6 +1003,25 @@ void screen_device::configure(int width, int height, const rectangle &visarea, a
 	assert(m_type == SCREEN_TYPE_VECTOR || m_type == SCREEN_TYPE_SVG || visarea.left() < width);
 	assert(m_type == SCREEN_TYPE_VECTOR || m_type == SCREEN_TYPE_SVG || visarea.top() < height);
 	assert(frame_period > 0);
+
+	// The visible-area origin may move independently of the device counters.
+	// Recover the latest unshifted epoch using the OLD period before changing
+	// clocks. Normalizing a shifted epoch by the new period alone changes
+	// the beam when software writes several timing registers at one instant.
+	bool const rebase = coordinate_phase != attotime::zero || m_coordinate_phase != attotime::zero;
+	attotime reference = m_vblank_start_time;
+	if (rebase)
+	{
+		reference -= m_coordinate_phase;
+		attotime const old_period(0, m_frame_period);
+		while (reference > machine().time())
+			reference -= old_period;
+		while (machine().time() - reference >= old_period)
+			reference += old_period;
+		// Match configure's ordinary shortened-frame rule below.
+		if (machine().time() - reference >= attotime(0, frame_period))
+			reference = machine().time();
+	}
 
 	// fill in the new parameters
 	m_max_width = std::max(m_max_width, width);
@@ -1008,6 +1043,18 @@ void screen_device::configure(int width, int height, const rectangle &visarea, a
 		m_vblank_period = m_vblank;
 	else
 		m_vblank_period = m_scantime * (height - visarea.height());
+
+	if (rebase)
+	{
+		m_vblank_start_time = reference + coordinate_phase;
+		while (m_vblank_start_time > machine().time())
+			m_vblank_start_time -= attotime(0, m_frame_period);
+		while (machine().time() - m_vblank_start_time >= attotime(0, m_frame_period))
+			m_vblank_start_time += attotime(0, m_frame_period);
+		m_vblank_end_time = m_vblank_start_time + attotime(0, m_vblank_period);
+	}
+
+	m_coordinate_phase = coordinate_phase;
 
 	// we are now fully configured with the new parameters
 	// and can safely call time_until_pos(), etc.
@@ -1103,13 +1150,12 @@ void screen_device::realloc_screen_bitmaps()
 		item->m_bitmap.resize(effwidth, effheight);
 
 	// re-set up textures
-	if (m_palette)
+	for (unsigned i = 0; i < bitmap_count(); ++i)
 	{
-		m_bitmap[0].set_palette(m_palette->palette());
-		m_bitmap[1].set_palette(m_palette->palette());
+		if (m_palette)
+			m_bitmap[i].set_palette(m_palette->palette());
+		m_texture[i]->set_bitmap(m_bitmap[i], m_visarea, m_bitmap[i].texformat());
 	}
-	m_texture[0]->set_bitmap(m_bitmap[0], m_visarea, m_bitmap[0].texformat());
-	m_texture[1]->set_bitmap(m_bitmap[1], m_visarea, m_bitmap[1].texformat());
 
 	allocate_scan_bitmaps();
 }
@@ -1445,7 +1491,8 @@ void screen_device::reset_partial_updates()
 
 u32 screen_device::pixel(s32 x, s32 y)
 {
-	screen_bitmap &curbitmap = m_bitmap[m_curbitmap];
+	unsigned const index = read_bitmap_index();
+	screen_bitmap &curbitmap = m_bitmap[index];
 	if (!curbitmap.valid())
 		return 0;
 
@@ -1461,7 +1508,7 @@ u32 screen_device::pixel(s32 x, s32 y)
 	{
 		case BITMAP_FORMAT_IND16:
 		{
-			bitmap_ind16 &srcbitmap = per_scanline ? *(bitmap_ind16 *)m_scan_bitmaps[m_curbitmap][y] : curbitmap.as_ind16();
+			bitmap_ind16 &srcbitmap = per_scanline ? *(bitmap_ind16 *)m_scan_bitmaps[index][y] : curbitmap.as_ind16();
 			const u16 src = per_scanline ? srcbitmap.pix(0, x) : srcbitmap.pix(y, x);
 			const rgb_t *palette = m_palette->palette()->entry_list_adjusted();
 			return (u32)palette[src];
@@ -1471,7 +1518,7 @@ u32 screen_device::pixel(s32 x, s32 y)
 		{
 			if (per_scanline)
 			{
-				return (u32)(*(bitmap_rgb32 *)m_scan_bitmaps[m_curbitmap][y]).pix(0, x);
+				return (u32)(*(bitmap_rgb32 *)m_scan_bitmaps[index][y]).pix(0, x);
 			}
 			else
 			{
@@ -1492,7 +1539,8 @@ u32 screen_device::pixel(s32 x, s32 y)
 
 void screen_device::pixels(u32 *buffer)
 {
-	screen_bitmap &curbitmap = m_bitmap[m_curbitmap];
+	unsigned const index = read_bitmap_index();
+	screen_bitmap &curbitmap = m_bitmap[index];
 	if (!curbitmap.valid())
 		return;
 
@@ -1507,7 +1555,7 @@ void screen_device::pixels(u32 *buffer)
 			const rgb_t *palette = m_palette->palette()->entry_list_adjusted();
 			for (int y = visarea.min_y; y <= visarea.max_y; y++)
 			{
-				bitmap_ind16 &srcbitmap = per_scanline ? *(bitmap_ind16 *)m_scan_bitmaps[m_curbitmap][y] : curbitmap.as_ind16();
+				bitmap_ind16 &srcbitmap = per_scanline ? *(bitmap_ind16 *)m_scan_bitmaps[index][y] : curbitmap.as_ind16();
 				const u16 *src = &srcbitmap.pix(per_scanline ? 0 : y, visarea.min_x);
 				for (int x = visarea.min_x; x <= visarea.max_x; x++)
 				{
@@ -1521,7 +1569,7 @@ void screen_device::pixels(u32 *buffer)
 		{
 			for (int y = visarea.min_y; y <= visarea.max_y; y++)
 			{
-				bitmap_rgb32 &srcbitmap = per_scanline ? *(bitmap_rgb32 *)m_scan_bitmaps[m_curbitmap][y] : curbitmap.as_rgb32();
+				bitmap_rgb32 &srcbitmap = per_scanline ? *(bitmap_rgb32 *)m_scan_bitmaps[index][y] : curbitmap.as_rgb32();
 				const u32 *src = &srcbitmap.pix(per_scanline ? 0 : y, visarea.min_x);
 				for (int x = visarea.min_x; x <= visarea.max_x; x++)
 				{
@@ -1677,6 +1725,11 @@ TIMER_CALLBACK_MEMBER(screen_device::vblank_begin)
 	m_vblank_start_time = machine().time();
 	m_vblank_end_time = m_vblank_start_time + attotime(0, m_vblank_period);
 
+	// Complete an independent raster at its own beam boundary. No textures
+	// or render containers are touched here (this may be a worker domain).
+	if (independent_frame() && !(m_video_attributes & VIDEO_UPDATE_AFTER_VBLANK))
+		complete_frame();
+
 	// if this is the primary screen and we need to update now
 	if (m_is_primary_screen && !(m_video_attributes & VIDEO_UPDATE_AFTER_VBLANK))
 		machine().video().frame_update();
@@ -1708,6 +1761,9 @@ TIMER_CALLBACK_MEMBER(screen_device::vblank_end)
 	for (auto &item : m_callback_list)
 		item->m_callback(*this, false);
 	m_screen_vblank(0);
+
+	if (independent_frame() && (m_video_attributes & VIDEO_UPDATE_AFTER_VBLANK))
+		complete_frame();
 
 	// if this is the primary screen and we need to update now
 	if (m_is_primary_screen && (m_video_attributes & VIDEO_UPDATE_AFTER_VBLANK))
@@ -1771,12 +1827,28 @@ void screen_device::create_composited_bitmap()
 
 
 //-------------------------------------------------
-//  update_quads - set up the quads for this
-//  screen
+//  complete_frame - retire an independent raster
+//  without touching the displayed texture
+//-------------------------------------------------
+
+void screen_device::complete_frame()
+{
+	update_partial(m_visarea.max_y);
+	if (m_changed)
+	{
+		std::swap(m_curbitmap, m_completed_bitmap);
+		m_frame_pending = true;
+		m_changed = false;
+	}
+}
+
+//-------------------------------------------------
+//  update_quads - set up the quads for this screen
 //-------------------------------------------------
 
 bool screen_device::update_quads()
 {
+	bool const changed = independent_frame() ? m_frame_pending : m_changed;
 	// only update if live
 	if (machine().render().is_live(*this))
 	{
@@ -1784,15 +1856,25 @@ bool screen_device::update_quads()
 		if (m_type != SCREEN_TYPE_VECTOR && (m_video_attributes & VIDEO_SELF_RENDER) == 0)
 		{
 			// if we're not skipping the frame and if the screen actually changed, then update the texture
-			if (!machine().video().skip_this_frame() && m_changed)
+			if (!machine().video().skip_this_frame() && changed)
 			{
 				if (m_video_attributes & VIDEO_VARIABLE_WIDTH)
 				{
 					create_composited_bitmap();
 				}
-				m_texture[m_curbitmap]->set_bitmap(m_bitmap[m_curbitmap], m_visarea, m_bitmap[m_curbitmap].texformat());
-				m_curtexture = m_curbitmap;
-				m_curbitmap = 1 - m_curbitmap;
+				if (independent_frame())
+				{
+					// The host's frame barrier has stopped the deferred domain.
+					// Publish its completed frame without swapping the active raster.
+					std::swap(m_curtexture, m_completed_bitmap);
+					m_frame_pending = false;
+				}
+				else
+				{
+					m_curtexture = m_curbitmap;
+					m_curbitmap = 1 - m_curbitmap;
+				}
+				m_texture[m_curtexture]->set_bitmap(m_bitmap[m_curtexture], m_visarea, m_bitmap[m_curtexture].texformat());
 			}
 
 			// brightness adjusted render color
@@ -1805,9 +1887,9 @@ bool screen_device::update_quads()
 	}
 
 	// reset the screen changed flags
-	bool result = m_changed;
-	m_changed = false;
-	return result;
+	if (!independent_frame())
+		m_changed = false;
+	return changed;
 }
 
 

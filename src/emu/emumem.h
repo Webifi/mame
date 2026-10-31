@@ -2386,6 +2386,23 @@ public:
 	util::notifier_subscription add_change_notifier(delegate<void (read_or_write)> &&n);
 	template <typename T> util::notifier_subscription add_change_notifier(T &&n) { return add_change_notifier(delegate<void (read_or_write)>(std::forward<T>(n))); }
 
+	// Bracket structural map changes, including passthrough removal. Detached
+	// consumers must relinquish the space before a handler becomes reachable;
+	// cache invalidation alone happens too late to provide that exclusion.
+	util::notifier_subscription add_map_change_notifier(delegate<void (bool)> &&n) { return m_map_notifiers.subscribe(std::move(n)); }
+	template <typename T> util::notifier_subscription add_map_change_notifier(T &&n) { return add_map_change_notifier(delegate<void (bool)>(std::forward<T>(n))); }
+
+	class map_update
+	{
+	public:
+		explicit map_update(address_space &space) : m_space(space) { if (!m_space.m_map_updates++) m_space.m_map_notifiers(true); }
+		~map_update() { if (!--m_space.m_map_updates) m_space.m_map_notifiers(false); }
+		map_update(map_update const &) = delete;
+		map_update &operator=(map_update const &) = delete;
+	private:
+		address_space &m_space;
+	};
+
 	void invalidate_caches(read_or_write mode) {
 		if(u32(mode) & ~m_in_notification) {
 			u32 old = m_in_notification;
@@ -2484,6 +2501,8 @@ protected:
 
 	std::vector<std::shared_ptr<emu::detail::memory_passthrough_handler_impl>> m_mphs;
 
+	util::notifier<bool> m_map_notifiers;
+	unsigned m_map_updates = 0;
 	util::notifier<read_or_write> m_notifiers;  // notifier list for address map change
 	u32                     m_in_notification;  // notification(s) currently being done
 

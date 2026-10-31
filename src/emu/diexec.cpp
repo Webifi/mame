@@ -109,6 +109,18 @@ void device_execute_interface::abort_timeslice() noexcept
 }
 
 
+void device_execute_interface::prepare_deferred_clock_change()
+{
+	if (!m_deferred_execution || !executing()) return;
+	const int elapsed = m_cycles_running - *m_icountptr;
+	m_localtime += cycles_to_attotime(elapsed);
+	m_totalcycles += elapsed;
+	m_cycles_running -= elapsed;
+	m_cycles_stolen += elapsed; // already accounted; exclude from run()'s return
+	abort_timeslice();
+}
+
+
 //-------------------------------------------------
 //  suspend_resume_changed
 //-------------------------------------------------
@@ -476,7 +488,9 @@ void device_execute_interface::interface_clock_changed(bool sync_on_new_clock_do
 
 	// recompute cps and spc
 	m_cycles_per_second = clocks_to_cycles(device().clock());
-	m_attoseconds_per_cycle = HZ_TO_ATTOSECONDS(m_cycles_per_second);
+	// Preserve the oscillator divider. Rounding clock/divider to whole Hz
+	// disagrees with local_time() and moves a retried edge backwards in time.
+	m_attoseconds_per_cycle = cycles_to_attotime(1).as_attoseconds();
 
 	// resynchronize the localtime to the clock domain when asked to
 	if (sync_on_new_clock_domain)
@@ -536,7 +550,7 @@ attoseconds_t device_execute_interface::minimum_quantum() const
 	// if we don't have the quantum time, compute it
 	attoseconds_t basetick = m_attoseconds_per_cycle;
 	if (basetick == 0)
-		basetick = HZ_TO_ATTOSECONDS(clocks_to_cycles(device().clock()));
+		basetick = cycles_to_attotime(1).as_attoseconds();
 
 	// apply the minimum cycle count
 	return basetick * min_cycles();
@@ -688,7 +702,7 @@ void device_execute_interface::device_input::set_state_synced(int state, int vec
 
 		// if this is the first one, set the timer
 		if (event_index == 0)
-			m_execute->scheduler().synchronize(timer_expired_delegate(FUNC(device_execute_interface::device_input::empty_event_queue),this));
+			m_execute->scheduler().synchronize(timer_expired_delegate(FUNC(device_execute_interface::device_input::empty_event_queue),this), 0, &m_execute->device());
 	}
 }
 
@@ -699,6 +713,12 @@ void device_execute_interface::device_input::set_state_synced(int state, int vec
 
 TIMER_CALLBACK_MEMBER(device_execute_interface::device_input::empty_event_queue)
 {
+	if (m_execute->deferred_execution() && !m_execute->executing() && m_execute->local_time() < m_execute->scheduler().time() &&
+		!m_execute->scheduler().synchronize_device(*m_execute, m_execute->scheduler().time()))
+	{
+		m_execute->scheduler().synchronize(timer_expired_delegate(FUNC(device_input::empty_event_queue), this), 0, &m_execute->device());
+		return;
+	}
 	if (TEMPLOG) printf("empty_queue(%s,%d,%d)\n", m_execute->device().tag(), m_linenum, m_qindex);
 
 	// loop over all events

@@ -42,7 +42,11 @@ struct profile_string
 //  GLOBAL VARIABLES
 //**************************************************************************
 
+#ifdef MAME_PROFILER
+thread_local profiler_state g_profiler;
+#else
 profiler_state g_profiler;
+#endif
 
 
 

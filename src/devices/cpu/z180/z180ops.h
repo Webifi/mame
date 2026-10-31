@@ -31,6 +31,7 @@
  ***************************************************************/
 inline u8 z180_device::IN(u16 port)
 {
+	if (m_cycle_executing) return cycle_access(cycle_kind::input, port);
 	if (is_internal_io_address(port))
 		return z180_readcontrol(port);
 	m_extra_cycles += io_wait_states();
@@ -42,6 +43,7 @@ inline u8 z180_device::IN(u16 port)
  ***************************************************************/
 inline void z180_device::OUT(u16 port, u8 value)
 {
+	if (m_cycle_executing) { cycle_access(cycle_kind::output, port, value); return; }
 	if (is_internal_io_address(port))
 		z180_writecontrol(port,value);
 	else
@@ -77,16 +79,20 @@ void z180_device::z180_mmu()
 		}
 		m_mmu[page] = (addr & 0xfffff);
 	}
+	cycle_update_direct_reads();
 }
 
 
 #define MMU_REMAP_ADDR(addr) (m_mmu[((addr)>>12)&15]|((addr)&4095))
+
+#include "z180cycles_inline.hxx"
 
 /***************************************************************
  * Read a byte from given memory location
  ***************************************************************/
 inline u8 z180_device::RM(offs_t addr)
 {
+	if (m_cycle_executing) return cycle_access(cycle_kind::read, u16(addr));
 	m_extra_cycles += memory_wait_states();
 	return z180_read_memory(MMU_REMAP_ADDR(addr));
 }
@@ -94,7 +100,13 @@ inline u8 z180_device::RM(offs_t addr)
 /***************************************************************
  * Write a byte to given memory location
  ***************************************************************/
-#define WM(addr,value) m_extra_cycles += memory_wait_states(); z180_write_memory(MMU_REMAP_ADDR(addr),value)
+inline void z180_device::write_mem(offs_t addr, u8 data)
+{
+	if (m_cycle_executing) { cycle_access(cycle_kind::write, u16(addr), data); return; }
+	m_extra_cycles += memory_wait_states();
+	z180_write_memory(MMU_REMAP_ADDR(addr), data);
+}
+#define WM(addr,value) write_mem(addr,value)
 
 /***************************************************************
  * Read a word from given memory location
@@ -121,8 +133,10 @@ void z180_device::WM16( offs_t addr, PAIR *r )
  ***************************************************************/
 uint8_t z180_device::ROP()
 {
+	++m_R; // UM0050 p177: once per opcode fetch, not per prefix handler.
 	offs_t addr = _PCD;
 	_PC++;
+	if (m_cycle_executing) return cycle_access(cycle_kind::fetch, u16(addr));
 	m_extra_cycles += memory_wait_states();
 	return m_copcodes.read_byte(MMU_REMAP_ADDR(addr));
 }
@@ -137,12 +151,14 @@ uint8_t z180_device::ARG()
 {
 	offs_t addr = _PCD;
 	_PC++;
+	if (m_cycle_executing) return cycle_access(cycle_kind::operand, u16(addr));
 	m_extra_cycles += memory_wait_states();
 	return m_cprogram.read_byte(MMU_REMAP_ADDR(addr));
 }
 
 uint32_t z180_device::ARG16()
 {
+	if (m_cycle_executing) { u8 const low = ARG(); return low | (u16(ARG()) << 8); }
 	offs_t addr = _PCD;
 	_PC += 2;
 	m_extra_cycles += memory_wait_states() * 2;
@@ -164,7 +180,7 @@ uint32_t z180_device::ARG16()
 /***************************************************************
  * PUSH
  ***************************************************************/
-#define PUSH(SR) { _SP -= 2; WM16(_SPD, &m_##SR); }
+#define PUSH(SR) { --_SP; WM(_SPD, m_##SR.b.h); --_SP; WM(_SPD, m_##SR.b.l); } // UM0050 pp272-273: high byte first
 
 /***************************************************************
  * JP
@@ -181,6 +197,7 @@ uint32_t z180_device::ARG16()
 	if( cond )                                                  \
 	{                                                           \
 		_PCD = ARG16();                                       \
+		m_extra_cycles += 3; /* UM0050 pp239-240: JP cc taken */   \
 	}                                                           \
 	else                                                        \
 	{                                                           \
@@ -256,11 +273,16 @@ uint32_t z180_device::ARG16()
 /***************************************************************
  * RETI
  ***************************************************************/
-#define RETI    {                                               \
+// Z8S180 DS006002 p67: M1E=0 refetches RETI with Z80 bus timing.
+// UM0050 pp84-85 gives 22 states; the ordinary Z8S180 path takes 12.
+#define RETI {                                                  \
+	if (!(m_omcr & Z180_OMCR_M1E))                              \
+	{                                                           \
+		_PC -= 2; ROP(); ROP();                                 \
+		m_extra_cycles += 10;                                  \
+	}                                                           \
 	POP(PC);                                                    \
-/* according to http://www.msxnet.org/tech/Z80/z80undoc.txt */  \
-/*  m_IFF1 = m_IFF2;  */                                        \
-	daisy_call_reti_device();                                   \
+	cycle_reti();                                              \
 }
 
 /***************************************************************
@@ -509,7 +531,8 @@ uint8_t z180_device::DEC(uint8_t value)
 {                                                               \
 	PAIR tmp = { { 0, 0, 0, 0 } };                              \
 	RM16( _SPD, &tmp );                                         \
-	WM16( _SPD, &m_##DR );                                    \
+	WM(u16(_SP + 1), m_##DR.b.h); /* UM0050 pp256-257 */       \
+	WM(_SPD, m_##DR.b.l);                                    \
 	m_##DR = tmp;                                             \
 }
 
@@ -918,22 +941,28 @@ uint8_t z180_device::SET(uint8_t bit, uint8_t value)
  * OTIM
  ***************************************************************/
 #define OTIM {                                                  \
-	_B--;                                                     \
-	OUT( _C, RM(_HL) );                                         \
-	_HL++;                                                        \
-	_C++;                                                     \
-	_F = (_B) ? NF : NF | ZF;                                   \
+	u8 const data = RM(_HL);                                     \
+	OUT(_C, data);                                              \
+	_B--;                                                      \
+	_HL++;                                                     \
+	_C++;                                                      \
+	/* HD64180 pp110-113: borrow/parity of B-1; N is data bit 7. */ \
+	_F = SZP[_B] | ((_B & 15) == 15 ? HF : 0) |                  \
+		(_B == 255 ? CF : 0) | ((data & 0x80) ? NF : 0);         \
 }
 
 /***************************************************************
  * OTDM
  ***************************************************************/
 #define OTDM {                                                  \
-	_B--;                                                     \
-	OUT( _C, RM(_HL) );                                         \
-	_HL--;                                                        \
-	_C--;                                                     \
-	_F = (_B) ? NF : NF | ZF;                                   \
+	u8 const data = RM(_HL);                                     \
+	OUT(_C, data);                                              \
+	_B--;                                                      \
+	_HL--;                                                     \
+	_C--;                                                      \
+	/* HD64180 pp110-113: borrow/parity of B-1; N is data bit 7. */ \
+	_F = SZP[_B] | ((_B & 15) == 15 ? HF : 0) |                  \
+		(_B == 255 ? CF : 0) | ((data & 0x80) ? NF : 0);         \
 }
 
 /***************************************************************
@@ -944,7 +973,7 @@ uint8_t z180_device::SET(uint8_t bit, uint8_t value)
 	if( _B )                                                  \
 	{                                                           \
 		_PC -= 2;                                             \
-		CC(ex,0xb3);                                            \
+		m_extra_cycles += 2; /* UM0050 pp232-234 */                                            \
 	}
 
 /***************************************************************
@@ -955,7 +984,7 @@ uint8_t z180_device::SET(uint8_t bit, uint8_t value)
 	if( _B )                                                  \
 	{                                                           \
 		_PC -= 2;                                             \
-		CC(ex,0xb3);                                            \
+		m_extra_cycles += 2; /* UM0050 pp232-234 */                                            \
 	}
 
 /***************************************************************
@@ -964,4 +993,21 @@ uint8_t z180_device::SET(uint8_t bit, uint8_t value)
 #define SLP {                                                   \
 	_PC -= 2;                                                      \
 	m_HALT = 2;                                                 \
+}
+
+// UM0050 pp68-72, Figures 32/33. TRAP leaves both IEFs unchanged.
+int z180_device::take_trap(bool third)
+{
+	if (m_cycle_executing) { m_trapping = true; m_third_trap = third; }
+	if (third)
+		RM(m_ea); // The indexed operand read precedes the trap (Figure 33).
+	if (!m_cycle_executing || !m_trap_started)
+	{
+		m_itc = (m_itc & ~Z180_ITC_UFO) | Z180_ITC_TRAP | (third ? Z180_ITC_UFO : 0);
+		m_trap_started = true;
+	}
+	_PC = _PPC + (third ? 2 : 1);
+	PUSH(PC);
+	_PC = 0;
+	return third ? 26 : 17;
 }

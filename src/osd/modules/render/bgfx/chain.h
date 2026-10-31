@@ -39,11 +39,13 @@ public:
 	std::vector<bgfx_chain_entry*>& entries() { return m_entries; }
 	uint32_t applicable_passes();
 	bool transform() const { return m_transform; }
+	bool interlace_fields() const { return m_interlace_fields; }
 	bool has_converter() const { return m_has_converter; }
 	bool has_adjuster() const { return m_has_adjuster; }
 
 	// Setters
 	void set_has_converter(bool has_converter) { m_has_converter = has_converter; }
+	void set_interlace_fields(bool fields) { m_interlace_fields = fields; }
 	void set_has_adjuster(bool has_adjuster) { m_has_adjuster = has_adjuster; }
 	void insert_effect(uint32_t index, bgfx_effect *effect, const bool apply_tint, std::string name, std::string source, chain_manager &chains);
 
@@ -51,6 +53,7 @@ private:
 	std::string                         m_name;
 	std::string                         m_author;
 	bool                                m_transform;
+	bool                                m_interlace_fields = false;
 	target_manager&                     m_targets;
 	std::vector<bgfx_slider*>           m_sliders;
 	std::vector<bgfx_parameter*>        m_params;

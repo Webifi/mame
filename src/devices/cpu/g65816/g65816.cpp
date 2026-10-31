@@ -236,14 +236,30 @@ const g65816_device::execute_func g65816_device::s_g65816_execute[5] =
 
 #define ADDRESS_65816(A) ((A)&0x00ffffff)
 
-#define BUS_HOOK(A, T) if (!m_bus_hook.isnull()) CLOCKS -= m_bus_hook((A), (T), u8(value))
+// Only CPU frames with trivial locals are crossed, after board hooks return.
+// No signal mask changes on this path; Darwin's plain context form avoids
+// saving/restoring it for each physical bus edge.
+#if defined(__APPLE__)
+#define BUS_CONTINUATION_SAVE(B) _setjmp(B)
+#define BUS_CONTINUATION_RESTORE(B, V) _longjmp(B, V)
+#else
+#define BUS_CONTINUATION_SAVE(B) setjmp(B)
+#define BUS_CONTINUATION_RESTORE(B, V) std::longjmp(B, V)
+#endif
+
+
+#define BUS_HOOK(A, T) if (!m_bus_hook.isnull()) { u8 bus_data = u8(value); CLOCKS -= m_bus_hook((A), (T), bus_data); value = bus_data; }
+#define WAIT_END(A, T, V) do { completed_bus_clock(); if (m_waitable) record_access((A), (T), u8(V), int(total_cycles() - wait_cycles)); } while (0)
 #define CACHED_READ(A, T) \
 	if (!m_cached_access.isnull()) \
 	{ \
 		int cycles; \
-		if (m_cached_access((A), (T), value, cycles)) \
+		const bool complete = m_cached_access((A), (T), value, cycles); \
+		if (m_wait_deferred) BUS_CONTINUATION_RESTORE(m_wait_jump, 1); \
+		if (complete) \
 		{ \
 			CLOCKS -= cycles; \
+			WAIT_END(A, T, value); \
 			return value; \
 		} \
 	}
@@ -251,6 +267,12 @@ const g65816_device::execute_func g65816_device::s_g65816_execute[5] =
 unsigned g65816_device::g65816i_read_8_normal(unsigned address)
 {
 	address = ADDRESS_65816(address);
+	const u64 wait_cycles = m_waitable ? total_cycles() : 0;
+	if (m_waitable)
+	{
+		u8 cached = 0;
+		if (replay_access(address, BUS_READ, cached)) return cached;
+	}
 	CLOCKS -= (bus_5A22_cycle_burst(address));
 	u8 value = 0;
 	CACHED_READ(address, BUS_READ);
@@ -259,12 +281,19 @@ unsigned g65816_device::g65816i_read_8_normal(unsigned address)
 	if (!m_data_hook.isnull())
 		value = m_data_hook(address, BUS_READ, value);
 	BUS_HOOK(address, BUS_READ);
+	WAIT_END(address, BUS_READ, value);
 	return value;
 }
 
 unsigned g65816_device::g65816i_read_8_immediate(unsigned address)
 {
 	address = ADDRESS_65816(address);
+	const u64 wait_cycles = m_waitable ? total_cycles() : 0;
+	if (m_waitable)
+	{
+		u8 cached = 0;
+		if (replay_access(address, BUS_OPERAND, cached)) return cached;
+	}
 	CLOCKS -= (bus_5A22_cycle_burst(address));
 	u8 value = 0;
 	CACHED_READ(address, BUS_OPERAND);
@@ -273,12 +302,19 @@ unsigned g65816_device::g65816i_read_8_immediate(unsigned address)
 	if (!m_data_hook.isnull())
 		value = m_data_hook(address, BUS_OPERAND, value);
 	BUS_HOOK(address, BUS_OPERAND);
+	WAIT_END(address, BUS_OPERAND, value);
 	return value;
 }
 
 unsigned g65816_device::g65816i_read_8_opcode(unsigned address)
 {
 	address = ADDRESS_65816(address);
+	const u64 wait_cycles = m_waitable ? total_cycles() : 0;
+	if (m_waitable)
+	{
+		u8 cached = 0;
+		if (replay_access(address, BUS_OPCODE, cached)) return cached;
+	}
 	CLOCKS -= (bus_5A22_cycle_burst(address));
 	u8 value = 0;
 	CACHED_READ(address, BUS_OPCODE);
@@ -287,22 +323,21 @@ unsigned g65816_device::g65816i_read_8_opcode(unsigned address)
 	if (!m_data_hook.isnull())
 		value = m_data_hook(address, BUS_OPCODE, value);
 	BUS_HOOK(address, BUS_OPCODE);
+	WAIT_END(address, BUS_OPCODE, value);
 	return value;
 }
 
 unsigned g65816_device::g65816i_read_8_direct(unsigned address)
 {
-	if (FLAG_E && !MAKE_UINT_8(REGISTER_D))
+	address = (FLAG_E && !MAKE_UINT_8(REGISTER_D))
+		? REGISTER_D | MAKE_UINT_8(address) : ADDRESS_65816(address);
+	const u64 wait_cycles = m_waitable ? total_cycles() : 0;
+	if (m_waitable)
 	{
-		/* force address into zero page */
-		address = REGISTER_D | MAKE_UINT_8(address);
-		CLOCKS -= (bus_5A22_cycle_burst(address));
+		u8 cached = 0;
+		if (replay_access(address, BUS_READ, cached)) return cached;
 	}
-	else
-	{
-		address = ADDRESS_65816(address);
-		CLOCKS -= (bus_5A22_cycle_burst(address));
-	}
+	CLOCKS -= (bus_5A22_cycle_burst(address));
 	u8 value = 0;
 	CACHED_READ(address, BUS_READ);
 	if (m_memory_hook.isnull() || !m_memory_hook(address, BUS_READ, value))
@@ -310,11 +345,18 @@ unsigned g65816_device::g65816i_read_8_direct(unsigned address)
 	if (!m_data_hook.isnull())
 		value = m_data_hook(address, BUS_READ, value);
 	BUS_HOOK(address, BUS_READ);
+	WAIT_END(address, BUS_READ, value);
 	return value;
 }
 
 unsigned g65816_device::g65816i_read_8_vector(unsigned address)
 {
+	const u64 wait_cycles = m_waitable ? total_cycles() : 0;
+	if (m_waitable)
+	{
+		u8 cached = 0;
+		if (replay_access(address, BUS_VECTOR, cached)) return cached;
+	}
 	CLOCKS -= (bus_5A22_cycle_burst(address));
 	u8 value = 0;
 	CACHED_READ(address, BUS_VECTOR);
@@ -328,20 +370,30 @@ unsigned g65816_device::g65816i_read_8_vector(unsigned address)
 	if (!m_data_hook.isnull())
 		value = m_data_hook(address, BUS_VECTOR, value);
 	BUS_HOOK(address, BUS_VECTOR);
+	WAIT_END(address, BUS_VECTOR, value);
 	return value;
 }
 
 void g65816_device::g65816i_write_8_normal(unsigned address, unsigned value)
 {
 	address = ADDRESS_65816(address);
+	const u64 wait_cycles = m_waitable ? total_cycles() : 0;
+	if (m_waitable)
+	{
+		u8 cached = u8(value);
+		if (replay_access(address, BUS_WRITE, cached)) return;
+	}
 	CLOCKS -= (bus_5A22_cycle_burst(address));
 	u8 data = MAKE_UINT_8(value);
 	if (!m_cached_access.isnull())
 	{
 		int cycles;
-		if (m_cached_access(address, BUS_WRITE, data, cycles))
+		const bool complete = m_cached_access(address, BUS_WRITE, data, cycles);
+		if (m_wait_deferred) BUS_CONTINUATION_RESTORE(m_wait_jump, 1);
+		if (complete)
 		{
 			CLOCKS -= cycles;
+			WAIT_END(address, BUS_WRITE, value);
 			return;
 		}
 	}
@@ -350,28 +402,30 @@ void g65816_device::g65816i_write_8_normal(unsigned address, unsigned value)
 	if (!m_data_hook.isnull())
 		m_data_hook(address, BUS_WRITE, value);
 	BUS_HOOK(address, BUS_WRITE);
+	WAIT_END(address, BUS_WRITE, value);
 }
 
 void g65816_device::g65816i_write_8_direct(unsigned address, unsigned value)
 {
-	if (FLAG_E && !MAKE_UINT_8(REGISTER_D))
+	address = (FLAG_E && !MAKE_UINT_8(REGISTER_D))
+		? REGISTER_D | MAKE_UINT_8(address) : ADDRESS_65816(address);
+	const u64 wait_cycles = m_waitable ? total_cycles() : 0;
+	if (m_waitable)
 	{
-		/* force address into zero page */
-		address = REGISTER_D | MAKE_UINT_8(address);
-		CLOCKS -= (bus_5A22_cycle_burst(address));
+		u8 cached = u8(value);
+		if (replay_access(address, BUS_WRITE, cached)) return;
 	}
-	else
-	{
-		address = ADDRESS_65816(address);
-		CLOCKS -= (bus_5A22_cycle_burst(address));
-	}
+	CLOCKS -= (bus_5A22_cycle_burst(address));
 	u8 data = MAKE_UINT_8(value);
 	if (!m_cached_access.isnull())
 	{
 		int cycles;
-		if (m_cached_access(address, BUS_WRITE, data, cycles))
+		const bool complete = m_cached_access(address, BUS_WRITE, data, cycles);
+		if (m_wait_deferred) BUS_CONTINUATION_RESTORE(m_wait_jump, 1);
+		if (complete)
 		{
 			CLOCKS -= cycles;
+			WAIT_END(address, BUS_WRITE, value);
 			return;
 		}
 	}
@@ -380,6 +434,7 @@ void g65816_device::g65816i_write_8_direct(unsigned address, unsigned value)
 	if (!m_data_hook.isnull())
 		m_data_hook(address, BUS_WRITE, value);
 	BUS_HOOK(address, BUS_WRITE);
+	WAIT_END(address, BUS_WRITE, value);
 }
 
 unsigned g65816_device::g65816i_read_16_normal(unsigned address)
@@ -728,7 +783,7 @@ void g65816_device::g65816i_set_reg_p(unsigned value)
 
 void g65816_device::g65816i_interrupt_hardware(unsigned vector)
 {
-	standard_irq_callback(0, g65816_get_pc());
+	if (!m_wait_restart) standard_irq_callback(0, g65816_get_pc());
 	internal_interrupt(REGISTER_PB | MAKE_UINT_16(REGISTER_PC));
 	internal_read(REGISTER_PB | MAKE_UINT_16(REGISTER_PC));
 	if (FLAG_E)
@@ -781,7 +836,7 @@ void g65816_device::g65816i_interrupt_software(unsigned vector)
 
 void g65816_device::g65816i_interrupt_nmi()
 {
-	standard_irq_callback(G65816_LINE_NMI, g65816_get_pc());
+	if (!m_wait_restart) standard_irq_callback(G65816_LINE_NMI, g65816_get_pc());
 	internal_interrupt(REGISTER_PB | MAKE_UINT_16(REGISTER_PC));
 	internal_read(REGISTER_PB | MAKE_UINT_16(REGISTER_PC));
 	if (FLAG_E)
@@ -863,6 +918,12 @@ unsigned g65816_device::EA_SIY()   {unsigned ptr=EA_S(); unsigned tmp=g65816i_re
 
 void g65816_device::device_reset()
 {
+	m_wait_restart = m_wait_active = m_wait_nmi = false;
+	m_wait_sync_after = false;
+	m_wait_count = m_wait_pos = 0;
+	m_bus_ready = true; m_wait_halted = false; m_wait_idle_cycles = 0;
+	m_wait_redirect_mask = 0;
+	resume(SUSPEND_REASON_RDY | SUSPEND_REASON_SYNC);
 	/* Start the CPU */
 	CPU_STOPPED = 0;
 
@@ -910,10 +971,267 @@ void g65816_device::device_reset()
 /* Execute some instructions */
 void g65816_device::execute_run()
 {
+	if (m_waitable)
+	{
+		execute_waitable();
+		if (m_bus_yield_hook) m_bus_yield_hook();
+		return;
+	}
 	int clocks = m_ICount;
 	m_ICount = clocks - (this->*FTABLE_EXECUTE)(m_ICount);
 }
 
+
+
+// The legacy opcode implementations are atomic C++ functions. Retain the
+// completed prefix and replay only CPU-local arithmetic when RDY is released.
+// Memory, cache, timing, internal-bus and interrupt callbacks run exactly once.
+// This journal is enabled only by a board with an asynchronous wait source.
+void g65816_device::set_bus_ready(bool ready)
+{
+	m_bus_ready = ready;
+	if (ready)
+	{
+		resume(SUSPEND_REASON_RDY);
+	}
+	else if (!m_wait_active && !m_wait_halted)
+	{
+		m_wait_begin_cycles = total_cycles(); m_wait_halted = true;
+		suspend(SUSPEND_REASON_RDY, true);
+	}
+}
+void g65816_device::retry_bus_access()
+{
+	// A posted motherboard transfer may hold RDY before this CPU access has
+	// started. Retain the earlier prefix, but do not journal this access yet.
+	if (m_waitable && m_wait_active && !m_bus_ready) throw bus_wait{};
+}
+void g65816_device::synchronize_bus_access()
+{
+	if (!m_waitable || !m_wait_active) fatalerror("65816 synchronized access outside a continuation");
+	abort_timeslice();
+	throw bus_wait{false};
+}
+void g65816_device::complete_bus_read(u8 data)
+{
+	if (m_wait_restart && m_wait_count && m_wait_type[m_wait_count - 1] != BUS_WRITE)
+		m_wait_data[m_wait_count - 1] = data;
+}
+bool g65816_device::replay_access(u32 address, int type, u8 &data)
+{
+	if (!m_wait_active || m_wait_pos == m_wait_count) return false;
+	const unsigned i = m_wait_pos++;
+	if (m_wait_address[i] != address || m_wait_type[i] != type ||
+		(type == BUS_WRITE && data != m_wait_data[i]))
+		fatalerror("65816 bus continuation diverged at %06x", address);
+	data = m_wait_data[i];
+	if (m_clock_stream) --m_base_clocks;
+	CLOCKS -= m_wait_cycles[i];
+	return true;
+}
+void g65816_device::record_access(u32 address, int type, u8 data, int clocks)
+{
+	if (!m_wait_active) return;
+	if (m_wait_count == m_wait_address.size()) fatalerror("65816 instruction bus journal overflow");
+	const unsigned i = m_wait_count++;
+	m_wait_address[i] = address; m_wait_type[i] = type;
+	m_wait_data[i] = data; m_wait_cycles[i] = clocks;
+	m_wait_pos = m_wait_count;
+	if (m_wait_sync_after || (m_clock_stream && CLOCKS <= 0))
+	{
+		m_wait_sync_after = false;
+		abort_timeslice();
+		if (m_clock_stream) BUS_CONTINUATION_RESTORE(m_wait_jump, 1);
+		throw bus_wait{false};
+	}
+	if (!m_bus_ready)
+	{
+		if (m_clock_stream) BUS_CONTINUATION_RESTORE(m_wait_jump, 2);
+		throw bus_wait{};
+	}
+}
+void g65816_device::internal_cycle(unsigned address, int type, u8 data)
+{
+	// Preserve the owner's bus-accounting order. Models without internal
+	// bus callbacks account those clocks at instruction end; only their
+	// external accesses are scheduler rendezvous points.
+	if (m_internal_hook.isnull()) return;
+	address &= 0xffffff;
+	const u64 cycles = m_waitable ? total_cycles() : 0;
+	if (m_waitable && replay_access(address, type, data)) return;
+	if (!m_internal_hook.isnull()) CLOCKS -= m_internal_hook(address, type, data);
+	if (m_wait_deferred) BUS_CONTINUATION_RESTORE(m_wait_jump, 1);
+	completed_bus_clock();
+	if (m_waitable) record_access(address, type, data, int(total_cycles() - cycles));
+}
+void g65816_device::wait_registers(bool restore)
+{
+	if (restore)
+	{
+		m_a = m_wait_registers[0];
+		m_b = m_wait_registers[1];
+		m_x = m_wait_registers[2];
+		m_y = m_wait_registers[3];
+		m_s = m_wait_registers[4];
+		m_pc = m_wait_registers[5];
+		m_ppc = m_wait_registers[6];
+		m_pb = m_wait_registers[7];
+		m_db = m_wait_registers[8];
+		m_d = m_wait_registers[9];
+		m_flag_e = m_wait_registers[10];
+		m_flag_m = m_wait_registers[11];
+		m_flag_x = m_wait_registers[12];
+		m_flag_n = m_wait_registers[13];
+		m_flag_v = m_wait_registers[14];
+		m_flag_d = m_wait_registers[15];
+		m_flag_i = m_wait_registers[16];
+		m_flag_z = m_wait_registers[17];
+		m_flag_c = m_wait_registers[18];
+		m_ir = m_wait_registers[19];
+		m_irq_delay = m_wait_registers[20];
+		m_stopped = m_wait_registers[21];
+		m_source = m_wait_registers[22];
+		m_destination = m_wait_registers[23];
+		m_fastROM = m_wait_registers[24];
+		m_divider = m_wait_registers[25];
+		g65816i_set_execution_mode(m_flag_e ? 4 : ((m_flag_m >> 4) | (m_flag_x >> 4)));
+	}
+	else
+		m_wait_registers = { m_a, m_b, m_x, m_y, m_s, m_pc, m_ppc, m_pb, m_db, m_d, m_flag_e, m_flag_m, m_flag_x, m_flag_n, m_flag_v, m_flag_d, m_flag_i, m_flag_z, m_flag_c, m_ir, m_irq_delay, m_stopped, m_source, m_destination, m_fastROM, m_divider };
+}
+void g65816_device::suspend_bus_continuation(bool rdy)
+{
+	// A newly scheduled rendezvous may abort the remaining timeslice.
+	// ICount then falls without executing those cycles. Only the elapsed
+	// cycles belong to the prefix replayed after this suspension.
+	m_wait_spent = int(total_cycles() - m_wait_start_cycles);
+	m_wait_restart = true;
+	m_wait_active = m_wait_deferred = false;
+	if (rdy)
+	{
+		m_wait_begin_cycles = total_cycles(); m_wait_halted = true;
+		suspend(SUSPEND_REASON_RDY, true);
+	}
+	else
+		abort_timeslice();
+}
+
+void g65816_device::execute_waitable()
+{
+	// Scheduler suspension changes take effect at its next boundary. Count
+	// held clocks here, after any final suspended slice, not in the callback.
+	if (m_wait_halted && m_bus_ready)
+	{
+		m_wait_idle_cycles += total_cycles() - m_wait_begin_cycles;
+		m_wait_halted = false;
+	}
+	while (CLOCKS > 0)
+	{
+		m_base_clocks = 0;
+		if (!m_wait_restart && !FLAG_I && m_irq_sync && !m_irq_sync(local_time()))
+		{
+			abort_timeslice();
+			return;
+		}
+		if (!m_bus_ready) { suspend(SUSPEND_REASON_RDY, true); return; }
+		if (m_wait_restart)
+		{
+			wait_registers(true);
+			CLOCKS += m_wait_spent; // the saved prefix has already consumed real time
+			m_wait_pos = 0;
+		}
+		else
+		{
+			m_wait_kind = m_wait_nmi ? 2 : (!(CPU_STOPPED & STOP_LEVEL_STOP) && LINE_IRQ && !FLAG_I ? 1 : 0);
+			if (CPU_STOPPED && !m_wait_kind)
+			{
+				if (m_bus_idle_hook) m_bus_idle_hook(true);
+				debugger_wait_hook();
+				// WAI can end on an IRQ generated inside a deferred coprocessor.
+				// Discover that output before consuming this whole idle slice.
+				if (m_irq_sync && !(CPU_STOPPED & STOP_LEVEL_STOP))
+				{
+					const attotime start = local_time();
+					const attotime end = start + cycles_to_attotime(CLOCKS);
+					if (!m_irq_sync(end))
+					{
+						const attotime edge = std::min(end, machine().scheduler().first_timer()->expire());
+						const attotime elapsed = std::max(attotime::zero, edge - start);
+						int clocks = int(attotime_to_cycles(elapsed));
+						// The observer executes at cycle starts. WAI must consume
+						// the idle cycle whose start precedes this timer too. A
+						// floor of zero keeps local time unchanged, so the scheduler
+						// repeatedly grants that same partial cycle and never fires
+						// the timer. The IRQ is sampled on the next CPU cycle, after
+						// the scheduler delivers the timer at its exact timestamp.
+						if (m_clock_stream == CLOCK_STREAM_START && cycles_to_attotime(clocks) < elapsed)
+							++clocks;
+						abort_timeslice();
+						CLOCKS -= clocks;
+						return;
+					}
+				}
+				CLOCKS = 0;
+				return;
+			}
+			if (m_bus_idle_hook) m_bus_idle_hook(false);
+			if (m_wait_kind == 2) m_wait_nmi = false;
+			wait_registers(false);
+			m_wait_count = m_wait_pos = 0;
+		}
+		m_wait_start_cycles = total_cycles();
+		m_wait_active = true;
+		// Board/delegate frames have already returned before a direct hook or
+		// completed-access journal jumps here. Ordinary handlers keep exception
+		// unwinding. Machines without the observer clock stream keep that path.
+		if (m_clock_stream)
+		{
+			switch (BUS_CONTINUATION_SAVE(m_wait_jump))
+			{
+			case 1: suspend_bus_continuation(false); return;
+			case 2: suspend_bus_continuation(true); return;
+			}
+		}
+		try
+		{
+			if (m_wait_kind)
+			{
+				if (m_wait_kind == 2) g65816i_interrupt_nmi();
+				else g65816i_interrupt_hardware(FLAG_E ? VECTOR_IRQ_E : VECTOR_IRQ_N);
+				CPU_STOPPED &= ~STOP_LEVEL_WAI;
+			}
+			else
+			{
+				REGISTER_PPC = REGISTER_PC;
+				if (!m_wait_restart) G65816_CALL_DEBUGGER(REGISTER_PB | REGISTER_PC);
+				REGISTER_PC++;
+				REGISTER_IR = g65816i_read_8_opcode(REGISTER_PB | REGISTER_PPC);
+				(this->*FTABLE_OPCODES[REGISTER_IR])();
+			}
+			if (m_clock_stream)
+			{
+				if (m_base_clocks < 0) fatalerror("65816 observer clocks exceed instruction total at %06x: %d", REGISTER_PB | REGISTER_PPC, m_base_clocks);
+				CLOCKS -= m_base_clocks;
+			}
+			m_wait_restart = m_wait_active = false;
+			if (CPU_STOPPED && m_bus_idle_hook) m_bus_idle_hook(true);
+			// Debugger/Lua PC edits made during a held instruction take effect
+			// at its completion. Replaying the saved prefix must neither lose
+			// the edit nor change the address of an unfinished bus transfer.
+			if (m_wait_redirect_mask)
+			{
+				if (m_wait_redirect_mask & 1) REGISTER_PC = m_wait_redirect_address & 0xffff;
+				if (m_wait_redirect_mask & 2) REGISTER_PB = m_wait_redirect_address & 0xff0000;
+				m_wait_redirect_mask = 0;
+			}
+		}
+		catch (bus_wait const &wait)
+		{
+			suspend_bus_continuation(wait.rdy);
+			return;
+		}
+	}
+}
 
 /* Get the current Program Counter */
 unsigned g65816_device::g65816_get_pc()
@@ -960,6 +1278,12 @@ void g65816_device::g65816_set_reg(int regnum, unsigned value)
 /* Set an interrupt line */
 void g65816_device::execute_set_input(int line, int state)
 {
+	if (m_waitable && line == G65816_LINE_NMI)
+	{
+		if (state != CLEAR_LINE && !m_line_nmi && !(CPU_STOPPED & STOP_LEVEL_STOP)) m_wait_nmi = true;
+		m_line_nmi = (state != CLEAR_LINE);
+		return;
+	}
 	(this->*FTABLE_SET_LINE)(line, state);
 }
 
@@ -1058,6 +1382,15 @@ void g65816_device::device_start()
 	save_item(NAME(m_irq_delay));
 	save_item(NAME(m_stopped));
 	save_item(NAME(m_fastROM));
+	save_item(NAME(m_bus_ready)); save_item(NAME(m_wait_restart));
+	save_item(NAME(m_base_clocks));
+	save_item(NAME(m_wait_halted)); save_item(NAME(m_wait_begin_cycles)); save_item(NAME(m_wait_idle_cycles));
+	save_item(NAME(m_wait_nmi)); save_item(NAME(m_wait_kind));
+	save_item(NAME(m_wait_count)); save_item(NAME(m_wait_pos));
+	save_item(NAME(m_wait_spent)); save_item(NAME(m_wait_registers));
+	save_item(NAME(m_wait_redirect_address)); save_item(NAME(m_wait_redirect_mask));
+	save_item(NAME(m_wait_address)); save_item(NAME(m_wait_type));
+	save_item(NAME(m_wait_data)); save_item(NAME(m_wait_cycles));
 
 	machine().save().register_postload(save_prepost_delegate(FUNC(g65816_device::g65816_restore_state), this));
 
@@ -1085,6 +1418,24 @@ void g65816_device::device_start()
 
 void g65816_device::state_import(const device_state_entry &entry)
 {
+	if (m_wait_restart)
+	{
+		if (entry.index() == STATE_GENPC || entry.index() == STATE_GENPCBASE)
+		{
+			m_wait_redirect_address = m_debugger_temp & 0xffffff;
+			m_wait_redirect_mask = 3;
+		}
+		else if (entry.index() == G65816_PC)
+		{
+			m_wait_redirect_address = (m_wait_redirect_address & 0xff0000) | (m_debugger_temp & 0xffff);
+			m_wait_redirect_mask |= 1;
+		}
+		else if (entry.index() == G65816_PB)
+		{
+			m_wait_redirect_address = (m_wait_redirect_address & 0xffff) | ((m_debugger_temp & 0xff) << 16);
+			m_wait_redirect_mask |= 2;
+		}
+	}
 	switch (entry.index())
 	{
 		case STATE_GENPC:

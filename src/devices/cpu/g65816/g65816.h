@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <csetjmp>
+
 #include "g65816ds.h"
 
 /* ======================================================================== */
@@ -58,7 +60,8 @@ public:
 	// an observer returns only additional clocks caused by the external bus.
 	using internal_hook_delegate = delegate<int (u32 address, int type, u8 data)>;
 	void set_internal_hook(internal_hook_delegate hook) { m_internal_hook = std::move(hook); }
-	using bus_hook_delegate = delegate<int (u32 address, int type, u8 data)>;
+	// The motherboard may drive a read at completion (after bus arbitration).
+	using bus_hook_delegate = delegate<int (u32 address, int type, u8 &data)>;
 	// An optional external cache can satisfy a transfer before the address space is accessed.
 	using memory_hook_delegate = delegate<bool (u32 address, int type, u8 &data)>;
 	void set_memory_hook(memory_hook_delegate hook) { m_memory_hook = std::move(hook); }
@@ -69,6 +72,42 @@ public:
 	// hooks, in one call. A miss must leave the normal access untouched.
 	using cached_access_delegate = delegate<bool (u32 address, int type, u8 &data, int &cycles)>;
 	void set_cached_access(cached_access_delegate hook) { m_cached_access = std::move(hook); }
+	// Opt-in bus continuation for a motherboard that can stretch RDY mid-instruction.
+	// Completed accesses are retained; resuming never repeats their side effects.
+	void enable_bus_wait() { m_waitable = true; }
+	using irq_sync_delegate = std::function<bool (attotime)>;
+	void set_irq_sync(irq_sync_delegate hook) { m_irq_sync = std::move(hook); }
+	void set_bus_ready(bool ready);
+	void complete_bus_read(u8 data);
+	void retry_bus_access();
+	// Yield an unfinished access for scheduler ordering, without a RDY wait.
+	void synchronize_bus_access();
+	// Direct hooks return before the CPU leaves its opcode frame.
+	void defer_bus_access() { if (!m_clock_stream) synchronize_bus_access(); abort_timeslice(); m_wait_deferred = true; }
+	bool bus_access_deferred() const { return m_wait_deferred; }
+	// A bus observer can rendezvous after the current access is journalled.
+	// This yields C++ execution without adding or removing any CPU clocks.
+	void synchronize_after_bus() { m_wait_sync_after = true; }
+	// An observer can yield between accesses of the atomic instruction core.
+	// Distribute the SAME instruction clocks at those accesses so resuming
+	// does not publish a later byte at an already elapsed scheduler time.
+	// Keep WAI accounting and the scheduler's grant convention together.
+	void enable_bus_clock_stream(bool cycle_start = false)
+	{
+		m_clock_stream = cycle_start ? CLOCK_STREAM_START : CLOCK_STREAM_COMPLETION;
+		set_cycle_start_execution(cycle_start);
+	}
+	bool bus_instruction_active() const { return m_clock_stream && (m_wait_active || m_wait_restart); }
+	// The clock stream charges this access's base clock at WAIT_END, after
+	// its handler returns. Shared latches sample at that completion edge,
+	// not at the start of the access or the end of the whole instruction.
+	attotime access_completion_time() const
+	{
+		return local_time() + cycles_to_attotime(m_clock_stream && m_wait_active ? 1 : 0);
+	}
+	void set_bus_idle_hook(std::function<void (bool)> hook) { m_bus_idle_hook = std::move(hook); }
+	void set_bus_yield_hook(std::function<void ()> hook) { m_bus_yield_hook = std::move(hook); }
+	u64 bus_active_cycles() const { return total_cycles() - m_wait_idle_cycles; }
 	// the interrupt mask flag, for a model that slows down while interrupts are off
 	bool irq_masked() const { return m_flag_i != 0; }
 
@@ -223,9 +262,28 @@ protected:
 	unsigned EA_DIY();
 	unsigned EA_DIYW();
 	void indexed_internal(unsigned base, unsigned index);
-	void internal_read(unsigned address) { if (!m_internal_hook.isnull()) m_ICount -= m_internal_hook(address & 0xffffff, BUS_INTERNAL, 0); }
-	void internal_modify(unsigned address, u8 data) { if (!m_internal_hook.isnull()) m_ICount -= m_internal_hook(address & 0xffffff, BUS_INTERNAL_WRITE, data); }
-	void internal_interrupt(unsigned address) { if (!m_internal_hook.isnull()) m_ICount -= m_internal_hook(address & 0xffffff, BUS_INTERRUPT, 0); }
+	void internal_read(unsigned address) { internal_cycle(address, BUS_INTERNAL, 0); }
+	void internal_modify(unsigned address, u8 data) { internal_cycle(address, BUS_INTERNAL_WRITE, data); }
+	void internal_interrupt(unsigned address) { internal_cycle(address, BUS_INTERRUPT, 0); }
+	void internal_cycle(unsigned address, int type, u8 data);
+	void instruction_clocks(int n) { if (m_clock_stream && m_wait_active) m_base_clocks += n; else m_ICount -= n; }
+	void completed_bus_clock() { if (m_clock_stream && m_wait_active) { --m_ICount; --m_base_clocks; } }
+	void stop_instruction_clocks()
+	{
+		if (m_clock_stream && m_wait_active)
+		{
+			// WAI/STP take three instruction clocks. Return to the scheduler
+			// before idle time so an intervening interrupt is not skipped.
+			m_base_clocks += 3 * m_divider;
+			abort_timeslice();
+		}
+		else m_ICount = 0;
+	}
+	enum clock_stream_mode : u8 { CLOCK_STREAM_OFF, CLOCK_STREAM_COMPLETION, CLOCK_STREAM_START };
+	clock_stream_mode m_clock_stream = CLOCK_STREAM_OFF;
+	std::function<void (bool)> m_bus_idle_hook;
+	std::function<void ()> m_bus_yield_hook;
+	int m_base_clocks = 0;
 	unsigned EA_DLIY();
 	unsigned EA_AXI();
 	unsigned EA_S();
@@ -278,6 +336,29 @@ protected:
 	memory_hook_delegate m_memory_hook;
 	data_hook_delegate m_data_hook;
 	cached_access_delegate m_cached_access;
+	irq_sync_delegate m_irq_sync;
+	// Fixed-size instruction journal: at most one instruction or interrupt entry.
+	bool m_waitable = false, m_bus_ready = true, m_wait_active = false;
+	bool m_wait_restart = false, m_wait_nmi = false, m_wait_halted = false;
+	bool m_wait_sync_after = false;
+	u64 m_wait_begin_cycles = 0, m_wait_idle_cycles = 0;
+	u8 m_wait_kind = 0, m_wait_count = 0, m_wait_pos = 0;
+	int m_wait_spent = 0;
+	u64 m_wait_start_cycles = 0;
+	u32 m_wait_redirect_address = 0;
+	u8 m_wait_redirect_mask = 0;
+	std::array<u32, 26> m_wait_registers{};
+	std::array<u32, 32> m_wait_address{};
+	std::array<u8, 32> m_wait_type{}, m_wait_data{};
+	std::array<int, 32> m_wait_cycles{};
+	struct bus_wait { bool rdy = true; };
+	void suspend_bus_continuation(bool rdy);
+	std::jmp_buf m_wait_jump;
+	bool m_wait_deferred = false;
+	bool replay_access(u32 address, int type, u8 &data);
+	void record_access(u32 address, int type, u8 data, int clocks);
+	void wait_registers(bool restore);
+	void execute_waitable();
 	int m_cpu_type;
 	uint8_t m_divider;
 	uint32_t m_debugger_temp;

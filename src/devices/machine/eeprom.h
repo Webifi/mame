@@ -47,6 +47,8 @@ public:
 
 	// status
 	bool ready() const { return machine().time() >= m_completion_time; }
+	// Let shared-pin consumers schedule a READY transition without polling.
+	attotime time_until_ready() const { return std::max(attotime::zero, m_completion_time - machine().time()); }
 
 	// internal read/write without side-effects
 	uint32_t internal_read(offs_t address);

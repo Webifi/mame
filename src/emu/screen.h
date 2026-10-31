@@ -70,6 +70,9 @@ constexpr u32 VIDEO_SELF_RENDER             = 0x0008;
 constexpr u32 VIDEO_ALWAYS_UPDATE           = 0x0080;
 constexpr u32 VIDEO_UPDATE_SCANLINE         = 0x0100;
 constexpr u32 VIDEO_VARIABLE_WIDTH          = 0x0200;
+// Finish raster frames at this screen's own VBLANK, independently of the
+// primary screen. A third buffer separates completed and displayed frames.
+constexpr u32 VIDEO_INDEPENDENT_FRAME       = 0x0400;
 
 
 //**************************************************************************
@@ -199,6 +202,12 @@ public:
 	float xscale() const { return m_xscale; }
 	float yscale() const { return m_yscale; }
 	bool has_screen_update() const { return !m_screen_update_ind16.isnull() || !m_screen_update_rgb32.isnull(); }
+
+	// Output-filter metadata for a bitmap containing woven fields.  This does
+	// not change the bitmap, beam position, refresh rate or emulated timers.
+	void set_output_interlace(bool interlace, int beam_origin = 0) { m_output_interlace = interlace; m_output_beam_origin = beam_origin; }
+	bool output_interlace() const { return m_output_interlace; }
+	unsigned output_field() const { return m_output_interlace && ((vpos() * width() + hpos() + m_output_beam_origin) % (width() * height()) >= width() * height() / 2) ? 1 : 0; }
 
 	// inline configuration helpers
 	void set_type(screen_type_enum type) { assert(!configured()); m_type = type; }
@@ -376,9 +385,12 @@ public:
 	device_palette_interface &palette() const { assert(m_palette != nullptr); return *m_palette; }
 	bool has_palette() const { return m_palette != nullptr; }
 	screen_bitmap &curbitmap() { return m_bitmap[m_curtexture]; }
+	bool independent_frame() const { return m_video_attributes & VIDEO_INDEPENDENT_FRAME; }
 
 	// dynamic configuration
-	void configure(int width, int height, const rectangle &visarea, attoseconds_t frame_period);
+	// coordinate_phase rebases the visible raster relative to its device
+	// counters without rounding fractional pixel time. Ordinary callers use zero.
+	void configure(int width, int height, const rectangle &visarea, attoseconds_t frame_period, attotime coordinate_phase = attotime::zero);
 	void reset_origin(int beamy = 0, int beamx = 0);
 	void set_visible_area(int min_x, int max_x, int min_y, int max_y);
 	void set_brightness(u8 brightness) { m_brightness = brightness; }
@@ -438,6 +450,14 @@ private:
 	// internal helpers
 	void set_container(render_container &container) { m_container = &container; }
 	void realloc_screen_bitmaps();
+	unsigned bitmap_count() const { return independent_frame() ? 3 : 2; }
+	unsigned read_bitmap_index() const
+	{
+		// During active display expose the partial raster; during blanking expose
+		// the frame just completed, even if the primary screen has published it.
+		return independent_frame() && vblank() ? (m_frame_pending ? m_completed_bitmap : m_curtexture) : m_curbitmap;
+	}
+	void complete_frame();
 	TIMER_CALLBACK_MEMBER(vblank_begin);
 	TIMER_CALLBACK_MEMBER(vblank_end);
 	TIMER_CALLBACK_MEMBER(first_scanline_tick);
@@ -452,6 +472,9 @@ private:
 
 	// inline configuration data
 	screen_type_enum    m_type;                     // type of screen
+	bool               m_output_interlace = false; // presentation only; derived from video mode
+	int                m_output_beam_origin = 0; // pixel offset to the field counter's origin
+	attotime           m_coordinate_phase = attotime::zero;
 	int                 m_orientation;              // orientation flags combined with system flags
 	std::pair<unsigned, unsigned> m_phys_aspect;    // physical aspect ratio
 	bool                m_oldstyle_vblank_supplied; // set_vblank_time call used
@@ -479,13 +502,15 @@ private:
 
 	// textures and bitmaps
 	texture_format      m_texformat;                // texture format
-	render_texture *    m_texture[2];               // 2x textures for the screen bitmap
-	screen_bitmap       m_bitmap[2];                // 2x bitmaps for rendering
+	render_texture *    m_texture[3];               // third buffer used only for independent frames
+	screen_bitmap       m_bitmap[3];                // drawing, displayed, optionally completed
 	std::vector<bitmap_t *> m_scan_bitmaps[2];      // 2x bitmaps for each individual scanline
 	bitmap_ind8         m_priority;                 // priority bitmap
 	bitmap_ind64        m_burnin;                   // burn-in bitmap
 	u8                  m_curbitmap;                // current bitmap index
 	u8                  m_curtexture;               // current texture index
+	u8                  m_completed_bitmap = 2;      // independent frame awaiting presentation
+	bool                m_frame_pending = false;
 	bool                m_changed;                  // has this bitmap changed?
 	attotime            m_last_partial_reset;       // last time partial updates were reset
 	s32                 m_last_partial_scan;        // scanline of last partial update

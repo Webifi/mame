@@ -28,6 +28,8 @@ constexpr u32 SUSPEND_REASON_TRIGGER    = 0x0008;   // waiting for a trigger
 constexpr u32 SUSPEND_REASON_DISABLE    = 0x0010;   // disabled (due to disable flag)
 constexpr u32 SUSPEND_REASON_TIMESLICE  = 0x0020;   // waiting for the next timeslice
 constexpr u32 SUSPEND_REASON_CLOCK      = 0x0040;   // currently not clocked
+constexpr u32 SUSPEND_REASON_RDY        = 0x0080;   // external bus ready, independent of DMA/HALT
+constexpr u32 SUSPEND_REASON_SYNC       = 0x0100;   // scheduler rendezvous, no hardware clocks
 constexpr u32 SUSPEND_ANY_REASON        = ~0;       // all of the above
 
 
@@ -107,13 +109,17 @@ public:
 	u64 cycles_to_clocks(u64 cycles) const { return execute_cycles_to_clocks(cycles); }
 	u32 min_cycles() const { return execute_min_cycles(); }
 	u32 max_cycles() const { return execute_max_cycles(); }
-	attotime cycles_to_attotime(u64 cycles) const { return device().clocks_to_attotime(cycles_to_clocks(cycles)); }
-	u64 attotime_to_cycles(const attotime &duration) const { return clocks_to_cycles(device().attotime_to_clocks(duration)); }
+	attotime cycles_to_attotime(u64 cycles) const { return execute_cycles_to_attotime(cycles); }
+	u64 attotime_to_cycles(const attotime &duration) const { return execute_attotime_to_cycles(duration); }
 	u32 default_irq_vector(int linenum) const { return execute_default_irq_vector(linenum); }
 	bool input_edge_triggered(int linenum) const { return execute_input_edge_triggered(linenum); }
 
 	// inline configuration helpers
 	void set_disable() { m_disabled = true; }
+	// A board with timestamped inputs can advance this CPU at its observation
+	// barriers instead of at every machine scheduling slice.
+	void set_deferred_execution(bool deferred = true) { m_deferred_execution = deferred; }
+	bool deferred_execution() const { return m_deferred_execution; }
 
 	template <typename... T> void set_vblank_int(const char *tag, T &&... args)
 	{
@@ -154,6 +160,10 @@ public:
 	// execution management
 	device_scheduler &scheduler() const noexcept { assert(m_scheduler != nullptr); return *m_scheduler; }
 	bool executing() const noexcept { return scheduler().currently_executing() == this; }
+	// Opt-in for a bus core that yields after each access. Prepare a clock
+	// at its start so timers inside that clock can see its pins. The clock
+	// is charged once; local_time may lead the scheduler by at most one.
+	void set_cycle_start_execution(bool enable) { m_cycle_start_execution = enable; }
 	s32 cycles_remaining() const noexcept { return executing() ? *m_icountptr : 0; } // cycles remaining in this timeslice
 	void eat_cycles(int cycles) noexcept { if (executing()) *m_icountptr = (cycles > *m_icountptr) ? 0 : (*m_icountptr - cycles); }
 	void adjust_icount(int delta) noexcept { if (executing()) *m_icountptr += delta; }
@@ -194,9 +204,18 @@ public:
 	device_execute_interface &execute() { return *this; }
 
 protected:
+	// Finish elapsed clocks at their old rate before a deferred CPU changes
+	// its divider in an instruction handler. The current instruction's tail
+	// is then accounted at the new rate by the normal execution return path.
+	void prepare_deferred_clock_change();
+
 	// clock and cycle information getters
 	virtual u64 execute_clocks_to_cycles(u64 clocks) const noexcept;
 	virtual u64 execute_cycles_to_clocks(u64 cycles) const noexcept;
+	// Cores with sub-oscillator execution edges can preserve their exact
+	// tick period without rounding each edge to a whole input clock.
+	virtual attotime execute_cycles_to_attotime(u64 cycles) const { return device().clocks_to_attotime(cycles_to_clocks(cycles)); }
+	virtual u64 execute_attotime_to_cycles(const attotime &duration) const { return clocks_to_cycles(device().attotime_to_clocks(duration)); }
 	virtual u32 execute_min_cycles() const noexcept;
 	virtual u32 execute_max_cycles() const noexcept;
 
@@ -291,6 +310,7 @@ private:
 
 	// configuration
 	bool                    m_disabled;                 // disabled from executing?
+	bool                    m_deferred_execution = false;
 	device_interrupt_delegate m_vblank_interrupt;       // for interrupts tied to VBLANK
 	const char *            m_vblank_interrupt_screen;  // the screen that causes the VBLANK interrupt
 	device_interrupt_delegate m_timed_interrupt;        // for interrupts not tied to VBLANK
@@ -313,6 +333,7 @@ private:
 	int                     m_cycles_stolen;            // number of cycles we artificially stole
 
 	// suspend states
+	bool                    m_cycle_start_execution = false;
 	u32                     m_suspend;                  // suspend reason mask (0 = not suspended)
 	u32                     m_nextsuspend;              // pending suspend reason mask
 	u8                      m_eatcycles;                // true if we eat cycles while suspended

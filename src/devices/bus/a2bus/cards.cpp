@@ -67,6 +67,7 @@
 #include "ramcard16k.h"
 #include "romcard.h"
 #include "sider.h"
+#include "secondsight.h"
 #include "snesmax.h"
 #include "softcard3.h"
 #include "ssbapple.h"
@@ -263,6 +264,8 @@ void apple2e_cards(device_slot_interface &device)
 
 void apple2gs_cards(device_slot_interface &device)
 {
+	device.option_add("secondsight", A2BUS_SECONDSIGHT);
+
 	device.option_add("diskiing", A2BUS_DISKIING);             // Disk II Controller Card, cycle-accurate version
 	device.option_add("mockingboard", A2BUS_MOCKINGBOARD);     // Sweet Micro Systems Mockingboard
 	device.option_add("phasor", A2BUS_PHASOR);                 // Applied Engineering Phasor

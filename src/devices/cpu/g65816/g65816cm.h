@@ -171,9 +171,9 @@
 #define CLK_W_S         2
 #define CLK_W_SIY       5
 
-#define CLK(A)          CLOCKS -= ((A)*(m_divider))
+#define CLK(A)          instruction_clocks((A)*(m_divider))
 #define CLK_BUS(A)      CLOCKS -= A
-#define USE_ALL_CLKS()  CLOCKS = 0
+#define USE_ALL_CLKS()  stop_instruction_clocks()
 
 
 /* ======================================================================== */

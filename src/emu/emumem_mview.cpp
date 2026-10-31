@@ -229,6 +229,7 @@ public:
 	template<int AccessWidth, typename READ>
 	void install_read_handler_helper(offs_t addrstart, offs_t addrend, offs_t addrmask, offs_t addrmirror, offs_t addrselect, u64 unitmask, int cswidth, u16 flags, const READ &handler_r)
 	{
+		address_space::map_update update(*m_view.m_space);
 		if constexpr (Width < AccessWidth) {
 			fatalerror("install_read_handler: cannot install a %d-wide handler in a %d-wide bus", 8 << AccessWidth, 8 << Width);
 		} else {
@@ -265,6 +266,7 @@ public:
 	void install_write_handler_helper(offs_t addrstart, offs_t addrend, offs_t addrmask, offs_t addrmirror, offs_t addrselect, u64 unitmask, int cswidth, u16 flags,
 								 const WRITE &handler_w)
 	{
+		address_space::map_update update(*m_view.m_space);
 		if constexpr (Width < AccessWidth) {
 			fatalerror("install_write_handler: cannot install a %d-wide handler in a %d-wide bus", 8 << AccessWidth, 8 << Width);
 		} else {
@@ -680,6 +682,7 @@ void memory_view::memory_view_entry::check_range_address(const char *function, o
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_ram_generic(offs_t addrstart, offs_t addrend, offs_t addrmirror, u16 flags, read_or_write readorwrite, void *baseptr)
 {
+	address_space::map_update update(*m_view.m_space);
 	VPRINTF("memory_view::install_ram_generic(%s-%s mirror=%s, %s, %p)\n",
 			m_addrchars, addrstart, m_addrchars, addrend,
 			m_addrchars, addrmirror,
@@ -713,6 +716,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::unmap_generic(offs_t addrstart, offs_t addrend, offs_t addrmirror, u16 flags, read_or_write readorwrite, bool quiet)
 {
+	address_space::map_update update(*m_view.m_space);
 	VPRINTF("memory_view::unmap(%*x-%*x mirror=%*x, %s, %s)\n",
 			m_addrchars, addrstart, m_addrchars, addrend,
 			m_addrchars, addrmirror,
@@ -754,6 +758,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_view(offs_t addrstart, offs_t addrend, offs_t addrmirror, memory_view &view)
 {
+	address_space::map_update update(*m_view.m_space);
 	offs_t nstart, nend, nmask, nmirror;
 	check_range_optimize_mirror("install_view", addrstart, addrend, addrmirror, nstart, nend, nmask, nmirror);
 
@@ -768,6 +773,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> memory_passthrough_handler memory_view_entry_specific<Level, Width, AddrShift>::install_read_tap(offs_t addrstart, offs_t addrend, offs_t addrmirror, std::string name, std::function<void (offs_t offset, uX &data, uX mem_mask)> tap, memory_passthrough_handler *mph)
 {
+	address_space::map_update update(*m_view.m_space);
 	offs_t nstart, nend, nmask, nmirror;
 	check_range_optimize_mirror("install_read_tap", addrstart, addrend, addrmirror, nstart, nend, nmask, nmirror);
 	auto impl = m_view.m_space->make_mph(mph);
@@ -786,6 +792,7 @@ template<int Level, int Width, int AddrShift> memory_passthrough_handler memory_
 
 template<int Level, int Width, int AddrShift> memory_passthrough_handler memory_view_entry_specific<Level, Width, AddrShift>::install_write_tap(offs_t addrstart, offs_t addrend, offs_t addrmirror, std::string name, std::function<void (offs_t offset, uX &data, uX mem_mask)> tap, memory_passthrough_handler *mph)
 {
+	address_space::map_update update(*m_view.m_space);
 	offs_t nstart, nend, nmask, nmirror;
 	check_range_optimize_mirror("install_write_tap", addrstart, addrend, addrmirror, nstart, nend, nmask, nmirror);
 	auto impl = m_view.m_space->make_mph(mph);
@@ -804,6 +811,7 @@ template<int Level, int Width, int AddrShift> memory_passthrough_handler memory_
 
 template<int Level, int Width, int AddrShift> memory_passthrough_handler memory_view_entry_specific<Level, Width, AddrShift>::install_readwrite_tap(offs_t addrstart, offs_t addrend, offs_t addrmirror, std::string name, std::function<void (offs_t offset, uX &data, uX mem_mask)> tapr, std::function<void (offs_t offset, uX &data, uX mem_mask)> tapw, memory_passthrough_handler *mph)
 {
+	address_space::map_update update(*m_view.m_space);
 	offs_t nstart, nend, nmask, nmirror;
 	check_range_optimize_mirror("install_readwrite_tap", addrstart, addrend, addrmirror, nstart, nend, nmask, nmirror);
 	auto impl = m_view.m_space->make_mph(mph);
@@ -826,6 +834,7 @@ template<int Level, int Width, int AddrShift> memory_passthrough_handler memory_
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_device_delegate(offs_t addrstart, offs_t addrend, device_t &device, address_map_constructor &delegate, u64 unitmask, int cswidth, u16 flags)
 {
+	address_space::map_update update(*m_view.m_space);
 	check_range_address("install_device_delegate", addrstart, addrend);
 
 	r()->select_u(m_id);
@@ -839,6 +848,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_readwrite_port(offs_t addrstart, offs_t addrend, offs_t addrmirror, u16 flags, std::string rtag, std::string wtag)
 {
+	address_space::map_update update(*m_view.m_space);
 	VPRINTF("memory_view::install_readwrite_port(%*x-%*x mirror=%*x, read=\"%s\" / write=\"%s\")\n",
 			m_addrchars, addrstart, m_addrchars, addrend,
 			m_addrchars, addrmirror,
@@ -880,6 +890,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_read_before_time(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_time_delegate ws)
 {
+	address_space::map_update update(*m_view.m_space);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_view.m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_view.m_device.tag());
@@ -902,6 +913,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_read_before_delay(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_delay_delegate ws)
 {
+	address_space::map_update update(*m_view.m_space);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_view.m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_view.m_device.tag());
@@ -924,6 +936,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_read_after_delay(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_delay_delegate ws)
 {
+	address_space::map_update update(*m_view.m_space);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_view.m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_view.m_device.tag());
@@ -948,6 +961,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_write_before_time(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_time_delegate ws)
 {
+	address_space::map_update update(*m_view.m_space);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_view.m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_view.m_device.tag());
@@ -970,6 +984,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_write_before_delay(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_delay_delegate ws)
 {
+	address_space::map_update update(*m_view.m_space);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_view.m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_view.m_device.tag());
@@ -992,6 +1007,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_write_after_delay(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_delay_delegate ws)
 {
+	address_space::map_update update(*m_view.m_space);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_view.m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_view.m_device.tag());
@@ -1015,6 +1031,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_readwrite_before_time(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_time_delegate ws)
 {
+	address_space::map_update update(*m_view.m_space);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_view.m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_view.m_device.tag());
@@ -1039,6 +1056,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_readwrite_before_delay(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_delay_delegate ws)
 {
+	address_space::map_update update(*m_view.m_space);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_view.m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_view.m_device.tag());
@@ -1063,6 +1081,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_readwrite_after_delay(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_delay_delegate ws)
 {
+	address_space::map_update update(*m_view.m_space);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_view.m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_view.m_device.tag());
@@ -1088,6 +1107,7 @@ template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Le
 
 template<int Level, int Width, int AddrShift> void memory_view_entry_specific<Level, Width, AddrShift>::install_bank_generic(offs_t addrstart, offs_t addrend, offs_t addrmirror, u16 flags, memory_bank *rbank, memory_bank *wbank)
 {
+	address_space::map_update update(*m_view.m_space);
 	VPRINTF("memory_view::install_readwrite_bank(%*x-%*x mirror=%*x, read=\"%s\" / write=\"%s\")\n",
 			m_addrchars, addrstart, m_addrchars, addrend,
 			m_addrchars, addrmirror,

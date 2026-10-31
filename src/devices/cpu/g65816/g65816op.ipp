@@ -1529,7 +1529,7 @@
 #define OP_WAI()                                                            \
 			internal_read(REGISTER_PB | MAKE_UINT_16(REGISTER_PC)); \
 			internal_read(REGISTER_PB | MAKE_UINT_16(REGISTER_PC)); \
-			USE_ALL_CLKS();                                                 \
+			if (m_irq_sync && !m_clock_stream) { CLK(3); } else { USE_ALL_CLKS(); }                                                 \
 			CPU_STOPPED |= STOP_LEVEL_WAI
 
 /* G65816  William D. Mensch, JR. (65816 designer) - future expansion */

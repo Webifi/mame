@@ -73,8 +73,8 @@ OP(op,3b) { _SP--;                                                    } /* DEC  
 OP(op,3c) { _A = INC(_A);                                         } /* INC  A           */
 OP(op,3d) { _A = DEC(_A);                                         } /* DEC  A           */
 OP(op,3e) { _A = ARG();                                           } /* LD   A,n         */
-OP(op,3f) { _F = ((_F&(SF|ZF|PF|CF))|((_F&CF)<<4)|(_A&(YF|XF)))^CF; } /* CCF              */
-//OP(op,3f) { _F = ((_F & ~(HF|NF)) | ((_F & CF)<<4)) ^ CF;           } /* CCF              */
+// UM0050 p235 and HD64180 p167: CCF clears H as well as N.
+OP(op,3f) { _F = ((_F & (SF | ZF | PF | CF)) | (_A & (YF | XF))) ^ CF; } /* CCF */
 
 OP(op,40) {                                                         } /* LD   B,B         */
 OP(op,41) { _B = _C;                                                } /* LD   B,C         */
@@ -232,7 +232,7 @@ OP(op,c7) { RST(0x00);                                              } /* RST  0 
 OP(op,c8) { RET_COND( _F & ZF, 0xc8 );                                } /* RET  Z           */
 OP(op,c9) { POP(PC);                                              } /* RET              */
 OP(op,ca) { JP_COND( _F & ZF );                                   } /* JP   Z,a         */
-OP(op,cb) { m_R++; m_extra_cycles += exec_cb(ROP());                                   } /* **** CB xx       */
+OP(op,cb) { m_extra_cycles += exec_cb(ROP());                                   } /* **** CB xx       */
 OP(op,cc) { CALL_COND( _F & ZF, 0xcc );                           } /* CALL Z,a         */
 OP(op,cd) { CALL();                                                 } /* CALL a           */
 OP(op,ce) { ADC(ARG());                                             } /* ADC  A,n         */
@@ -252,7 +252,7 @@ OP(op,d9) { EXX;                                                    } /* EXX    
 OP(op,da) { JP_COND( _F & CF );                                   } /* JP   C,a         */
 OP(op,db) { unsigned n = ARG() | (_A << 8); _A = IN(n );         } /* IN   A,(n)       */
 OP(op,dc) { CALL_COND( _F & CF, 0xdc );                           } /* CALL C,a         */
-OP(op,dd) { m_R++; m_extra_cycles += exec_dd(ROP());                                   } /* **** DD xx       */
+OP(op,dd) { m_extra_cycles += exec_dd(ROP());                                   } /* **** DD xx       */
 OP(op,de) { SBC(ARG());                                             } /* SBC  A,n         */
 OP(op,df) { RST(0x18);                                              } /* RST  3           */
 
@@ -270,14 +270,14 @@ OP(op,e9) { _PC = _HL;                                              } /* JP   (H
 OP(op,ea) { JP_COND( _F & PF );                                   } /* JP   PE,a        */
 OP(op,eb) { EX_DE_HL;                                               } /* EX   DE,HL       */
 OP(op,ec) { CALL_COND( _F & PF, 0xec );                           } /* CALL PE,a        */
-OP(op,ed) { m_R++; m_extra_cycles += exec_ed(ROP());                                   } /* **** ED xx       */
+OP(op,ed) { m_extra_cycles += exec_ed(ROP());                                   } /* **** ED xx       */
 OP(op,ee) { XOR(ARG());                                             } /* XOR  n           */
 OP(op,ef) { RST(0x28);                                              } /* RST  5           */
 
 OP(op,f0) { RET_COND( !(_F & SF), 0xf0 );                         } /* RET  P           */
 OP(op,f1) { POP(AF);                                              } /* POP  AF          */
 OP(op,f2) { JP_COND( !(_F & SF) );                                    } /* JP   P,a         */
-OP(op,f3) { m_IFF1 = m_IFF2 = 0;                                        } /* DI               */
+OP(op,f3) { m_IFF1 = m_IFF2 = 0; m_after_EI = 1;                                        } /* DI               */
 OP(op,f4) { CALL_COND( !(_F & SF), 0xf4 );                            } /* CALL P,a         */
 OP(op,f5) { PUSH( AF );                                           } /* PUSH AF          */
 OP(op,f6) { OR(ARG());                                              } /* OR   n           */
@@ -288,7 +288,7 @@ OP(op,f9) { _SP = _HL;                                              } /* LD   SP
 OP(op,fa) { JP_COND(_F & SF);                                     } /* JP   M,a         */
 OP(op,fb) { EI;                                                     } /* EI               */
 OP(op,fc) { CALL_COND( _F & SF, 0xfc );                           } /* CALL M,a         */
-OP(op,fd) { m_R++; m_extra_cycles += exec_fd(ROP());                                   } /* **** FD xx       */
+OP(op,fd) { m_extra_cycles += exec_fd(ROP());                                   } /* **** FD xx       */
 OP(op,fe) { CP(ARG());                                              } /* CP   n           */
 OP(op,ff) { RST(0x38);                                              } /* RST  7           */
 
@@ -297,6 +297,9 @@ int z180_device::take_interrupt(int irq)
 {
 	int irq_vector;
 	int cycles = 0;
+	m_extra_cycles = 0;
+	int const iwi = (m_dcntl >> 4) & 3;
+	int const ack_extra = iwi ? iwi + 1 : 0; // UM0050 Table 4: 2,4,5,6 waits
 
 	/* Check if processor was halted */
 	LEAVE_HALT();
@@ -320,7 +323,7 @@ int z180_device::take_interrupt(int irq)
 			RM16(irq_vector, &m_PC );
 			LOG("Z180 IM2 [$%04x] = $%04x\n", irq_vector, _PCD);
 			/* CALL opcode timing */
-			cycles += m_cc[Z180_TABLE_op][0xcd];
+			cycles += 18 + ack_extra;
 		}
 		else
 		/* Interrupt mode 1. RST 38h */
@@ -330,7 +333,7 @@ int z180_device::take_interrupt(int irq)
 			PUSH( PC );
 			_PCD = 0x0038;
 			/* RST $38 + 'interrupt latency' cycles */
-			cycles += m_cc[Z180_TABLE_op][0xff] - m_cc[Z180_TABLE_ex][0xff];
+			cycles += 11 + ack_extra;
 		}
 		else
 		{
@@ -368,8 +371,8 @@ int z180_device::take_interrupt(int irq)
 		RM16(irq_vector, &m_PC );
 		LOG("Z180 INT%d [$%04x] = $%04x\n", irq, irq_vector, _PCD);
 		/* CALL opcode timing */
-		cycles += m_cc[Z180_TABLE_op][0xcd];
+		cycles += 18; // UM0050 Figure 43; IWI does not affect this acknowledge.
 	}
 
-	return cycles;
+	return cycles + m_extra_cycles;
 }

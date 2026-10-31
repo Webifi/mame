@@ -105,14 +105,10 @@ void sdl_osd_interface::update(bool skip_redraw)
 {
 	osd_common_t::update(skip_redraw);
 
-	// if we're not skipping this redraw, update all windows
-	if (!skip_redraw)
-	{
-//      profiler_mark(PROFILER_BLIT);
-		for (auto const &window : osd_common_t::window_list())
+	// Output field effects must animate even when the source bitmap is static.
+	for (auto const &window : osd_common_t::window_list())
+		if (!skip_redraw || (window->has_renderer() && window->renderer().has_flags(osd_renderer::FLAG_NEEDS_FRAME_UPDATE)))
 			window->update();
-//      profiler_mark(PROFILER_END);
-	}
 
 	// if we're running, disable some parts of the debugger
 	if ((machine().debug_flags & DEBUG_FLAG_OSD_ENABLED) != 0)

@@ -17,6 +17,8 @@
 #ifndef MAME_EMU_MACHINE_H
 #define MAME_EMU_MACHINE_H
 
+#include "sideeffects.h"
+
 #include <functional>
 
 #include <ctime>
@@ -118,7 +120,12 @@ public:
 	const game_driver &system() const { return m_system; }
 	osd_interface &osd() const;
 	machine_manager &manager() const { return m_manager; }
-	device_scheduler &scheduler() { return m_scheduler; }
+	device_scheduler &scheduler() { return m_private_domains.load(std::memory_order_relaxed) ? device_scheduler::for_thread(m_scheduler) : m_scheduler; }
+	void private_domain_change(bool added)
+	{
+		if (added) m_private_domains.fetch_add(1, std::memory_order_relaxed);
+		else { [[maybe_unused]] auto old = m_private_domains.fetch_sub(1, std::memory_order_relaxed); assert(old); }
+	}
 	save_manager &save() { return m_save; }
 	memory_manager &memory() { return m_memory; }
 	ioport_manager &ioport() { return m_ioport; }
@@ -151,11 +158,15 @@ public:
 	// RAII-based side effect disable
 	// NOP-ed when passed false, to make it more easily conditional
 	side_effects_disabler disable_side_effects(bool disable_se = true) { return side_effects_disabler(this, disable_se); }
-	bool side_effects_disabled() const { return m_side_effects_disabled != 0; }
+	bool side_effects_disabled() const
+	{
+		if (!m_private_domains.load(std::memory_order_relaxed)) return m_side_effects_disabled != 0;
+		return side_effects_scopes::any() && device_scheduler::side_effects_count(*this, m_side_effects_disabled) != 0;
+	}
 
 	// additional helpers
 	emu_options &options() const { return m_config.options(); }
-	attotime time() const noexcept { return m_scheduler.time(); }
+	attotime time() const noexcept { return (m_private_domains.load(std::memory_order_relaxed) ? device_scheduler::for_thread(m_scheduler) : m_scheduler).time(); }
 	bool scheduled_event_pending() const { return m_exit_pending || m_hard_reset_pending; }
 	bool allow_logging() const { return !m_logerror_list.empty(); }
 
@@ -236,8 +247,8 @@ private:
 		side_effects_disabler(side_effects_disabler &&) = default;
 	};
 
-	void disable_side_effects_count() { m_side_effects_disabled++; }
-	void enable_side_effects_count()  { m_side_effects_disabled--; }
+	void disable_side_effects_count() { side_effects_scopes::enter(m_private_domains.load(std::memory_order_relaxed) ? device_scheduler::side_effects_count(*this, m_side_effects_disabled) : m_side_effects_disabled); }
+	void enable_side_effects_count() { side_effects_scopes::leave(m_private_domains.load(std::memory_order_relaxed) ? device_scheduler::side_effects_count(*this, m_side_effects_disabled) : m_side_effects_disabled); }
 
 	// internal helpers
 	template <typename T> struct is_null { template <typename U> static bool value(U &&x) { return false; } };
@@ -341,9 +352,11 @@ private:
 	ioport_manager          m_ioport;               // I/O port manager
 	parameters_manager      m_parameters;           // parameters manager
 	device_scheduler        m_scheduler;            // scheduler object
+	std::atomic<unsigned>   m_private_domains{0};
 
 	// string formatting buffer
 	mutable util::ovectorstream m_string_buffer;
+	mutable std::recursive_mutex m_log_mutex;
 
 #if defined(__EMSCRIPTEN__)
 private:
@@ -396,6 +409,7 @@ inline void running_machine::logerror(Format &&fmt, Params &&... args) const
 	// process only if there is a target
 	if (allow_logging())
 	{
+		std::lock_guard lock(m_log_mutex);
 		auto profile = g_profiler.start(PROFILER_LOGERROR);
 
 		// dump to the buffer

@@ -26,6 +26,9 @@
 #include "emu.h"
 #include "es5503.h"
 
+#define LOG_CONTROL (1U << 1)
+#include "logmacro.h"
+
 DEFINE_DEVICE_TYPE(ES5503, es5503_device, "es5503", "Ensoniq ES5503")
 
 namespace {
@@ -72,7 +75,7 @@ es5503_device::es5503_device(const machine_config &mconfig, const char *tag, dev
 void es5503_device::device_start()
 {
 	assert(m_output_channels > 0 && m_output_channels <= 16 && !(m_output_channels & (m_output_channels - 1)));
-	m_input_clock = clock();
+	configure_clock();
 	// Audio reconstruction is independent of the oscillator-enable register.
 	m_stream = stream_alloc(0, m_output_channels, AUDIO_RATE);
 	m_audio_buffer.resize(AUDIO_RATE * m_output_channels);
@@ -93,6 +96,7 @@ void es5503_device::device_start()
 	save_pointer(STRUCT_MEMBER(m_oscillators, accumulator), 32);
 	save_pointer(STRUCT_MEMBER(m_oscillators, irqpend), 32);
 	save_item(NAME(m_input_clock));
+	save_item(NAME(m_clock_epoch));
 	save_item(NAME(m_oscsenabled));
 	save_item(NAME(m_scan_enabled));
 	save_item(NAME(m_slot));
@@ -137,9 +141,10 @@ void es5503_device::device_reset()
 	// state; it is not an emulation of a timed assertion of the RES pin.
 	for (auto &o : m_oscillators)
 		o = oscillator{};
-	m_input_clock = clock();
+	configure_clock();
 	m_tick = machine().time().as_ticks(m_input_clock);
-	m_next_tick = m_tick + 4;
+	m_clock_epoch = ((m_tick + m_clock_divider - 1) / m_clock_divider) * m_clock_divider;
+	m_next_tick = m_clock_epoch + 4 * uint64_t(m_clock_divider) + m_e_fall_delay;
 	m_slot = 0;
 	m_phase = ADDRESS;
 	m_oscsenabled = m_scan_enabled = 1;
@@ -168,20 +173,22 @@ void es5503_device::device_reset()
 	m_filter_sum = 0;
 	m_filter_tick = m_tick;
 	m_filter_sample = 0;
+
 	schedule_wakeup();
 }
 
 void es5503_device::device_clock_changed()
 {
-	if (!m_stream)
+	if (!m_stream || m_clock_numerator)
 		return;
 	synchronize();
 	if (m_filter_enabled)
 		filter_to(m_tick);
 	const uint64_t left = m_next_tick - m_tick;
 	const uint64_t adc_left = m_adc_tick ? m_adc_tick - m_tick : 0;
-	m_input_clock = clock();
+	configure_clock();
 	m_tick = machine().time().as_ticks(m_input_clock);
+	m_clock_epoch = m_tick;
 	m_next_tick = m_tick + left;
 	m_adc_tick = adc_left ? m_tick + adc_left : 0;
 	m_audio_end = m_stream->sample_to_time(m_audio_index).as_ticks(m_input_clock);
@@ -189,6 +196,73 @@ void es5503_device::device_clock_changed()
 	if (m_filter_mode_count)
 		m_output_filter.configure(m_input_clock, AUDIO_RATE, m_filter_poles, m_filter_gains, m_filter_mode_count);
 	schedule_wakeup();
+}
+
+void es5503_device::configure_clock()
+{
+	m_input_clock = m_clock_numerator ? m_clock_numerator : clock();
+	// attotime::as_ticks multiplies the fractional second using saturating
+	// attotime arithmetic. A finer timebase above 1 GHz can saturate there.
+	assert(m_input_clock && m_input_clock <= 1'000'000'000 && m_clock_divider);
+	// Ensoniq p.21 typical CLK-to-pin delays. Keep nanoseconds fixed;
+	// the divider changes clock periods, not silicon propagation.
+	auto delay = [this](unsigned ns) { return uint32_t((uint64_t(m_input_clock) * ns + 500'000'000) / 1'000'000'000); };
+	m_e_rise_delay = m_clock_numerator ? delay(50) : 0;
+	m_e_fall_delay = m_clock_numerator ? delay(63) : 0;
+	m_q_rise_delay = m_clock_numerator ? delay(60) : 0;
+}
+
+attotime es5503_device::clock_time(uint64_t tick) const
+{
+	// from_ticks multiplies by a truncated attosecond period. At a fine
+	// timebase that can put an event several ticks before its intended edge.
+	// Divide the complete fraction, rounding up by at most one attosecond.
+	const uint64_t rem = tick % m_input_clock;
+	const uint64_t second = 1'000'000'000'000'000'000ULL;
+	const uint64_t fraction = rem * (second / m_input_clock) +
+		(rem * (second % m_input_clock) + m_input_clock - 1) / m_input_clock;
+	return attotime(tick / m_input_clock, fraction);
+}
+
+es5503_device::host_window es5503_device::host_cycle(attotime earliest_rise) const
+{
+	uint64_t tick = earliest_rise.as_ticks(m_input_clock);
+	if (clock_time(tick) < earliest_rise)
+		++tick;
+	const uint64_t origin = m_clock_epoch + m_e_rise_delay;
+	const uint64_t period = 8 * uint64_t(m_clock_divider);
+	const uint64_t rise = origin + (tick > origin ? ((tick - origin + period - 1) / period) * period : 0);
+	return { rise, rise + 4 * uint64_t(m_clock_divider) + m_e_fall_delay - m_e_rise_delay };
+}
+
+void es5503_device::write_latched(offs_t offset, u8 data, uint64_t fall)
+{
+	assert(fall >= m_tick);
+	advance_ticks(fall, true);
+	assert(m_phase == ADDRESS && m_next_tick == fall);
+	m_host_operation = HOST_WRITE;
+	m_host_address = offset;
+	m_host_data = data;
+	advance_ticks(fall);
+	schedule_wakeup();
+}
+
+u8 es5503_device::read_latched(offs_t offset, uint64_t fall)
+{
+	assert(fall >= m_tick);
+	advance_ticks(fall, true);
+	assert(m_phase == ADDRESS && m_next_tick == fall);
+	const uint8_t value = register_read(offset);
+	if ((offset & 0xff) == 0xe0 && m_irq_count)
+	{
+		m_host_operation = HOST_ACK;
+		m_host_data = m_irq_queue[0];
+	}
+	else if ((offset & 0xff) == 0xe2)
+		m_host_operation = HOST_ADC;
+	advance_ticks(fall);
+	schedule_wakeup();
+	return value;
 }
 
 void es5503_device::synchronize()
@@ -282,8 +356,12 @@ void es5503_device::advance_to(attotime time)
 	// times, so audio and slot timers cannot overtake those transfers.
 	if (m_host_sync)
 		m_host_sync(time);
-	const uint64_t target = time.as_ticks(m_input_clock);
-	if (target <= m_tick)
+	advance_ticks(time.as_ticks(m_input_clock));
+}
+
+void es5503_device::advance_ticks(uint64_t target, bool before_host)
+{
+	if (target < m_tick)
 		return;
 	while (m_next_tick <= target || (m_adc_tick && m_adc_tick <= target))
 	{
@@ -294,11 +372,13 @@ void es5503_device::advance_to(attotime time)
 			m_adc_result = m_adc_func();
 			continue;
 		}
+		if (before_host && m_phase == ADDRESS && m_next_tick == target)
+			break;
 		// Complete an uninterrupted oscillator slot in one iteration. Nothing
 		// can observe the channel midpoint before target, and the DAC holds
 		// the same integer value across both halves of E-low.
-		if (m_phase == ADDRESS && m_next_tick + 4 <= target &&
-			(!m_adc_tick || m_adc_tick > m_next_tick + 4))
+		if (m_phase == ADDRESS && m_next_tick + address_to_sample() <= target &&
+			(!m_adc_tick || m_adc_tick > m_next_tick + address_to_sample()))
 		{
 			if (m_host_operation == HOST_NONE &&
 				m_slot < m_scan_enabled && (m_oscillators[m_slot].control & 1))
@@ -307,7 +387,7 @@ void es5503_device::advance_to(attotime time)
 				// still resets M0+H and contributes center level on its channel.
 				// Integrate the preceding DAC hold through this sample edge.
 				oscillator &o = m_oscillators[m_slot];
-				integrate_to(m_next_tick + 4);
+				integrate_to(m_next_tick + address_to_sample());
 				m_fetch_control = o.control;
 				m_fetch_volume = o.vol;
 				m_fetch_active = false;
@@ -318,7 +398,7 @@ void es5503_device::advance_to(attotime time)
 				m_dac_channel = m_channel_strobe & (m_output_channels - 1);
 				m_dac_sample = 0;
 				++m_slot; // refresh slots follow, so this cannot wrap the scan
-				m_next_tick += 8;
+				m_next_tick += 8 * uint64_t(m_clock_divider);
 				continue;
 			}
 			integrate_to(m_next_tick);
@@ -327,7 +407,7 @@ void es5503_device::advance_to(attotime time)
 			address_phase();
 			m_phase = CHANNEL;
 			m_channel_strobe = (m_slot < m_scan_enabled) ? m_fetch_control >> 4 : 15;
-			integrate_to(m_next_tick + 4);
+			integrate_to(m_next_tick + address_to_sample());
 			m_phase = SAMPLE;
 			sample_phase();
 			if (++m_slot == m_scan_enabled + 2)
@@ -336,7 +416,7 @@ void es5503_device::advance_to(attotime time)
 				m_scan_enabled = m_oscsenabled;
 			}
 			m_phase = ADDRESS;
-			m_next_tick += 8;
+			m_next_tick += 8 * uint64_t(m_clock_divider);
 			continue;
 		}
 		integrate_to(m_next_tick);
@@ -347,12 +427,12 @@ void es5503_device::advance_to(attotime time)
 			commit_host();
 			address_phase();
 			m_phase = CHANNEL;
-			m_next_tick += 2;
+			m_next_tick += 2 * uint64_t(m_clock_divider) + m_q_rise_delay - m_e_fall_delay;
 			break;
 		case CHANNEL:
 			m_channel_strobe = (m_slot < m_scan_enabled) ? m_fetch_control >> 4 : 15;
 			m_phase = SAMPLE;
-			m_next_tick += 2;
+			m_next_tick += 2 * uint64_t(m_clock_divider) + m_e_rise_delay - m_q_rise_delay;
 			break;
 		case SAMPLE:
 			sample_phase();
@@ -364,7 +444,7 @@ void es5503_device::advance_to(attotime time)
 				m_scan_enabled = m_oscsenabled;
 			}
 			m_phase = ADDRESS;
-			m_next_tick += 4;
+			m_next_tick += 4 * uint64_t(m_clock_divider) + m_e_fall_delay - m_e_rise_delay;
 			break;
 		}
 	}
@@ -522,6 +602,11 @@ void es5503_device::register_write(uint8_t address, uint8_t data)
 		case 0x60: break; // current sample is read-only
 		case 0x80: o.wavetblpointer = (o.wavetblpointer & 0x10000) | (data << 8); break;
 		case 0xa0:
+			// Passive experiment trace: a requested reset can remain unseen if
+			// halt and run both arrive between this oscillator's service slots.
+			LOGMASKED(LOG_CONTROL, "DOCCTL tick=%llu osc=%u old=%02x data=%02x acc=%06x freq=%04x ptr=%05x size=%u res=%u vol=%u\n",
+					(unsigned long long)m_tick, osc, o.control, data, o.accumulator,
+					o.freq, o.wavetblpointer, o.wavetblsize, o.resolution, o.vol);
 			o.control = data;
 			queue_irq(osc);
 			break;
@@ -554,7 +639,7 @@ void es5503_device::commit_host()
 		}
 		break;
 	case HOST_ADC:
-		m_adc_tick = m_tick + 26 * 8;
+		m_adc_tick = m_tick + 26 * 8 * uint64_t(m_clock_divider);
 		break;
 	}
 	m_host_operation = HOST_NONE;
@@ -608,23 +693,23 @@ void es5503_device::schedule_wakeup()
 	uint64_t due = m_adc_tick ? m_adc_tick : ~uint64_t(0);
 	if (m_host_operation != HOST_NONE)
 	{
-		const uint64_t host = m_next_tick + (m_phase == CHANNEL ? 6 : m_phase == SAMPLE ? 4 : 0);
+		const uint64_t host = m_next_tick + to_host();
 		due = std::min(due, host);
 	}
-	const uint64_t sample = m_next_tick + (m_phase == ADDRESS ? 4 : m_phase == CHANNEL ? 2 : 0);
+	const uint64_t sample = m_next_tick + to_sample();
 	const int slots = m_scan_enabled + 2;
 	for (int osc = 0; osc < m_scan_enabled; ++osc)
 		if ((m_oscillators[osc].control & 9) == 8 ||
 			(osc == m_slot && m_phase != ADDRESS && m_fetch_active && (m_fetch_control & 8)))
-			due = std::min(due, sample + ((osc + slots - m_slot) % slots) * 8);
+			due = std::min(due, sample + ((osc + slots - m_slot) % slots) * 8 * uint64_t(m_clock_divider));
 	if (m_scan_enabled != m_oscsenabled)
-		due = std::min(due, sample + (slots - m_slot - 1) * 8);
+		due = std::min(due, sample + (slots - m_slot - 1) * 8 * uint64_t(m_clock_divider));
 	if (due == ~uint64_t(0))
 		m_timer->adjust(attotime::never);
 	else
 	{
 		// Avoid rounding a clock edge backwards when converting to attotime.
-		const attotime when = attotime::from_ticks(due, m_input_clock) + attotime::from_nsec(1);
+		const attotime when = clock_time(due);
 		m_timer->adjust(std::max(attotime::zero, when - machine().time()));
 	}
 }

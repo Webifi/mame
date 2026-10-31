@@ -9,7 +9,6 @@
 /*********************************************************************
 
     TODO:
-    - Handle entering IOSTOP mode.
     - Handle mid-transfer clock frequency changes.
 
 *********************************************************************/
@@ -66,6 +65,7 @@ void z180csio_device::device_start()
 	m_trdr = 0;
 
 	save_item(NAME(m_cntr));
+	save_item(NAME(m_iostop));
 	save_item(NAME(m_trdr));
 	save_item(NAME(m_shift_cnt));
 	save_item(NAME(m_irq));
@@ -80,6 +80,7 @@ void z180csio_device::device_start()
 
 void z180csio_device::device_reset()
 {
+	m_iostop = false;
 	m_cntr = 0x07;
 	m_shift_cnt = 0;
 	m_irq = 0;
@@ -92,6 +93,22 @@ void z180csio_device::device_reset()
 	m_txs_cb(m_txs_out);
 }
 
+void z180csio_device::iostop_w(bool stopped)
+{
+	m_iostop = stopped;
+	if (!stopped)
+		return;
+	// UM0050 pp148-149/Table56: retain EIE, SS and TRDR; TXS holds.
+	m_cntr &= Z180_CNTR_EIE | Z180_CNTR_SS;
+	m_shift_cnt = m_irq = 0;
+	m_internal_clock->adjust(attotime::never);
+	if (!m_cks_out)
+	{
+		m_cks_out = 1;
+		if ((m_cntr & Z180_CNTR_SS) != 7)
+			m_cks_cb(1);
+	}
+}
 
 void z180csio_device::state_add(device_state_interface &parent)
 {
@@ -127,6 +144,8 @@ void z180csio_device::cntr_w(u8 data)
 	// If one attempts to write 1 to both at the same time, which takes precedence?
 
 	LOG("Z180 CNTR wr $%02x\n", data);
+	if (m_iostop)
+		data &= ~(Z180_CNTR_RE | Z180_CNTR_TE);
 
 	if (data & (Z180_CNTR_RE | Z180_CNTR_TE))
 	{
@@ -203,7 +222,7 @@ void z180csio_device::cks_wr(int state)
 	if (m_cks_in != state)
 	{
 		m_cks_in = state;
-		if ((m_cntr & Z180_CNTR_SS) == 0x07)
+		if (!m_iostop && (m_cntr & Z180_CNTR_SS) == 0x07)
 			clock_edge(m_cks_in);
 	}
 }

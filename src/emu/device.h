@@ -646,6 +646,13 @@ public:
 	virtual std::vector<std::string> searchpath() const;
 	const char *source() const { return m_type.source(); }
 	device_t *owner() const { return m_owner; }
+	// A local clock domain must reach a timer edge before its peripheral
+	// callback can observe or change that domain. Children inherit the barrier.
+	void set_execution_barrier(device_execute_interface &exec) { m_execution_barrier = &exec; }
+	device_execute_interface *execution_barrier() const
+	{
+		return m_execution_barrier ? m_execution_barrier : m_owner ? m_owner->execution_barrier() : nullptr;
+	}
 	device_t *next() const { return m_next; }
 	u32 configured_clock() const { return m_configured_clock; }
 	const machine_config &mconfig() const { return m_machine_config; }
@@ -1024,6 +1031,7 @@ protected:
 
 	// device relationships & interfaces
 	device_t *              m_owner;                // device that owns us
+	device_execute_interface *m_execution_barrier = nullptr;
 	device_t *              m_next;                 // next device by the same owner (of any type/class)
 	subdevice_list          m_subdevices;           // container for list of subdevices
 	interface_list          m_interfaces;           // container for list of interfaces

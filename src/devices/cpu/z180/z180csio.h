@@ -23,6 +23,7 @@ public:
 	auto cks_handler() { return m_cks_cb.bind(); }
 	auto txs_handler() { return m_txs_cb.bind(); }
 
+	void iostop_w(bool stopped);
 	void cks_wr(int state);
 	void rxs_wr(int state);
 
@@ -50,6 +51,7 @@ protected:
 
 	emu_timer *m_internal_clock;
 
+	bool m_iostop = false;
 	u8   m_cntr;       // CSI/O Control/Status Register
 	u8   m_trdr;       // CSI/O Transmit/Receive Data Register
 	u8   m_shift_cnt;

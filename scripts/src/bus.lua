@@ -34,6 +34,12 @@ end
 
 if BUSES["A2BUS"] then
 	files {
+		MAME_DIR .. "src/devices/bus/a2bus/secondsight.cpp",
+		MAME_DIR .. "src/devices/bus/a2bus/secondsight.h",
+		MAME_DIR .. "src/devices/bus/a2bus/secondsight_video.cpp",
+		MAME_DIR .. "src/devices/bus/a2bus/secondsight_video.h",
+		MAME_DIR .. "src/devices/bus/a2bus/secondsight_lattice.h",
+		MAME_DIR .. "src/devices/bus/a2bus/secondsight_lattice_bbb1.h",
 		MAME_DIR .. "src/devices/bus/a2bus/a2bus.cpp",
 		MAME_DIR .. "src/devices/bus/a2bus/a2bus.h",
 		MAME_DIR .. "src/devices/bus/a2bus/a2eauxslot.cpp",

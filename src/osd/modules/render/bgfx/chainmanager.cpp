@@ -14,8 +14,9 @@
 #include <bx/readerwriter.h>
 #include <bx/file.h>
 
-#include "emucore.h"
+#include "emu.h"
 #include "render.h"
+#include "screen.h"
 #include "../frontend/mame/ui/slider.h"
 
 #include "modules/lib/osdobj_common.h"
@@ -33,6 +34,7 @@
 #include "texture.h"
 
 #include "sliderdirtynotifier.h"
+#include "interlace.h"
 
 #include "util/path.h"
 #include "util/unicode.h"
@@ -525,6 +527,7 @@ void chain_manager::create_selection_slider(uint32_t screen_index)
 
 uint32_t chain_manager::update_screen_textures(uint32_t view, render_primitive *starting_prim, osd_window& window)
 {
+	window.renderer().clear_flags(osd_renderer::FLAG_NEEDS_FRAME_UPDATE);
 	if (!count_screens(starting_prim))
 		return 0;
 
@@ -559,6 +562,23 @@ uint32_t chain_manager::update_screen_textures(uint32_t view, render_primitive *
 		int width_mul_factor = 1;
 		const bgfx::Memory* mem = bgfx_util::mame_texture_data_to_bgfx_texture_data(dst_format, prim.m_flags & PRIMFLAG_TEXFORMAT_MASK,
 			prim.m_rowpixels, prim.m_prim->texture.width_margin, tex_height, prim.m_prim->texture.palette, prim.m_prim->texture.base, pitch, width_div_factor, width_mul_factor);
+
+		// Work only on BGFX's private upload copy, never the emulated bitmap.
+		// Keep each field at its original odd/even line positions (no bobbing,
+		// resampling, or field/frame-rate guess based on resolution).
+		bgfx_chain *const field_chain = screen_chain(screen);
+		if (field_chain && field_chain->interlace_fields() && prim.m_prim->container &&
+				(src_format == TEXFORMAT_RGB32 || src_format == TEXFORMAT_ARGB32))
+		{
+			screen_device const *const source = prim.m_prim->container->screen();
+			if (source && source->output_interlace())
+			{
+				// A static woven bitmap still has alternating output fields.
+				window.renderer().set_flags(osd_renderer::FLAG_NEEDS_FRAME_UPDATE);
+				bgfx_interlace::select_field(mem->data, pitch, tex_height,
+						(source->output_field() + source->visible_area().min_y) & 1);
+			}
+		}
 
 		if (!texture)
 		{

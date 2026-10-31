@@ -350,6 +350,7 @@ public:
 	/* Generic flags */
 	static const int FLAG_NONE                  = 0x0000;
 	static const int FLAG_HAS_VECTOR_SCREEN     = 0x0001;
+	static const int FLAG_NEEDS_FRAME_UPDATE    = 0x0002; // animated output even if the emulated bitmap is unchanged
 
 	osd_renderer(osd_window &window) : m_sliders_dirty(false), m_window(window), m_flags(0) { }
 

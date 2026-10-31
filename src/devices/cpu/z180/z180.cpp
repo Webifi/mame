@@ -83,7 +83,8 @@ Hitachi HD647180 series:
 #include "z180.h"
 #include "z180dasm.h"
 
-//#define VERBOSE 1
+#define LOG_CLOCK (1U << 1)
+#define VERBOSE LOG_CLOCK
 #include "logmacro.h"
 
 /* interrupt priorities */
@@ -109,6 +110,7 @@ Hitachi HD647180 series:
 DEFINE_DEVICE_TYPE(Z80180, z80180_device, "z80180", "Zilog Z80180") // equivalent to Hitachi HD64180R or HD64180Z
 DEFINE_DEVICE_TYPE(HD64180RP, hd64180rp_device, "hd64180rp", "Hitachi HD64180RP") // DIP64 version, identical to Zilog Z80180xxPSC
 DEFINE_DEVICE_TYPE(Z8S180, z8s180_device, "z8s180", "Zilog Z8S180") // enhanced Z80180
+DEFINE_DEVICE_TYPE(Z8S180_K, z8s180k_device, "z8s180k", "Zilog Z8S180 revision K")
 DEFINE_DEVICE_TYPE(Z80182, z80182_device, "z80182", "Zilog Z80182") // further enhanced Z8S180
 
 
@@ -151,8 +153,9 @@ hd64180rp_device::hd64180rp_device(const machine_config &mconfig, const char *ta
 	set_address_width(19);
 }
 
-z8s180_device::z8s180_device(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, uint32_t clock)
+z8s180_device::z8s180_device(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, uint32_t clock, bool enhanced)
 	: z180_device(mconfig, type, tag, owner, clock, false, address_map_constructor())
+	, m_enhanced(enhanced)
 {
 }
 
@@ -163,6 +166,11 @@ z8s180_device::z8s180_device(const machine_config &mconfig, const char *tag, dev
 
 z80182_device::z80182_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
 	: z8s180_device(mconfig, Z80182, tag, owner, clock)
+{
+}
+
+z8s180k_device::z8s180k_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
+	: z8s180_device(mconfig, Z8S180_K, tag, owner, clock, false)
 {
 }
 
@@ -396,6 +404,7 @@ static std::unique_ptr<uint8_t[]> SZHVC_sub;
 #include "z180fd.hxx"
 #include "z180ed.hxx"
 #include "z180op.hxx"
+#include "z180cycles.hxx"
 
 
 void z180_device::set_address_width(int bits)
@@ -421,6 +430,7 @@ device_memory_interface::space_config_vector z180_device::memory_space_config() 
 
 uint8_t z180_device::z180_readcontrol(offs_t port)
 {
+	m_instruction_fast=false;
 	// normal external readport (ignore the data)
 	(void)m_io.read_byte(port);
 
@@ -471,21 +481,19 @@ uint8_t z180_device::z180_internal_port_read(uint8_t port)
 		data = m_tmdr_value[0] & 0x00ff;
 		LOG("Z180 TMDR0L rd $%02x ($%04x)\n", data, m_tmdr[0].w);
 		/* if timer is counting, latch the MSB and set the latch flag */
-		if ((m_tcr & Z180_TCR_TDE0) == 0)
+		if (m_tcr & Z180_TCR_TDE0)
 		{
 			m_tmdr_latch |= 1;
 			m_tmdrh[0] = (m_tmdr_value[0] & 0xff00) >> 8;
 		}
 
-		if(m_read_tcr_tmdr[0])
+		// UM0050 p162: acknowledge by reading both TCR and TMDR.
+		if (m_read_tcr_tmdr[0] & 1)
 		{
-			m_tcr &= ~Z180_TCR_TIF0; // reset TIF0
+			m_tcr &= ~Z180_TCR_TIF0;
 			m_read_tcr_tmdr[0] = 0;
 		}
-		else
-		{
-			m_read_tcr_tmdr[0] = 1;
-		}
+		else m_read_tcr_tmdr[0] = 2;
 		break;
 
 	case 0x0d:
@@ -500,15 +508,13 @@ uint8_t z180_device::z180_internal_port_read(uint8_t port)
 			data = (m_tmdr_value[0] & 0xff00) >> 8;
 		}
 
-		if(m_read_tcr_tmdr[0])
+		// UM0050 p162: acknowledge by reading both TCR and TMDR.
+		if (m_read_tcr_tmdr[0] & 1)
 		{
-			m_tcr &= ~Z180_TCR_TIF0; // reset TIF0
+			m_tcr &= ~Z180_TCR_TIF0;
 			m_read_tcr_tmdr[0] = 0;
 		}
-		else
-		{
-			m_read_tcr_tmdr[0] = 1;
-		}
+		else m_read_tcr_tmdr[0] = 2;
 		LOG("Z180 TMDR0H rd $%02x ($%04x)\n", data, m_tmdr[0].w);
 		break;
 
@@ -525,25 +531,21 @@ uint8_t z180_device::z180_internal_port_read(uint8_t port)
 	case 0x10:
 		data = m_tcr;
 
-		if(m_read_tcr_tmdr[0])
+		// UM0050 p162: acknowledge by reading both TCR and TMDR.
+		if (m_read_tcr_tmdr[0] & 2)
 		{
-			m_tcr &= ~Z180_TCR_TIF0; // reset TIF0
+			m_tcr &= ~Z180_TCR_TIF0;
 			m_read_tcr_tmdr[0] = 0;
 		}
-		else
-		{
-			m_read_tcr_tmdr[0] = 1;
-		}
+		else m_read_tcr_tmdr[0] = 1;
 
-		if(m_read_tcr_tmdr[1])
+		// UM0050 p162: acknowledge by reading both TCR and TMDR.
+		if (m_read_tcr_tmdr[1] & 2)
 		{
-			m_tcr &= ~Z180_TCR_TIF1; // reset TIF1
+			m_tcr &= ~Z180_TCR_TIF1;
 			m_read_tcr_tmdr[1] = 0;
 		}
-		else
-		{
-			m_read_tcr_tmdr[1] = 1;
-		}
+		else m_read_tcr_tmdr[1] = 1;
 
 		LOG("Z180 TCR    rd $%02x ($%02x)\n", data, m_tcr);
 		break;
@@ -552,21 +554,19 @@ uint8_t z180_device::z180_internal_port_read(uint8_t port)
 		data = m_tmdr_value[1];
 		LOG("Z180 TMDR1L rd $%02x ($%02x)\n", data, m_tmdr[1].w);
 		/* if timer is counting, latch the MSB and set the latch flag */
-		if ((m_tcr & Z180_TCR_TDE1) == 0)
+		if (m_tcr & Z180_TCR_TDE1)
 		{
 			m_tmdr_latch |= 2;
 			m_tmdrh[1] = (m_tmdr_value[1] & 0xff00) >> 8;
 		}
 
-		if(m_read_tcr_tmdr[1])
+		// UM0050 p162: acknowledge by reading both TCR and TMDR.
+		if (m_read_tcr_tmdr[1] & 1)
 		{
-			m_tcr &= ~Z180_TCR_TIF1; // reset TIF1
+			m_tcr &= ~Z180_TCR_TIF1;
 			m_read_tcr_tmdr[1] = 0;
 		}
-		else
-		{
-			m_read_tcr_tmdr[1] = 1;
-		}
+		else m_read_tcr_tmdr[1] = 2;
 		break;
 
 	case 0x15:
@@ -581,15 +581,13 @@ uint8_t z180_device::z180_internal_port_read(uint8_t port)
 			data = (m_tmdr_value[1] & 0xff00) >> 8;
 		}
 
-		if(m_read_tcr_tmdr[1])
+		// UM0050 p162: acknowledge by reading both TCR and TMDR.
+		if (m_read_tcr_tmdr[1] & 1)
 		{
-			m_tcr &= ~Z180_TCR_TIF1; // reset TIF1
+			m_tcr &= ~Z180_TCR_TIF1;
 			m_read_tcr_tmdr[1] = 0;
 		}
-		else
-		{
-			m_read_tcr_tmdr[1] = 1;
-		}
+		else m_read_tcr_tmdr[1] = 2;
 		LOG("Z180 TMDR1H rd $%02x ($%04x)\n", data, m_tmdr[1].w);
 		break;
 
@@ -694,7 +692,7 @@ uint8_t z180_device::z180_internal_port_read(uint8_t port)
 		break;
 
 	case 0x30:
-		data = m_dstat | ~Z180_DSTAT_MASK;
+		data = m_dstat | ~Z180_DSTAT_MASK | Z180_DSTAT_DWE0 | Z180_DSTAT_DWE1;
 		LOG("Z180 DSTAT  rd $%02x ($%02x)\n", data, m_dstat);
 		break;
 
@@ -759,6 +757,7 @@ uint8_t z180_device::z180_internal_port_read(uint8_t port)
 
 void z180_device::z180_writecontrol(offs_t port, uint8_t data)
 {
+	m_instruction_fast=false;
 	// normal external write port
 	m_io.write_byte(port, data);
 
@@ -827,16 +826,14 @@ void z180_device::z180_internal_port_write(uint8_t port, uint8_t data)
 
 	case 0x10:
 		LOG("Z180 TCR    wr $%02x ($%02x)\n", data,  data & ~(Z180_TCR_TIF1 | Z180_TCR_TIF0));
-		{
-			uint16_t old = m_tcr;
-			/* Force reload on state change */
-			m_tcr = (m_tcr & (Z180_TCR_TIF1 | Z180_TCR_TIF0)) | (data & ~(Z180_TCR_TIF1 | Z180_TCR_TIF0));
-			if (!(old & Z180_TCR_TDE0) && (m_tcr & Z180_TCR_TDE0))
-				m_tmdr_value[0] = 0; //m_rldr[0].w;
-			if (!(old & Z180_TCR_TDE1) && (m_tcr & Z180_TCR_TDE1))
-				m_tmdr_value[1] = 0; //m_rldr[1].w;
-		}
-
+		// UM0050 pp158,163: enabling counting preserves a programmed TMDR.
+		m_tcr = (m_tcr & (Z180_TCR_TIF1 | Z180_TCR_TIF0)) | (data & ~(Z180_TCR_TIF1 | Z180_TCR_TIF0));
+		// HD64180 User's Manual Oct1985 p88, PRT Operation Notes (3):
+		// programming TOC selects HIGH before the first timeout, then the
+		// timeout parity (even HIGH, odd LOW). Forced LOW/HIGH takes effect
+		// at the next timeout, not on this register write.
+		m_tout = !m_prt1_timeout_odd;
+		cycle_update_direct_reads();
 		break;
 
 	case 0x14:
@@ -848,7 +845,7 @@ void z180_device::z180_internal_port_write(uint8_t port, uint8_t data)
 	case 0x15:
 		LOG("Z180 TMDR1H wr $%02x\n", data);
 		m_tmdr[1].b.h = data;
-		m_tmdr_value[1] = (m_tmdr_value[1] & 0x00ff) | m_tmdr[1].b.h;
+		m_tmdr_value[1] = (m_tmdr_value[1] & 0x00ff) | (m_tmdr[1].b.h << 8);
 		break;
 
 	case 0x16:
@@ -948,14 +945,31 @@ void z180_device::z180_internal_port_write(uint8_t port, uint8_t data)
 
 	case 0x30:
 		LOG("Z180 DSTAT  wr $%02x ($%02x)\n", data,  data & Z180_DSTAT_MASK & ~Z180_DSTAT_DME);
-		m_dstat = (m_dstat & Z180_DSTAT_DME) | (data & Z180_DSTAT_MASK & ~Z180_DSTAT_DME);
-		if ((data & (Z180_DSTAT_DE1 | Z180_DSTAT_DWE1)) == Z180_DSTAT_DE1)
+		// UM0050 pp95-97: DWE=1 protects DE, and reads back as 1.
 		{
-			m_dstat |= Z180_DSTAT_DME;  /* DMA enable */
-		}
-		if ((data & (Z180_DSTAT_DE0 | Z180_DSTAT_DWE0)) == Z180_DSTAT_DE0)
-		{
-			m_dstat |= Z180_DSTAT_DME;  /* DMA enable */
+			u8 const previous = m_dstat;
+			u8 const writable = Z180_DSTAT_DIE0 | Z180_DSTAT_DIE1 |
+				((data & Z180_DSTAT_DWE0) ? 0 : Z180_DSTAT_DE0) |
+				((data & Z180_DSTAT_DWE1) ? 0 : Z180_DSTAT_DE1);
+			m_dstat = (m_dstat & ~writable) | (data & writable) | Z180_DSTAT_DWE0 | Z180_DSTAT_DWE1;
+			if (data & writable & (Z180_DSTAT_DE0 | Z180_DSTAT_DE1))
+				m_dstat |= Z180_DSTAT_DME;
+			// UM0050 pp107-109: after enabling a channel, edge-sense
+			// transfers are requested by DREQ falling edges. Events from
+			// before that enable are not a queue of pending DMA requests.
+			if (m_cycle_engine)
+				for (unsigned ch = 0; ch < 2; ++ch)
+					if ((m_dstat & (0x40 << ch)) &&
+						(!(previous & (0x40 << ch)) || !(previous & Z180_DSTAT_DME)))
+						m_dma_edge_sampled[ch] = m_dma_edge_accepted[ch] = m_dma_edge_generation[ch];
+			// UM0050 p106: a memory-to-memory start follows one further CPU
+			// MC. The register-write MC itself does not satisfy that delay.
+			if (m_cycle_engine && (data & writable & Z180_DSTAT_DE0) &&
+				((m_dmode >> 2) & 3) < 2 && ((m_dmode >> 4) & 3) < 2)
+			{
+				m_dma_allowed = false;
+				m_dma_start_pending = m_cycle_executing;
+			}
 		}
 		break;
 
@@ -966,6 +980,10 @@ void z180_device::z180_internal_port_write(uint8_t port, uint8_t data)
 
 	case 0x32:
 		LOG("Z180 DCNTL  wr $%02x\n", data);
+		if (m_cycle_engine)
+			for (unsigned ch = 0; ch < 2; ++ch)
+				if ((data & ~m_dcntl) & (4 << ch))
+					m_dma_edge_sampled[ch] = m_dma_edge_accepted[ch] = m_dma_edge_generation[ch];
 		m_dcntl = data;
 		break;
 
@@ -976,7 +994,7 @@ void z180_device::z180_internal_port_write(uint8_t port, uint8_t data)
 
 	case 0x34:
 		LOG("Z180 ITC    wr $%02x ($%02x)\n", data,  data & Z180_ITC_MASK & ~Z180_ITC_UFO);
-		m_itc = (m_itc & Z180_ITC_UFO) | (data & Z180_ITC_MASK & ~Z180_ITC_UFO);
+		m_itc = (m_itc & Z180_ITC_UFO) | (m_itc & data & Z180_ITC_TRAP) | (data & 7);
 		break;
 
 	case 0x36:
@@ -1009,6 +1027,10 @@ void z180_device::z180_internal_port_write(uint8_t port, uint8_t data)
 
 	case 0x3f:
 		LOG("Z180 IOCR   wr $%02x ($%02x)\n", data,  data & (m_extended_io ? 0xa0 : 0xe0));
+		if((m_iocr^data)&0x20) {
+			for(auto &channel:m_asci)channel->iostop_w((data&0x20)!=0);
+			m_csio->iostop_w((data&0x20)!=0);
+		}
 		m_iocr = data & (m_extended_io ? 0xa0 : 0xe0);
 		break;
 
@@ -1021,6 +1043,11 @@ void z180_device::z180_internal_port_write(uint8_t port, uint8_t data)
 
 uint8_t z8s180_device::z180_internal_port_read(uint8_t port)
 {
+	// TN0053 pp1-2: original K/SL1960 has CCR (DC4077), but none of
+	// the later ASEXT, 16-bit baud counter or CMR registers. Unassigned
+	// ports retain the core's FF read convention, not a silicon value.
+	if (!m_enhanced && port != 0x1f)
+		return z180_device::z180_internal_port_read(port);
 	uint8_t data = 0xff;
 
 	switch (port)
@@ -1031,13 +1058,13 @@ uint8_t z8s180_device::z180_internal_port_read(uint8_t port)
 		break;
 
 	case 0x1a:
-	case 0x1b:
-		data = m_asci[port & 1]->astcl_r();
+	case 0x1c:
+		data = m_asci[(port - 0x1a) >> 1]->astcl_r();
 		break;
 
-	case 0x1c:
+	case 0x1b:
 	case 0x1d:
-		data = m_asci[port & 1]->astcl_r();
+		data = m_asci[(port - 0x1a) >> 1]->astch_r();
 		break;
 
 	case 0x1e:
@@ -1060,6 +1087,8 @@ uint8_t z8s180_device::z180_internal_port_read(uint8_t port)
 
 void z8s180_device::z180_internal_port_write(uint8_t port, uint8_t data)
 {
+	if (!m_enhanced && port != 0x1f)
+		return z180_device::z180_internal_port_write(port, data);
 	switch (port)
 	{
 	case 0x12:
@@ -1068,24 +1097,31 @@ void z8s180_device::z180_internal_port_write(uint8_t port, uint8_t data)
 		break;
 
 	case 0x1a:
-	case 0x1b:
-		m_asci[port & 1]->astcl_w(data);
+	case 0x1c:
+		m_asci[(port - 0x1a) >> 1]->astcl_w(data);
 		break;
 
-	case 0x1c:
+	case 0x1b:
 	case 0x1d:
-		m_asci[port & 1]->astch_w(data);
+		m_asci[(port - 0x1a) >> 1]->astch_w(data);
 		break;
 
 	case 0x1e:
 		LOG("Z180 CMR    wr $%02x ($%02x)\n", data,  data & Z180_CMR_MASK);
+		prepare_deferred_clock_change();
 		m_cmr = data & Z180_CMR_MASK;
+		if ((m_cmr & Z180_CMR_X2) && !clock_multiplier_enabled())
+			LOGMASKED(LOG_CLOCK, "Z8S180: CMR x2 out of spec at %u Hz EXTAL (DS006002 p52: 10-16 MHz); retaining CCR rate is a convention, not specified bypass behavior\n", clock());
 		notify_clock_changed();
 		break;
 
 	case 0x1f:
 		LOG("Z180 CCR    wr $%02x\n", data);
-		m_ccr = data;
+		prepare_deferred_clock_change();
+		// 1992 Zilog data book p377 Fig.D: bit 3 is reserved on K/SL1960.
+		m_ccr = m_enhanced ? data : data & 0xf7;
+		if (data & Z180_CCR_CLOCK_DIVIDE)
+			LOGMASKED(LOG_CLOCK, "Z8S180: CCR divider bypass selected at %u Hz EXTAL\n", clock());
 		notify_clock_changed();
 		break;
 
@@ -1093,6 +1129,15 @@ void z8s180_device::z180_internal_port_write(uint8_t port, uint8_t data)
 		z180_device::z180_internal_port_write(port, data);
 		break;
 	}
+}
+
+bool z180_device::dma0_ready() const
+{
+	// UM0050 pp106-108: fixed memory addresses are memory-mapped I/O
+	// and use DREQ0 too. A stalled request is not a DMA bus cycle.
+	unsigned const sm = (m_dmode >> 2) & 3, dm = (m_dmode >> 4) & 3;
+	return (m_dstat & Z180_DSTAT_DE0) && !(sm >= 2 && dm >= 2) &&
+		((sm < 2 && dm < 2) || (m_iol & Z180_DREQ0));
 }
 
 int z180_device::z180_dma0(int max_cycles)
@@ -1109,14 +1154,15 @@ int z180_device::z180_dma0(int max_cycles)
 	int count = (m_dmode & Z180_DMODE_MMOD) ? bcr0 : 1;
 	int cycles = 0;
 
-	if (!(m_dstat & Z180_DSTAT_DE0))
+	if (!dma0_ready())
 	{
 		return 0;
 	}
 
-	while (count > 0)
+	while (count > 0 && dma0_ready())
 	{
 		m_extra_cycles = 0;
+		offs_t const previous_sar = sar0, previous_dar = dar0;
 		/* last transfer happening now? */
 		if (bcr0 == 1)
 		{
@@ -1230,6 +1276,16 @@ int z180_device::z180_dma0(int max_cycles)
 		case 0x3c:  /* reserved */
 			break;
 		}
+		if ((m_dmode & 0x08) || (m_dmode & 0x20))
+		{
+			if (m_dcntl & Z180_DCNTL_DMS0) m_iol &= ~Z180_DREQ0;
+		}
+		// UM0050 pp112-113: A15/A16 carry or borrow adds one Ti per
+		// affected memory access. Address registers remain 20 bits wide.
+		cycles += ((sar0 ^ previous_sar) & 0x10000) ? 1 : 0;
+		cycles += ((dar0 ^ previous_dar) & 0x10000) ? 1 : 0;
+		sar0 &= Z180_SAR0_MASK;
+		dar0 &= Z180_DAR0_MASK;
 		count--;
 		cycles += 6 + m_extra_cycles; // use extra_cycles for I/O wait states
 		if (cycles > max_cycles)
@@ -1255,6 +1311,9 @@ int z180_device::z180_dma0(int max_cycles)
 
 int z180_device::z180_dma1()
 {
+	// UM0050 p113: channel 0 wins simultaneous requests; memory-to-
+	// memory channel 0 blocks channel 1 until the entire block completes.
+	if (dma0_ready()) return 0;
 	offs_t mar1 = m_dma_mar1.d;
 	offs_t iar1 = m_dma_iar1.w.l;
 	int bcr1 = m_dma_bcr[1].w;
@@ -1303,11 +1362,13 @@ int z180_device::z180_dma1()
 		break;
 	}
 
-	cycles += memory_wait_states();
+	cycles += ((mar1 ^ m_dma_mar1.d) & 0x10000) ? 1 : 0; // UM0050 pp112-113
+	mar1 &= Z180_MAR1_MASK;
+	cycles += memory_wait_states() + io_wait_states(); // UM0050 pp30,112
 	cycles += m_extra_cycles; // use extra_cycles for I/O wait states
 
 	/* edge sensitive DREQ1 ? */
-	if (m_dcntl & Z180_DCNTL_DIM1)
+	if (m_dcntl & Z180_DCNTL_DMS1)
 		m_iol &= ~Z180_DREQ1;
 
 	m_dma_mar1.d = mar1;
@@ -1538,34 +1599,34 @@ void z180_device::device_start()
 
 	/* set up the state table */
 	{
-		state_add(Z180_PC,         "PC",        m_PC.w.l);
-		state_add(STATE_GENPC,     "GENPC",     _PCD).noshow();
-		state_add(STATE_GENPCBASE, "CURPC",     m_PREPC.w.l).noshow();
-		state_add(Z180_SP,         "SP",        m_SP.w.l);
-		state_add(STATE_GENFLAGS,  "GENFLAGS",  m_AF.b.l).noshow().formatstr("%8s");
-		state_add(Z180_A,          "A",         _A).noshow();
-		state_add(Z180_B,          "B",         _B).noshow();
-		state_add(Z180_C,          "C",         _C).noshow();
-		state_add(Z180_D,          "D",         _D).noshow();
-		state_add(Z180_E,          "E",         _E).noshow();
-		state_add(Z180_H,          "H",         _H).noshow();
-		state_add(Z180_L,          "L",         _L).noshow();
-		state_add(Z180_AF,         "AF",        m_AF.w.l);
-		state_add(Z180_BC,         "BC",        m_BC.w.l);
-		state_add(Z180_DE,         "DE",        m_DE.w.l);
-		state_add(Z180_HL,         "HL",        m_HL.w.l);
-		state_add(Z180_IX,         "IX",        m_IX.w.l);
-		state_add(Z180_IY,         "IY",        m_IY.w.l);
-		state_add(Z180_AF2,        "AF2",       m_AF2.w.l);
-		state_add(Z180_BC2,        "BC2",       m_BC2.w.l);
-		state_add(Z180_DE2,        "DE2",       m_DE2.w.l);
-		state_add(Z180_HL2,        "HL2",       m_HL2.w.l);
+		state_add(Z180_PC,         "PC",        m_PC.w.l).callimport();
+		state_add(STATE_GENPC,     "GENPC",     _PCD).noshow().callimport();
+		state_add(STATE_GENPCBASE, "CURPC",     m_PREPC.w.l).noshow().callimport();
+		state_add(Z180_SP,         "SP",        m_SP.w.l).callimport();
+		state_add(STATE_GENFLAGS,  "GENFLAGS",  m_AF.b.l).noshow().formatstr("%8s").callimport();
+		state_add(Z180_A,          "A",         _A).noshow().callimport();
+		state_add(Z180_B,          "B",         _B).noshow().callimport();
+		state_add(Z180_C,          "C",         _C).noshow().callimport();
+		state_add(Z180_D,          "D",         _D).noshow().callimport();
+		state_add(Z180_E,          "E",         _E).noshow().callimport();
+		state_add(Z180_H,          "H",         _H).noshow().callimport();
+		state_add(Z180_L,          "L",         _L).noshow().callimport();
+		state_add(Z180_AF,         "AF",        m_AF.w.l).callimport();
+		state_add(Z180_BC,         "BC",        m_BC.w.l).callimport();
+		state_add(Z180_DE,         "DE",        m_DE.w.l).callimport();
+		state_add(Z180_HL,         "HL",        m_HL.w.l).callimport();
+		state_add(Z180_IX,         "IX",        m_IX.w.l).callimport();
+		state_add(Z180_IY,         "IY",        m_IY.w.l).callimport();
+		state_add(Z180_AF2,        "AF2",       m_AF2.w.l).callimport();
+		state_add(Z180_BC2,        "BC2",       m_BC2.w.l).callimport();
+		state_add(Z180_DE2,        "DE2",       m_DE2.w.l).callimport();
+		state_add(Z180_HL2,        "HL2",       m_HL2.w.l).callimport();
 		state_add(Z180_R,          "R",         m_rtemp).callimport().callexport();
-		state_add(Z180_I,          "I",         m_I);
-		state_add(Z180_IM,         "IM",        m_IM).mask(0x3);
-		state_add(Z180_IFF1,       "IFF1",      m_IFF1).mask(0x1);
-		state_add(Z180_IFF2,       "IFF2",      m_IFF2).mask(0x1);
-		state_add(Z180_HALT,       "HALT",      m_HALT).mask(0x1);
+		state_add(Z180_I,          "I",         m_I).callimport();
+		state_add(Z180_IM,         "IM",        m_IM).mask(0x3).callimport();
+		state_add(Z180_IFF1,       "IFF1",      m_IFF1).mask(0x1).callimport();
+		state_add(Z180_IFF2,       "IFF2",      m_IFF2).mask(0x1).callimport();
+		state_add(Z180_HALT,       "HALT",      m_HALT).mask(0x1).callimport();
 
 		state_add(Z180_IOLINES,    "IOLINES",   m_ioltemp).mask(0xffffff).callimport();
 
@@ -1577,7 +1638,7 @@ void z180_device::device_start()
 		state_add(Z180_RLDR0,      "RLDR0",     m_rldr[0].w);
 		state_add(Z180_TMDR1,      "TMDR1",     m_tmdr_value[1]);
 		state_add(Z180_RLDR1,      "RLDR1",     m_rldr[1].w);
-		state_add(Z180_TCR,        "TCR",       m_tcr);
+		state_add(Z180_TCR,        "TCR",       m_tcr).callimport();
 
 		state_add(Z180_FRC,        "FRC",       m_frc);
 
@@ -1624,12 +1685,15 @@ void z180_device::device_start()
 	save_item(NAME(m_irq_state));
 	save_item(NAME(m_int_pending));
 	save_item(NAME(m_frc_prescale));
+	save_item(NAME(m_bus_released));
 	save_item(NAME(m_after_EI));
 
 	save_item(NAME(m_read_tcr_tmdr));
 	save_item(NAME(m_tmdr_value));
 	save_item(NAME(m_tmdrh));
 	save_item(NAME(m_tmdr_latch));
+	save_item(NAME(m_prt1_timeout_odd));
+	save_item(NAME(m_tout));
 
 	save_item(NAME(m_tmdr[0].w));
 	save_item(NAME(m_tmdr[1].w));
@@ -1659,15 +1723,17 @@ void z180_device::device_start()
 	save_item(NAME(m_ioltemp));
 
 	save_item(NAME(m_mmu));
+	machine().save().register_postload(save_prepost_delegate(FUNC(z180_device::cycle_update_direct_reads), this));
 
 	set_icountptr(m_icount);
+	cycle_register_save();
 }
 
 void z8s180_device::device_start()
 {
 	z180_device::device_start();
 
-	state_add(Z180_CMR,        "CMR",       m_cmr).mask(Z180_CMR_MASK);
+	if (m_enhanced) state_add(Z180_CMR, "CMR", m_cmr).mask(Z180_CMR_MASK);
 	state_add(Z180_CCR,        "CCR",       m_ccr);
 
 	save_item(NAME(m_cmr));
@@ -1702,12 +1768,19 @@ void z180_device::device_reset()
 	m_tmdr_latch = 0;
 	m_read_tcr_tmdr[0] = 0;
 	m_read_tcr_tmdr[1] = 0;
-	m_iol = 0;
+	// UM0050 pp8,289-290: these are externally driven inputs (or the
+	// external level of a multiplexed clock pin). RESET disables their
+	// consumers; it does not change the board level. Clear output state
+	// only. cycle_reset below still resets the DREQ edge detectors.
+	m_iol &= Z180_CKA0 | Z180_CKA1 | Z180_CKS | Z180_CTS0 | Z180_CTS1 |
+		Z180_DCD0 | Z180_DREQ0 | Z180_DREQ1 | Z180_RXA0 | Z180_RXA1 | Z180_RXS;
 	memset(m_mmu, 0, sizeof(m_mmu));
 	m_tmdrh[0] = 0;
 	m_tmdrh[1] = 0;
 	m_tmdr_value[0] = 0xffff;
 	m_tmdr_value[1] = 0xffff;
+	m_tmdr[0].w = m_tmdr[1].w = 0xffff;
+	m_rldr[0].w = m_rldr[1].w = 0xffff; // UM0050 pp157,159,164; HD64180 p88
 	m_nmi_state = CLEAR_LINE;
 	m_nmi_pending = 0;
 	m_irq_state[0] = CLEAR_LINE;
@@ -1718,7 +1791,7 @@ void z180_device::device_reset()
 
 	memcpy(m_cc, (uint8_t *)cc_default, sizeof(m_cc));
 	_IX = _IY = 0xffff; /* IX and IY are FFFF after a reset! */
-	_F = ZF;          /* Zero flag is set */
+	_F = 0; // UM0050 p178: all defined F bits reset to zero.
 
 	for (int i=0; i <= Z180_INT_MAX; i++)
 	{
@@ -1727,9 +1800,12 @@ void z180_device::device_reset()
 
 	m_frc = 0xff;
 	m_frc_prescale = 0;
+	m_bus_released = false;
 
 	/* reset io registers */
 	m_tcr = 0x00;
+	m_prt1_timeout_odd = false;
+	m_tout = true;
 	m_dma_iar1.b.h2 = 0x00;
 	m_dstat = Z180_DSTAT_DWE1 | Z180_DSTAT_DWE0;
 	m_dmode = 0x00;
@@ -1744,6 +1820,7 @@ void z180_device::device_reset()
 	m_iocr = 0x00;
 
 	z180_mmu();
+	cycle_reset();
 }
 
 void z180_device::device_add_mconfig(machine_config &config)
@@ -1757,6 +1834,8 @@ void z180_device::device_add_mconfig(machine_config &config)
 
 void z8s180_device::device_add_mconfig(machine_config &config)
 {
+	if (!m_enhanced)
+		return z180_device::device_add_mconfig(config);
 	Z180ASCI_EXT_CHANNEL_0(config, m_asci[0], DERIVED_CLOCK(1,2));
 
 	Z180ASCI_EXT_CHANNEL_1(config, m_asci[1], DERIVED_CLOCK(1,2));
@@ -1775,7 +1854,7 @@ void z8s180_device::device_reset()
 
 void z8s180_device::device_clock_changed()
 {
-	auto const rate = (m_cmr & 0x80) ? DERIVED_CLOCK(2,1) : (m_ccr & 0x80) ? DERIVED_CLOCK(1,1) : DERIVED_CLOCK(1,2);
+	auto const rate = clock_multiplier_enabled() ? DERIVED_CLOCK(2,1) : (m_ccr & 0x80) ? DERIVED_CLOCK(1,1) : DERIVED_CLOCK(1,2);
 	m_asci[0]->set_clock(rate);
 	m_asci[1]->set_clock(rate);
 	m_csio->set_clock(rate);
@@ -1784,63 +1863,74 @@ void z8s180_device::device_clock_changed()
 /* Handle PRT timers, decreasing them after 20 clocks and returning the new icount base that needs to be used for the next check */
 void z180_device::clock_timers()
 {
-	/* Programmable Reload Timer 0 */
-	if(m_tcr & Z180_TCR_TDE0)
+	// UM0050 figure64: decrement through zero, reload on the next tick.
+	for (unsigned ch = 0; ch != 2; ++ch)
 	{
-		if(m_tmdr_value[0] == 0)
+		if (!(m_tcr & (1 << ch))) continue;
+		if (m_tmdr_value[ch] == 0) m_tmdr_value[ch] = m_rldr[ch].w;
+		else --m_tmdr_value[ch];
+		if (m_tmdr_value[ch] == 0)
 		{
-			m_tmdr_value[0] = m_rldr[0].w;
-			m_tcr |= Z180_TCR_TIF0;
+			m_tcr |= Z180_TCR_TIF0 << ch;
+			if (ch == 1)
+			{
+				m_prt1_timeout_odd = !m_prt1_timeout_odd;
+				bool const old_tout=m_tout;
+				switch (m_tcr & (Z180_TCR_TOC1 | Z180_TCR_TOC0))
+				{
+				case 0: m_tout = !m_prt1_timeout_odd; break;
+				case Z180_TCR_TOC0: m_tout = !m_tout; break;
+				case Z180_TCR_TOC1: m_tout = false; break;
+				case Z180_TCR_TOC1 | Z180_TCR_TOC0: m_tout = true; break;
+				}
+				if(old_tout!=m_tout && (m_tcr&0x0c))cycle_update_direct_reads();
+			}
 		}
-		else
-			m_tmdr_value[0]--;
 	}
+}
 
-	/* Programmable Reload Timer 1 */
-	if(m_tcr & Z180_TCR_TDE1)
-	{
-		if(m_tmdr_value[1] == 0)
-		{
-			m_tmdr_value[1] = m_rldr[1].w;
-			m_tcr |= Z180_TCR_TIF1;
-		}
-		else
-			m_tmdr_value[1]--;
-	}
+int z180_device::take_nmi()
+{
+	LOG("Z180 take NMI\n");
+	LEAVE_HALT();       /* Check if processor was halted */
 
-	if((m_tcr & Z180_TCR_TIE0) && (m_tcr & Z180_TCR_TIF0))
-	{
-		// check if we can take the interrupt
-		if(m_IFF1 && !m_after_EI)
-			m_int_pending[Z180_INT_PRT0] = 1;
-	}
+	/* disable DMA transfers!! */
+	m_dstat &= ~Z180_DSTAT_DME;
 
-	if((m_tcr & Z180_TCR_TIE1) && (m_tcr & Z180_TCR_TIF1))
-	{
-		// check if we can take the interrupt
-		if(m_IFF1 && !m_after_EI)
-			m_int_pending[Z180_INT_PRT1] = 1;
-	}
+	m_IFF2 = m_IFF1;
+	m_IFF1 = 0;
+	m_extra_cycles = 0;
+	PUSH( PC );
+	_PCD = 0x0066;
+	m_nmi_pending = 0;
+	return 11 + m_extra_cycles;
 }
 
 int z180_device::check_interrupts()
 {
-	/* check for IRQs before each instruction */
-	if (m_IFF1 && !m_after_EI)
-	{
-		if (m_irq_state[0] != CLEAR_LINE && (m_itc & Z180_ITC_ITE0) == Z180_ITC_ITE0)
-			m_int_pending[Z180_INT_IRQ0] = 1;
+	if (m_nmi_pending && !m_after_EI) return take_nmi();
+	// UM0050 pp114,164: PRT and DMA requests are levels. A completed
+	// transfer while DI must still interrupt after EI; clearing DIE/TIE or
+	// acknowledging a timer must cancel its request before it is serviced.
+	bool const enabled = !m_after_EI;
+	m_int_pending[Z180_INT_PRT0] = enabled && (m_tcr & Z180_TCR_TIE0) && (m_tcr & Z180_TCR_TIF0);
+	m_int_pending[Z180_INT_PRT1] = enabled && (m_tcr & Z180_TCR_TIE1) && (m_tcr & Z180_TCR_TIF1);
+	m_int_pending[Z180_INT_DMA0] = enabled && (m_dstat & Z180_DSTAT_DIE0) && !(m_dstat & Z180_DSTAT_DE0);
+	m_int_pending[Z180_INT_DMA1] = enabled && (m_dstat & Z180_DSTAT_DIE1) && !(m_dstat & Z180_DSTAT_DE1);
+	// All maskable inputs are levels, not queued edges (UM0050 pp67-69).
+	m_int_pending[Z180_INT_IRQ0] = enabled && m_irq_state[0] != CLEAR_LINE && (m_itc & Z180_ITC_ITE0);
+	m_int_pending[Z180_INT_IRQ1] = enabled && m_irq_state[1] != CLEAR_LINE && (m_itc & Z180_ITC_ITE1);
+	m_int_pending[Z180_INT_IRQ2] = enabled && m_irq_state[2] != CLEAR_LINE && (m_itc & Z180_ITC_ITE2);
+	m_int_pending[Z180_INT_CSIO] = enabled && m_csio->check_interrupt();
+	m_int_pending[Z180_INT_ASCI0] = enabled && m_asci[0]->check_interrupt();
+	m_int_pending[Z180_INT_ASCI1] = enabled && m_asci[1]->check_interrupt();
 
-		if (m_irq_state[1] != CLEAR_LINE && (m_itc & Z180_ITC_ITE1) == Z180_ITC_ITE1)
-			m_int_pending[Z180_INT_IRQ1] = 1;
-
-		if (m_irq_state[2] != CLEAR_LINE && (m_itc & Z180_ITC_ITE2) == Z180_ITC_ITE2)
-			m_int_pending[Z180_INT_IRQ2] = 1;
-
-		m_int_pending[Z180_INT_CSIO] = m_csio->check_interrupt();
-		m_int_pending[Z180_INT_ASCI0] = m_asci[0]->check_interrupt();
-		m_int_pending[Z180_INT_ASCI1] = m_asci[1]->check_interrupt();
-	}
+	// UM0050 p34: an individually enabled interrupt wakes SLP even
+	// with IEF1=0; in that case execution resumes after SLP, without entry.
+	if (m_HALT == 2 && std::any_of(std::begin(m_int_pending) + Z180_INT_IRQ0,
+		std::end(m_int_pending), [](auto p) { return p != 0; }))
+		LEAVE_HALT();
+	if (!m_IFF1) return 0;
 
 	int cycles = 0;
 	for (int i = 0; i <= Z180_INT_MAX; i++)
@@ -1867,18 +1957,46 @@ int z180_device::check_interrupts()
 
 void z180_device::handle_io_timers(int cycles)
 {
-	while (cycles-- > 0)
+	if (cycles <= 0) return;
+	// The FRC falls every ten clocks; a falling edge to an even FRC clocks
+	// both PRTs. Retain the timeout parity and the final multiplexed TOUT
+	// level; instruction/DMA boundaries observe those outputs.
+	const unsigned frc_ticks = (m_frc_prescale + cycles) / 10;
+	m_frc_prescale = (m_frc_prescale + cycles) % 10;
+	const unsigned ticks = (frc_ticks + (m_frc & 1)) / 2;
+	m_frc -= frc_ticks;
+	// UM0050 p172: IOSTOP stops the PRTs, not FRC or its PHI/10 base.
+	if (!ticks || (m_iocr & 0x20)) return;
+	for (unsigned ch = 0; ch != 2; ++ch)
 	{
-		// FRC counts down by 1 every 10 cycles
-		m_frc_prescale++;
-		if (m_frc_prescale >= 10)
+		if (!(m_tcr & (1 << ch))) continue;
+		const unsigned value = m_tmdr_value[ch];
+		const unsigned period = unsigned(m_rldr[ch].w) + 1;
+		// Zero is a real count state: reload occurs on its following tick.
+		const unsigned first = value ? value : period;
+		const unsigned timeouts = ticks < first ? 0 : 1 + (ticks - first) / period;
+		if (timeouts)
 		{
-			m_frc_prescale = 0;
-			m_frc--;
-
-			// Programmable reload timers are clocked once every 20 cycles
-			if ((m_frc & 1) == 0)
-				clock_timers();
+			m_tcr |= Z180_TCR_TIF0 << ch;
+			if (ch == 1)
+			{
+				m_prt1_timeout_odd ^= bool(timeouts & 1);
+				bool const old_tout=m_tout;
+				switch (m_tcr & (Z180_TCR_TOC1 | Z180_TCR_TOC0))
+				{
+				case 0: m_tout = !m_prt1_timeout_odd; break;
+				case Z180_TCR_TOC0: m_tout ^= bool(timeouts & 1); break;
+				case Z180_TCR_TOC1: m_tout = false; break;
+				case Z180_TCR_TOC1 | Z180_TCR_TOC0: m_tout = true; break;
+				}
+				if(old_tout!=m_tout && (m_tcr&0x0c))cycle_update_direct_reads();
+			}
+		}
+		if (ticks <= value) m_tmdr_value[ch] = value - ticks;
+		else
+		{
+			const unsigned remainder = (ticks - value) % period;
+			m_tmdr_value[ch] = remainder ? period - remainder : 0;
 		}
 	}
 }
@@ -1886,42 +2004,69 @@ void z180_device::handle_io_timers(int cycles)
 /****************************************************************************
  * Execute 'cycles' T-states. Return number of T-states really executed
  ****************************************************************************/
+int z180_device::halt_cycles() const
+{
+	if (!m_instruction_boundary_timing || (machine().debug_flags & DEBUG_FLAG_ENABLED)) return 3;
+	// The old loop samples IRQs every three T states. Preserve that grid and
+	// stop at the first sample that can observe a new PRT interrupt. External
+	// IRQ, DMA and serial events already bound the scheduler's current slice.
+	int limit = std::max(1, m_icount);
+	if (m_IFF1)
+	{
+		for (unsigned ch = 0; ch != 2; ++ch)
+		{
+			if (!(m_tcr & (Z180_TCR_TIE0 << ch))) continue;
+			if (m_tcr & (Z180_TCR_TIF0 << ch)) return 3;
+			if (!(m_tcr & (1 << ch))) continue;
+			const int first = 10 - m_frc_prescale + ((m_frc & 1) ? 0 : 10);
+			const int ticks = m_tmdr_value[ch] ? m_tmdr_value[ch] : std::max(1, int(m_rldr[ch].w) + 1);
+			limit = std::min(limit, first + (ticks - 1) * 20);
+		}
+	}
+	return ((limit + 2) / 3) * 3;
+}
+
 void z180_device::execute_run()
 {
+	if (m_cycle_engine) execute_machine_cycles();
+	else execute_legacy();
+}
+
+void z180_device::execute_legacy()
+{
 	int curcycles;
-
-	/* check for NMIs on the way in; they can only be set externally */
-	/* via timers, and can't be dynamically enabled, so it is safe */
-	/* to just check here */
-	if (m_nmi_pending)
+	if (m_icount <= 0) return;
+	if (m_bus_released)
 	{
-		LOG("Z180 take NMI\n");
-		LEAVE_HALT();       /* Check if processor was halted */
+		// DMA cannot progress or accept interrupts during bus release.
+		// PRT/FRC continue from PHI; ASCI and CSI/O already use independent
+		// device timers. The PRT/FRC continuation is inferred
+		// from their PHI dividers, not a claim that HALT and BUSREQ are equal.
+		handle_io_timers(m_icount);
+		m_icount = 0;
+		return;
+	}
 
-		/* disable DMA transfers!! */
-		m_dstat &= ~Z180_DSTAT_DME;
-
-		m_IFF2 = m_IFF1;
-		m_IFF1 = 0;
-		PUSH( PC );
-		_PCD = 0x0066;
-		m_icount -= 11;
-		m_nmi_pending = 0;
-		handle_io_timers(11);
+	if (m_nmi_pending && !m_after_EI)
+	{
+		curcycles = take_nmi();
+		m_icount -= curcycles;
+		handle_io_timers(curcycles);
 	}
 
 again:
+	if (m_icount <= 0 || m_bus_released) return;
 	/* check if any DMA transfer is running */
-	if ((m_dstat & Z180_DSTAT_DME) == Z180_DSTAT_DME)
+	if (m_HALT != 2 && (m_dstat & Z180_DSTAT_DME) == Z180_DSTAT_DME)
 	{
 		/* check if DMA channel 0 is running and also is in burst mode */
 		if ((m_dstat & Z180_DSTAT_DE0) == Z180_DSTAT_DE0 &&
-			(m_dmode & Z180_DMODE_MMOD) == Z180_DMODE_MMOD)
+			(m_dmode & Z180_DMODE_MMOD) == Z180_DMODE_MMOD && dma0_ready())
 		{
 			debugger_wait_hook();
 
 			/* FIXME z180_dma0 should be handled in handle_io_timers */
-			curcycles = z180_dma0(m_icount);
+			curcycles = z180_dma0(m_instruction_boundary_timing ? 0 : m_icount);
 			m_icount -= curcycles;
 			handle_io_timers(curcycles);
 		}
@@ -1929,17 +2074,18 @@ again:
 		{
 			do
 			{
+				if (m_icount <= 0 || m_bus_released) return;
 				curcycles = check_interrupts();
 				m_icount -= curcycles;
 				handle_io_timers(curcycles);
 				m_after_EI = 0;
+				if (m_icount <= 0) return;
 
 				if (!m_HALT)
 				{
 					_PPC = _PCD;
 					debugger_instruction_hook(_PCD);
 
-					m_R++;
 					m_extra_cycles = 0;
 					curcycles = exec_op(ROP());
 					curcycles += m_extra_cycles;
@@ -1947,25 +2093,21 @@ again:
 				else
 				{
 					debugger_wait_hook();
-					curcycles = 3;
+					curcycles = !(m_dstat & Z180_DSTAT_DE0) &&
+						(!(m_dstat & Z180_DSTAT_DE1) || !(m_iol & Z180_DREQ1)) ? halt_cycles() : 3;
 				}
 
 				m_icount -= curcycles;
 				handle_io_timers(curcycles);
 
+				if (m_HALT == 2) continue; // UM0050 p33: SLEEP stops DMAC.
+
 				/* if channel 0 was started in burst mode, go recheck the mode */
 				if ((m_dstat & Z180_DSTAT_DE0) == Z180_DSTAT_DE0 &&
-					(m_dmode & Z180_DMODE_MMOD) == Z180_DMODE_MMOD)
+					(m_dmode & Z180_DMODE_MMOD) == Z180_DMODE_MMOD && dma0_ready())
 					goto again;
 
-				/* FIXME:
-				 * For simultaneous DREQ0 and DREQ1 requests, channel 0 has priority
-				 * over channel 1. When channel 0 is performing a memory to/from memory
-				 * transfer, channel 1 cannot operate until the channel 0 operation has
-				 * terminated. If channel 1 is operating, channel 0 cannot operate until
-				 * channel 1 releases control of the bus.
-				 *
-				 */
+
 				curcycles = z180_dma0(6);
 				m_icount -= curcycles;
 				handle_io_timers(curcycles);
@@ -1985,21 +2127,22 @@ again:
 	{
 		do
 		{
+			if (m_icount <= 0 || m_bus_released) return;
 			/* If DMA is started go to check the mode */
-			if ((m_dstat & Z180_DSTAT_DME) == Z180_DSTAT_DME)
+			if (m_HALT != 2 && (m_dstat & Z180_DSTAT_DME) == Z180_DSTAT_DME)
 				goto again;
 
 			curcycles = check_interrupts();
 			m_icount -= curcycles;
 			handle_io_timers(curcycles);
 			m_after_EI = 0;
+			if (m_icount <= 0) return;
 
 			if (!m_HALT)
 			{
 				_PPC = _PCD;
 				debugger_instruction_hook(_PCD);
 
-				m_R++;
 				m_extra_cycles = 0;
 				curcycles = exec_op(ROP());
 				curcycles += m_extra_cycles;
@@ -2007,7 +2150,7 @@ again:
 			else
 			{
 				debugger_wait_hook();
-				curcycles = 3;
+				curcycles = halt_cycles();
 			}
 
 			m_icount -= curcycles;
@@ -2039,6 +2182,7 @@ void z180_device::burn_cycles(int32_t cycles)
  ****************************************************************************/
 void z180_device::execute_set_input(int irqline, int state)
 {
+	m_instruction_fast=false;
 	if (irqline == INPUT_LINE_NMI)
 	{
 		/* mark an NMI pending on the rising edge */
@@ -2058,11 +2202,13 @@ void z180_device::execute_set_input(int irqline, int state)
 
 			/* the main execute loop will take the interrupt */
 		} else if(irqline == Z180_INPUT_LINE_DREQ0) {
+			if (state==ASSERT_LINE && !(m_iol&Z180_DREQ0)) ++m_dma_edge_generation[0];
 			uint32_t iol = m_iol & ~Z180_DREQ0;
 			if(state == ASSERT_LINE)
 				iol |= Z180_DREQ0;
 			z180_write_iolines(iol);
 		} else if(irqline == Z180_INPUT_LINE_DREQ1) {
+			if (state==ASSERT_LINE && !(m_iol&Z180_DREQ1)) ++m_dma_edge_generation[1];
 			uint32_t iol = m_iol & ~Z180_DREQ1;
 			if(state == ASSERT_LINE)
 				iol |= Z180_DREQ1;
@@ -2089,11 +2235,57 @@ bool z180_device::memory_translate(int spacenum, int intention, offs_t &address,
 
 void z180_device::state_import(const device_state_entry &entry)
 {
+	m_replay_pristine=false;
 	switch (entry.index())
 	{
+		case Z180_PC:
+		case STATE_GENPC:
+		case STATE_GENPCBASE:
+		case Z180_SP:
+		case STATE_GENFLAGS:
+		case Z180_A:
+		case Z180_B:
+		case Z180_C:
+		case Z180_D:
+		case Z180_E:
+		case Z180_H:
+		case Z180_L:
+		case Z180_AF:
+		case Z180_BC:
+		case Z180_DE:
+		case Z180_HL:
+		case Z180_IX:
+		case Z180_IY:
+		case Z180_AF2:
+		case Z180_BC2:
+		case Z180_DE2:
+		case Z180_HL2:
+		case Z180_I:
+		case Z180_IM:
+			// The entry already stored this register. Preserve its old replay
+			// semantics by requiring the ordinary ISA continuation next time.
+			break;
+
+		case Z180_IFF1:
+		case Z180_IFF2:
+		case Z180_HALT:
+			// Debugger control writes must survive replay of a suspended ISA
+			// handler. Finish its actual bus edges; do not cancel the journal.
+			if (m_cycle_engine && m_instruction_active)
+			{
+				m_instruction_start.control[2] = m_IFF1;
+				m_instruction_start.control[3] = m_IFF2;
+				m_instruction_start.control[4] = m_HALT;
+			}
+			break;
+
 		case Z180_R:
 			m_R = m_rtemp & 0x7f;
 			m_R2 = m_rtemp & 0x80;
+			break;
+
+		case Z180_TCR:
+			cycle_update_direct_reads();
 			break;
 
 		case Z180_CBR:

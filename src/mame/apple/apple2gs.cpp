@@ -55,8 +55,10 @@
 ***************************************************************************/
 
 #include "emu.h"
-#include "twgs_timing.h"
+
+#include "twgs_slot_timing.h"
 #include "twgs_clock.h"
+#include "observer_clock.h"
 #include "applesqueezer.h"
 #include "osdcore.h"
 
@@ -93,9 +95,7 @@
 
 #include <bit>
 
-#define LOG_GLU (1U << 1)
-#define LOG_GLUTRACE (1U << 2)
-#define VERBOSE (LOG_GLU | LOG_GLUTRACE)
+#define VERBOSE 0
 #include "logmacro.h"
 
 namespace {
@@ -441,6 +441,20 @@ private:
 	void keyglu_mcu_write(u8 offset, u8 data);
 	u8 keyglu_816_read(u8 offset);
 	void keyglu_816_write(u8 offset, u8 data);
+	void keyglu_mcu_ack(u8 offset);
+	void keyglu_816_ack(u8 offset);
+	bool keyglu_access(bool mcu, u8 reg, bool write, u8 &data);
+	bool keyglu_queue(bool mcu, u8 reg, bool write, u8 data, attotime when);
+	bool keyglu_host_prepare(u32 address, bool write, u8 data, attotime when, u8 bus);
+	static int keyglu_816_register(offs_t offset, bool write);
+	bool keyglu_816_access(offs_t offset, bool write, u8 &data);
+	u8 keyglu_edge(bool mcu, u8 reg, bool write, u8 data);
+	TIMER_CALLBACK_MEMBER(keyglu_sync);
+	emu_timer *m_keyglu_timer[2]{};
+	u8 m_keyglu_pending[2]{}, m_keyglu_result[2]{};
+	u16 m_keyglu_request[2]{};
+	attotime m_keyglu_time[2];
+	u8 m_keyglu_host_bus = 0; // 0 CPU, 1 TWGS, 2 AS FIFO, 3 legacy AS read, 4 observed AS read, 5 slow CPU
 
 	u8 m_adb_p2_last, m_adb_p3_last;
 	int m_adb_reset_freeze = 0;
@@ -487,17 +501,17 @@ private:
 
 	bool m_last_speed = false;
 
-	// Sound GLU. The DOC host port is free on one phase of the oscillator slot
-	// (8 clocks of the 7.159 MHz DOC clock). A CPU transfer that misses that
-	// phase is latched and completed on the following slot, so the port is
-	// busy for between one and two slots. Register writes do not stall: a
-	// second write replaces the byte still in the latch. Register reads and
-	// sound-RAM accesses hold the CPU until the DOC port finishes. The 16-step
-	// VCA sits after the DOC/speaker sum.
+	// Sound GLU: one bidirectional holding latch, no CPU ready connection.
+	// Host work uses DOC E-high. The register sample at E-fall and the
+	// following data hold are separate events on the DOC's shared clock.
 	u8 m_sndglu_ctrl = 0x0f;
 	u16 m_sndglu_addr = 0;
 	int m_sndglu_dummy_read = 0;
 	attotime m_sndglu_busy_until;
+	attotime m_sndglu_transfer_at, m_sndglu_host_rise;
+	u64 m_sndglu_host_fall = 0;
+	bool m_sndglu_landed = false, m_sndglu_addr_locked = false;
+	u16 m_sndglu_lock_addr = 0;
 	bool m_snd_demux = false;
 	bool m_sndglu_pending = false;
 	bool m_sndglu_pend_read = false;
@@ -506,61 +520,35 @@ private:
 	u16 m_sndglu_pend_addr = 0;
 	u8 m_sndglu_pend_data = 0;
 	emu_timer *m_sndglu_timer = nullptr;
-	attotime m_glu_log_at;
-	u32 m_glu_ram = 0;
-	u32 m_glu_land[32][7]{};
-	u32 m_glu_repl[32][7]{};
-	static const char *const s_glu_cls[7];
 	attotime sndglu_now() const;
+	u64 sndglu_slot() const;
+
+	static u64 sndglu_slot_len(u64 slot) { return (slot % BT_LINE == 64 * BT_MEGA) ? BT_MEGA_LAST : BT_MEGA; }
 	attotime bt_at(u64 t) const;
 	bool sndglu_service();
 	bool sndglu_service(attotime time);
 	void sndglu_ctrl_write(u8 data);
-	void sndglu_arm(bool is_read, u8 data);
+	void sndglu_arm(bool is_read, u8 data, attotime request);
+	void sndglu_merge(bool is_read, attotime request);
+	void sndglu_set_deadline();
+	void sndglu_schedule();
 	void sndglu_reg_write(u8 data);
 	void sndglu_commit();
 	// $C03D register write judged at the bus time bt_access computes (the
-	// CPU core calls the handler first). m_snd_force is that time.
+	// CPU core calls the handler first). m_snd_slot is that bus cycle.
 	bool m_glu_hold = false;
 	u16 m_glu_hold_reg = 0;
 	void sndglu_addr_write(u16 reg, u8 data);
 	u8 m_glu_hold_data = 0;
-	attotime m_snd_force;
+	u64 m_snd_slot = 0;
 	bool m_snd_force_on = false;
-	void sndglu_tally(u16 addr, bool land);
-	void sndglu_log_table();
 	void sndglu_apply_vca();
 	float m_snd_gain_mono = -1.0f, m_snd_gain_side = -1.0f, m_snd_vca = -1.0f;
 	TIMER_CALLBACK_MEMBER(sndglu_commit_cb);
 
-	// Optional Sound GLU diagnostics use the transfer model's bus timestamps
-	// and latch state. Keep logging passive: it must not schedule transfers
-	// or change their deadlines. m_glu_log_enabled gates diagnostic work.
-	bool m_glu_log_enabled = false;
-	struct glu_log_context
-	{
-		attotime time;
-		int64_t gap = -1;
-		u32 pc = 0, cpu_hz = 0, accelerator_hz = 0;
-		u8 bank = 0;
-		const char *accelerator = "none";
-	};
-	glu_log_context m_glu_log_context;
-	u32 m_glu_log_instruction_pc = 0;
-	u8 m_glu_log_access_bank = 0;
-	u16 m_glu_log_intended_address = 0;
-	u8 m_glu_log_intended_control = 15;
-	int64_t m_glu_log_last_cycle = -1;
-	u64 m_glu_log_counts[6]{};
-	attotime m_glu_log_summary_at;
-	void sndglu_log_note(u32 address, int type);
-	bool sndglu_log_memory(u32 address, int type, u8 &data);
-	std::string sndglu_log_prefix(const glu_log_context &event) const;
-	std::string sndglu_log_cpu_state();
-	std::string sndglu_log_stack();
-	void sndglu_log_event(unsigned kind, std::string details);
-	void sndglu_log_access(unsigned port, bool read, u8 data, u8 result = 0);
-	void sndglu_log_summary();
+	class trace_state;
+	std::unique_ptr<trace_state> m_trace;
+	bool trace_memory(u32 address, int type, u8 &data);
 
 	// Key GLU variables
 	u8 m_glu_regs[12]{}, m_glu_bus = 0;
@@ -614,6 +602,8 @@ private:
 	u64 m_as_mapping_until = 0;
 	u64 m_as_io_until = 0;
 	u32 m_as_io_delay_us = 500;
+	u32 m_as_sound_delay_us = 500;
+	bool m_as_glu_wait = false; // experimental per-access readiness guard, not current-core behavior
 	u8 m_as_slow_ram[0x20000]{};
 	std::unique_ptr<u8[]> m_as_extended;
 	applesqueezer::dram_port m_as_dram;
@@ -628,9 +618,10 @@ private:
 	u8 as_slow_r(u32 address) const;
 	void as_slow_w(u32 address, u8 data);
 	void as_flush(u64 time);
+	void as_materialize(applesqueezer::write_entry const &entry);
 	void as_schedule();
 	void as_postload();
-	void as_io_access(u64 end);
+	void as_io_access(u32 address, u64 end);
 	TIMER_CALLBACK_MEMBER(as_write_complete);
 	TIMER_CALLBACK_MEMBER(as_io_complete);
 
@@ -698,7 +689,8 @@ private:
 	static constexpr u64 BUS_READ_RESUME = 1; // US 4,794,523 DL1/DL2 synchronizer: retain the one-card-cycle read resume.
 	static constexpr int ZIP_WRITE_DEPTH = 1; // US 4,794,523 Table I has one first-stage write latch.
 	static constexpr int TWGS_WRITE_LATCHES = 4; // Body schematic and GAL1 decode use all four write-latch columns.
-	static constexpr u32 REPSEP_SLOW_CYCLES = 1; // GAL3 OP_SLOW decodes REP/SEP; retain the model's one motherboard cycle.
+	static constexpr u32 REPSEP_SLOW_CYCLES = 1; // Legacy TWGS compatibility accounting; decoded TWGS uses GAL3 alone.
+	bool m_zip_repsep_pending = false;
 	static constexpr u64 BT_CLK = 1056;
 	static constexpr u64 BT_PER_SEC = 15'120'000'000; // 14.318181 MHz * 1056
 	static constexpr u64 BT_FAST = 5 * BT_CLK;
@@ -709,7 +701,16 @@ private:
 	static constexpr u64 BT_LINE = 912 * BT_CLK;
 	static constexpr u64 BT_IDLE = 64; // more cycles than one instruction: the CPU waited (WAI)
 	static constexpr u64 BT_PAGE_UNIT = 66; // per-page stall counters are in 1/16 of a 14M clock
-	enum { BT_OFF = 0, BT_STOCK, BT_ZIP, BT_TWGS, BT_NATIVE, BT_APPLESQUEEZER };
+
+	enum
+	{
+		BT_OFF = 0,
+		BT_STOCK,
+		BT_ZIP,
+		BT_TWGS,
+		BT_NATIVE,
+		BT_APPLESQUEEZER
+	};
 	enum { BC_RAM = 0, BC_ROM, BC_FASTIO, BC_MEGA };
 
 	// profile region ":zipprof", read by Lua
@@ -734,6 +735,9 @@ private:
 	bool m_bt_slot_ok = false;
 	u64 m_bt_wbuf[4] = { 0, 0, 0, 0 };
 	int m_bt_wcount = 0;
+	bool m_zip_write_ph0 = false;
+
+	u64 zip_write_ready() const { return m_bt_wbuf[0] + (m_zip_write_ph0 ? sndglu_slot_len(m_bt_wbuf[0]) : 0); }
 	std::unique_ptr<u32[]> m_zip_tag;
 	std::unique_ptr<u8[]> m_zip_data;
 	bool m_zip_tag_update = false, m_zip_trash_tag = false;
@@ -747,7 +751,7 @@ private:
 	bool zip_iolc(u32 address) const;
 	void zip_snoop(u32 address, bool write, u8 data);
 	bool zip_cacheable(u32 address) const;
-	u32 zip_taddr(u32 address, bool write) const;
+	u32 zip_taddr(u32 address, int type) const;
 	u8 zip_access(u32 address, int type, u8 data);
 	u32 m_zip_mask = 0x3fff;
 	u8 m_zip_size = 1;
@@ -776,19 +780,124 @@ private:
 	using twgs_time = twgs_decoded::time_base<BT_PER_SEC * TWGS_TIME_SCALE>;
 	static u64 twgs_ticks(attotime const &t) { return twgs_time::ticks(t.seconds(), t.attoseconds()); }
 	static attotime twgs_at(u64 t) { return attotime(t / (BT_PER_SEC * TWGS_TIME_SCALE), twgs_time::fraction(t)); }
-	twgs_decoded::timing_scaled<TWGS_TIME_SCALE> m_twgs_kernel;
+
+	twgs_decoded::slot_timing<TWGS_TIME_SCALE> m_twgs_kernel;
 	bool m_twgs_kernel_on = false, m_twgs_kernel_started = false;
+	bool m_twgs_cpu_idle = false;
+	bool m_twgs_stream_owned = false; // transient: cleared before returning to the scheduler
 	u64 m_twgs_transaction = 0, m_twgs_retired = 0, m_twgs_visible = 0;
 	u64 m_twgs_unemitted_cycles = 0;
 	s64 m_twgs_cycle_charge = 0;
+	bool m_twgs_access_pending = false, m_twgs_access_suspended = false;
+	u64 m_twgs_access_start = 0, m_twgs_access_mega = 0, m_twgs_access_board = 0, m_twgs_access_refresh = 0;
+	u64 m_twgs_suspend_cycles = 0;
+	bool m_twgs_phase_waiting = false, m_twgs_phase_delivering = false;
+	u64 m_twgs_phase_tick = 0;
+	u64 m_twgs_deferred_input_tick = ~u64(0);
+	bool twgs_prepare_phase(u64 when);
+	// Derived conversion cache, keyed by the complete scheduler expiration.
+	// No state-load invalidation is needed: equal keys always give equal ticks.
+	attotime m_twgs_limit_time = attotime::never;
+	u64 m_twgs_limit_tick = ~u64(0);
+
+	u64 twgs_phase_limit()
+	{
+		const auto when = machine().scheduler().first_timer()->expire();
+		if (when != m_twgs_limit_time)
+		{
+			m_twgs_limit_time = when;
+			const u64 tick = when.is_never() ? 0 : twgs_ticks(when), clk = m_twgs_kernel.CLK;
+			m_twgs_limit_tick = when.is_never() ? ~u64(0) : ((tick + clk - 1) / clk) * clk;
+		}
+		return m_twgs_limit_tick;
+	}
 	struct twgs_board
 	{
 		apple2gs_state &owner;
-		void read(twgs_decoded::transaction &w, u64 begin, u64 end) { w.data = owner.twgs_board_read(w, begin, end); }
-		void write(twgs_decoded::transaction const &w, u64 begin, u64 end) { owner.twgs_board_write(w, begin, end); }
+		int idle = -1, read_idle = -1;
+		u32 read_address = 0;
+		u8 read_data = 0;
+		u64 limit = ~u64(0);
+
+		void invalidate()
+		{
+			idle = read_idle = -1;
+			limit = ~u64(0);
+		}
+
+		bool prepare(twgs_decoded::transaction const &w, u64 end)
+		{
+			invalidate();
+			return owner.twgs_keyglu_prepare(w, end);
+		}
+
+		void read(twgs_decoded::transaction &w, u64 begin, u64 end)
+		{
+			invalidate();
+			w.data = owner.twgs_board_read(w, begin, end);
+		}
+
+		void write(twgs_decoded::transaction const &w, u64 begin, u64 end)
+		{
+			invalidate();
+			owner.twgs_board_write(w, begin, end);
+		}
+
+		void write(twgs_decoded::transaction const &w, u64 begin, u64 end, bool complete)
+		{
+			invalidate();
+			owner.twgs_board_write(w, begin, end, complete);
+		}
+
+		int phase(twgs_decoded::transaction const &w, u64 time, bool ph0, bool m7, bool selected, bool bank)
+		{
+			invalidate();
+			return owner.twgs_slot_phase(w, time, ph0, m7, selected, bank);
+		}
+
+		bool rdy() const { return !owner.m_mega_waiting; }
+
+		bool prepare_phase(u64 when)
+		{
+			invalidate();
+			return owner.twgs_prepare_phase(when);
+		}
+
+		bool idle_phases()
+		{
+			if (idle < 0)
+				idle = owner.m_a2bus->can_defer_mega_idle();
+			return idle;
+		}
+
+		bool read_phases(twgs_decoded::transaction const &w)
+		{
+			if (read_idle < 0 || read_address != w.address || read_data != w.data)
+			{
+				read_address = w.address;
+				read_data = w.data;
+				read_idle = owner.m_a2bus->can_defer_mega_read(read_address, read_data);
+			}
+			return read_idle;
+		}
+
+		u64 idle_phase_limit()
+		{
+			if (limit != ~u64(0))
+				return limit;
+			return limit = owner.twgs_phase_limit();
+		}
+
+		void idle_phases(u64, u64 last)
+		{
+			owner.m_a2bus->advance_mega_idle(last / owner.m_twgs_kernel.CLK);
+		}
 	};
+
 	u8 twgs_board_read(twgs_decoded::transaction const &w, u64 begin, u64 end);
-	void twgs_board_write(twgs_decoded::transaction const &w, u64 begin, u64 end);
+	bool twgs_keyglu_prepare(twgs_decoded::transaction const &w, u64 end);
+	void twgs_board_write(twgs_decoded::transaction const &w, u64 begin, u64 end, bool complete = true);
+	int twgs_slot_phase(twgs_decoded::transaction const &w, u64 time, bool ph0, bool m7, bool selected, bool bank);
 	void twgs_kernel_cycle(u32 address, int type, u8 &data);
 	int twgs_kernel_access(u32 address, int type, u8 &data);
 	int twgs_internal(u32 address, int type, u8 data);
@@ -798,7 +907,46 @@ private:
 	u64 *m_btc = nullptr;
 	u64 *m_btpage = nullptr, *m_btpc = nullptr;
 
-	int bt_access(u32 address, int type, u8 data);
+	int bt_access(u32 address, int type, u8 &data);
+	int mega_observed_access(u32 address, int type, u8 &data);
+	bool mega_slow_keyglu(u32 address, int type, u8 &data, int &cycles);
+	bool mega_selected(u32 address, bool write);
+	void mega_transfer(u32 address, bool read, u8 &data, attotime when, int bank = -1, bool zip_opcode = false, u64 raw_end = 0);
+	bool m_mega_observe = false, m_mega_waiting = false;
+	// Observer delivery only. CPU/cache/write-buffer timing remains the
+	// validated path; these records carry its already calculated bus ends.
+	static constexpr unsigned MEGA_OBSERVER_QUEUE = 128;
+	std::array<u32, MEGA_OBSERVER_QUEUE> m_observer_address{};
+	std::array<u8, MEGA_OBSERVER_QUEUE> m_observer_data{}, m_observer_flags{};
+	std::array<bool, MEGA_OBSERVER_QUEUE> m_observer_keyglu_cycle{};
+	u8 m_slow_keyglu_pending = 0, m_slow_keyglu_data = 0;
+	u32 m_slow_keyglu_address = 0;
+	int m_slow_keyglu_cycles = 0;
+	std::array<attotime, MEGA_OBSERVER_QUEUE> m_observer_time{}, m_observer_high_time{};
+	std::array<attotime, MEGA_OBSERVER_QUEUE> m_observer_origin_time{};
+	std::array<u64, MEGA_OBSERVER_QUEUE> m_observer_tick{}, m_observer_period{}, m_observer_divisor{};
+	std::array<u64, MEGA_OBSERVER_QUEUE> m_observer_origin_tick{};
+	attotime m_observer_epoch_time;
+	u64 m_observer_epoch_tick = 0, m_observer_epoch_period = 0, m_observer_epoch_divisor = 1;
+	u64 m_observer_first_tick = 0;
+	attotime m_observer_cpu_stop_time;
+	unsigned m_observer_head = 0, m_observer_count = 0;
+	bool m_observer_held = false, m_observer_read_pending = false, m_observer_high = true;
+	bool m_as_observer_pending = false, m_as_observer_blocked = false;
+	attotime m_observer_first_end;
+	u64 m_observer_cpu_stop_cycles = 0;
+	bool m_observer_cpu_released = false;
+	emu_timer *m_observer_timer = nullptr;
+	void observer_schedule();
+	attotime observer_at(unsigned entry, u64 ticks) const;
+	u64 observer_ticks(attotime when) const;
+	TIMER_CALLBACK_MEMBER(observer_deliver);
+	attotime m_mega_bus_time;
+	void mega_ready(int ready);
+	bool m_as_bus_retry = false;
+	u64 m_as_retry_charge = 0;
+	u64 m_as_retry_deadline = 0;
+	u64 m_as_keyglu_begin = 0, m_as_keyglu_slot = 0, m_as_keyglu_end = 0;
 	u64 bt_instruction(u32 pc);
 	u64 bt_fast(u64 t, bool refresh);
 	u64 bt_mega_start(u64 t) const;
@@ -810,11 +958,18 @@ private:
 	void bt_control();
 };
 
+#include "apple2gs_trace.h"
+
 // FF6ACF is speed test routine in ROM 3
 
 // slow_cycle() - take a 1 MHz cycle.  Theory: a 2.8 MHz cycle is 14M / 5.
 // 1 MHz is 14M / 14.  14/5 = 2.8 * 65536 (16.16 fixed point) = 0x2cccd.
+// With a bus observer, this selects the CPU access whose bus hook will
+// publish A/F. A Lua/device access between CPU slices still performs its
+// memory operation, but must not select the next CPU access (notably VPB's
+// fast ROM/RAM read) or charge it slow clocks. Preserve the unobserved path.
 #define slow_cycle() \
+if (!m_mega_observe || m_maincpu->executing()) \
 {   \
 	if (m_bt_mode != BT_OFF) \
 	{\
@@ -953,6 +1108,8 @@ void apple2gs_state::machine_start()
 		save_item(NAME(m_as_mapping_until));
 		save_item(NAME(m_as_io_until));
 		save_item(NAME(m_as_io_delay_us));
+		save_item(NAME(m_as_sound_delay_us));
+		save_item(NAME(m_as_glu_wait));
 		save_item(NAME(m_as_dram.main_bank));
 		save_item(NAME(m_as_dram.offset));
 		save_item(NAME(m_as_dram.at_bank_end));
@@ -974,9 +1131,18 @@ void apple2gs_state::machine_start()
 	m_twgs_data = std::make_unique<u8[]>(0x10000);
 	m_twgs_write_timer = timer_alloc(FUNC(apple2gs_state::twgs_write_complete), this);
 	m_sndglu_timer = timer_alloc(FUNC(apple2gs_state::sndglu_commit_cb), this);
-	m_glu_log_enabled = (VERBOSE & (LOG_GLU | LOG_GLUTRACE)) && machine().allow_logging();
+	if (machine().allow_logging())
+		m_trace = std::make_unique<trace_state>(*this);
 	m_doc->set_host_sync([this](attotime time) { sndglu_service(time); });
 	m_a2bus->set_dma_sync([this]() { twgs_flush_due(); });
+	// Slot children reset before driver_device::machine_reset. Use the same
+	// configuration/signature predicates here, before its cached flags exist.
+	m_a2bus->set_mega_phase_query([this]()
+	{
+		const ioport_value cfg = m_btconfig->read();
+		return !m_as_model && (m_sysconfig->read() & 1) && BIT(cfg, 10) && !BIT(cfg, 13) &&
+			(!BIT(ioport("twgs_rom")->read(), 0) || !memcmp(m_twgs_rom + 0x7f00, "TWGS", 4));
+	});
 	twgs_build_firmware();
 	m_twgs_rom = memregion("twgs")->base();
 	memory_region *prof = machine().memory().region_alloc(":zipprof", BTP_SIZE, 1, ENDIANNESS_LITTLE);
@@ -987,9 +1153,87 @@ void apple2gs_state::machine_start()
 	m_btpc = reinterpret_cast<u64 *>(m_btprof + BTP_PCS);
 	m_maincpu->set_data_hook(g65816_device::data_hook_delegate(&apple2gs_state::twdc_access, this));
 	machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([this]() {
-		sndglu_log_table();
+		if (m_trace) m_trace->sndglu_log_table();
 	}));
-	m_maincpu->set_bus_hook(g65816_device::bus_hook_delegate(&apple2gs_state::bt_access, this));
+	m_mega_observe = m_a2bus->has_mega_observers();
+	if (m_mega_observe)
+	{
+		m_maincpu->enable_bus_clock_stream(true);
+		m_maincpu->set_bus_idle_hook([this](bool idle)
+		{
+			if (!m_twgs_kernel_on || idle == m_twgs_cpu_idle)
+				return;
+			m_twgs_cpu_idle = idle;
+			twgs_kernel_schedule();
+		});
+	}
+	if (m_mega_observe)
+		m_observer_timer = timer_alloc(FUNC(apple2gs_state::observer_deliver), this);
+	save_item(NAME(m_observer_address));
+	save_item(NAME(m_observer_data));
+	save_item(NAME(m_observer_flags));
+	save_item(NAME(m_observer_time));
+	save_item(NAME(m_observer_keyglu_cycle));
+	save_item(NAME(m_slow_keyglu_pending));
+	save_item(NAME(m_slow_keyglu_data));
+	save_item(NAME(m_slow_keyglu_address));
+	save_item(NAME(m_slow_keyglu_cycles));
+	save_item(NAME(m_observer_high_time));
+	save_item(NAME(m_observer_tick));
+	save_item(NAME(m_observer_origin_time));
+	save_item(NAME(m_observer_origin_tick));
+	save_item(NAME(m_observer_period));
+	save_item(NAME(m_observer_divisor));
+	save_item(NAME(m_observer_epoch_time));
+	save_item(NAME(m_observer_epoch_tick));
+	save_item(NAME(m_observer_epoch_period));
+	save_item(NAME(m_observer_epoch_divisor));
+	save_item(NAME(m_observer_first_tick));
+	save_item(NAME(m_observer_cpu_stop_time));
+	save_item(NAME(m_observer_head));
+	save_item(NAME(m_observer_count));
+	save_item(NAME(m_observer_held));
+	save_item(NAME(m_observer_first_end));
+	save_item(NAME(m_observer_high));
+	save_item(NAME(m_observer_read_pending));
+	save_item(NAME(m_as_observer_pending));
+	save_item(NAME(m_as_observer_blocked));
+	save_item(NAME(m_observer_cpu_stop_cycles));
+	save_item(NAME(m_observer_cpu_released));
+	// KEYGLU's two clock domains also need zero-time bus continuations.
+	m_maincpu->enable_bus_wait();
+	if (m_mega_observe)
+		m_maincpu->set_irq_sync([this](attotime when) { return m_a2bus->synchronize_mega_irq(when); });
+	for (auto &timer : m_keyglu_timer)
+		timer = timer_alloc(FUNC(apple2gs_state::keyglu_sync), this);
+	save_item(NAME(m_keyglu_pending));
+	save_item(NAME(m_keyglu_result));
+	save_item(NAME(m_keyglu_request));
+	save_item(NAME(m_keyglu_time));
+	save_item(NAME(m_keyglu_host_bus));
+	save_item(NAME(m_mega_waiting));
+	save_item(NAME(m_mega_bus_time));
+	save_item(NAME(m_as_bus_retry));
+	save_item(NAME(m_as_retry_charge));
+	save_item(NAME(m_as_retry_deadline));
+	save_item(NAME(m_as_keyglu_begin));
+	save_item(NAME(m_as_keyglu_slot));
+	save_item(NAME(m_as_keyglu_end));
+	// Pin 35: ROM03 slots 1-6; ROM01 slot 3 (Second Sight manual).
+	m_a2bus->set_m2b0_slot_mask(m_is_rom3 ? 0x7e : 0x08);
+	m_maincpu->set_bus_hook(m_mega_observe ? g65816_device::bus_hook_delegate(&apple2gs_state::mega_observed_access, this) :
+											 g65816_device::bus_hook_delegate(&apple2gs_state::bt_access, this));
+	if (m_mega_observe)
+		m_a2bus->set_dma_observer([this](u32 address, bool read, u8 &data)
+		{
+			if (mega_selected(address, !read))
+			{
+				// Slot DMA supplies its completed cycle at this callback;
+				// it is not a future CPU posted write.
+				m_mega_bus_time = machine().time();
+				data = m_a2bus->mega_cycle({u16(address), data, read, false, bool(BIT(address, 16)), false, m_mega_bus_time});
+			}
+		});
 	m_speaker_state = 0;
 	m_speaker->level_w(m_speaker_state);
 	m_upperbank.select(0);
@@ -1125,6 +1369,12 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_sndglu_addr));
 	save_item(NAME(m_sndglu_dummy_read));
 	save_item(NAME(m_sndglu_busy_until));
+	save_item(NAME(m_sndglu_transfer_at));
+	save_item(NAME(m_sndglu_host_rise));
+	save_item(NAME(m_sndglu_host_fall));
+	save_item(NAME(m_sndglu_landed));
+	save_item(NAME(m_sndglu_addr_locked));
+	save_item(NAME(m_sndglu_lock_addr));
 	save_item(NAME(m_sndglu_pending));
 	save_item(NAME(m_sndglu_pend_read));
 	save_item(NAME(m_sndglu_pend_ram));
@@ -1182,18 +1432,48 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_bt_busfree));
 	save_item(NAME(m_bt_wbuf));
 	save_item(NAME(m_bt_wcount));
+	save_item(NAME(m_zip_write_ph0));
 	save_item(NAME(m_bt_twslow));
 	save_item(NAME(m_zip_mask));
 	save_item(NAME(m_zip_size));
 	save_item(NAME(m_zip_bank_ok));
 	// Decoded card state: every physical register, tag and holding latch.
 	save_item(NAME(m_twgs_kernel_on));
+	save_item(NAME(m_twgs_cpu_idle));
 	save_item(NAME(m_twgs_kernel_started));
 	save_item(NAME(m_twgs_transaction));
 	save_item(NAME(m_twgs_retired));
 	save_item(NAME(m_twgs_visible));
 	save_item(NAME(m_twgs_unemitted_cycles));
 	save_item(NAME(m_twgs_cycle_charge));
+	save_item(NAME(m_twgs_access_pending));
+	save_item(NAME(m_twgs_access_suspended));
+	save_item(NAME(m_twgs_access_start));
+	save_item(NAME(m_twgs_access_mega));
+	save_item(NAME(m_twgs_access_board));
+	save_item(NAME(m_twgs_access_refresh));
+	save_item(NAME(m_twgs_suspend_cycles));
+	save_item(NAME(m_twgs_phase_waiting));
+	save_item(NAME(m_twgs_phase_tick));
+	save_item(NAME(m_twgs_kernel.ready.h));
+	save_item(NAME(m_twgs_kernel.ready.dma));
+	save_item(NAME(m_twgs_kernel.ready.u30));
+	save_item(NAME(m_twgs_kernel.phase_event));
+	save_item(NAME(m_twgs_kernel.motherboard.address));
+	save_item(NAME(m_twgs_kernel.motherboard.id));
+	save_item(NAME(m_twgs_kernel.motherboard.data));
+	save_item(NAME(m_twgs_kernel.motherboard.type));
+	save_item(NAME(m_twgs_kernel.motherboard.seed));
+	save_item(NAME(m_twgs_kernel.falling_bus.address));
+	save_item(NAME(m_twgs_kernel.falling_bus.id));
+	save_item(NAME(m_twgs_kernel.falling_bus.data));
+	save_item(NAME(m_twgs_kernel.falling_bus.type));
+	save_item(NAME(m_twgs_kernel.falling_bus.seed));
+	save_item(NAME(m_twgs_kernel.motherboard_valid));
+	save_item(NAME(m_twgs_kernel.motherboard_mega));
+	save_item(NAME(m_twgs_kernel.retry));
+	save_item(NAME(m_twgs_kernel.falling_valid));
+	save_item(NAME(m_twgs_kernel.pending));
 	save_item(NAME(m_twgs_kernel.now));
 	save_item(NAME(m_twgs_kernel.early));
 	save_item(NAME(m_twgs_kernel.late));
@@ -1212,6 +1492,15 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_twgs_kernel.next_gs_level));
 	save_item(NAME(m_twgs_kernel.had_bus));
 	save_item(NAME(m_twgs_kernel.fast_hits));
+	save_item(NAME(m_twgs_kernel.socket.bus.address));
+	save_item(NAME(m_twgs_kernel.socket.bus.id));
+	save_item(NAME(m_twgs_kernel.socket.bus.data));
+	save_item(NAME(m_twgs_kernel.socket.bus.type));
+	save_item(NAME(m_twgs_kernel.socket.bus.seed));
+	save_item(NAME(m_twgs_kernel.socket.byte));
+	save_item(NAME(m_twgs_kernel.socket.valid));
+	save_item(NAME(m_twgs_kernel.bus_stage));
+	save_item(NAME(m_twgs_kernel.bus_waiting));
 	save_item(NAME(m_twgs_kernel.c.ctl.q1));
 	save_item(NAME(m_twgs_kernel.c.ctl.q2));
 	save_item(NAME(m_twgs_kernel.c.ctl.gs));
@@ -1344,6 +1633,7 @@ void apple2gs_state::machine_start()
 	save_item(NAME(m_zip_intcxrom));
 	save_item(NAME(m_zip_c8_slot));
 	save_item(NAME(m_zip_hit));
+	save_item(NAME(m_zip_repsep_pending));
 
 	save_item(NAME(m_twgs_ramrd));
 	save_item(NAME(m_twgs_ramwrt));
@@ -1363,10 +1653,31 @@ void apple2gs_state::machine_start()
 
 void apple2gs_state::machine_reset()
 {
-	if (m_as_model && m_as_fifo.count)
+	m_observer_head = m_observer_count = 0;
+	m_twgs_phase_waiting = m_twgs_phase_delivering = false;
+	m_twgs_cpu_idle = m_twgs_stream_owned = false;
+	m_observer_cpu_released = false;
+	m_observer_held = m_observer_read_pending = false;
+	m_observer_high = true;
+	m_as_observer_pending = m_as_observer_blocked = false;
+	if (m_observer_timer)
+		m_observer_timer->adjust(attotime::never);
+	for (int i = 0; i < 2; ++i)
+	{
+		m_keyglu_pending[i] = 0;
+		m_keyglu_timer[i]->adjust(attotime::never);
+	}
+	m_keyglu_host_bus = 0;
+	m_slow_keyglu_pending = 0;
+	m_maincpu->resume(SUSPEND_REASON_SYNC);
+	m_as_bus_retry = false;
+	m_as_retry_charge = 0;
+	m_as_retry_deadline = 0;
+	if (m_as_model && m_as_fifo.count && !m_mega_observe)
 		as_flush(m_as_fifo.entries[(m_as_fifo.head + m_as_fifo.count - 1) % applesqueezer::write_fifo::capacity].end);
 	m_j13_config = m_j13_config_port.read_safe(0);
 	m_zip_tag_update = m_zip_trash_tag = false;
+	m_zip_repsep_pending = false;
 	bool const cold_start = !m_ram_initialized;
 	// Configuration is loaded after machine_start.  Initialise physical RAM only
 	// on power-on; RESET retains its contents.  DRAM does not have a reset input.
@@ -1469,15 +1780,13 @@ void apple2gs_state::machine_reset()
 	m_sndglu_busy_until = attotime::zero;
 	m_sndglu_pending = false;
 	m_sndglu_pend_read = false;
+	m_sndglu_landed = m_sndglu_addr_locked = false;
 	m_sndglu_pend_ram = false;
 	m_sndglu_pend_auto = false;
 	m_sndglu_pend_addr = 0;
 	m_sndglu_pend_data = 0;
 	m_sndglu_timer->adjust(attotime::never);
-	m_glu_log_at = attotime::from_seconds(10);
-	m_glu_ram = 0;
-	std::fill(&m_glu_land[0][0], &m_glu_land[0][0] + 32 * 7, 0);
-	std::fill(&m_glu_repl[0][0], &m_glu_repl[0][0] + 32 * 7, 0);
+	if (m_trace) m_trace->reset();
 	m_snd_demux = ioport("snd_demux")->read() != 0;
 	m_doc->set_output_filter_enabled(!m_snd_demux);
 	m_doc->set_volume_knee(ioport("doc_volume_law")->read() != 0);
@@ -1522,9 +1831,11 @@ void apple2gs_state::machine_reset()
 	m_twgs_post = false;
 	m_twgs_write_timer->adjust(attotime::never);
 	m_maincpu->set_memory_hook(g65816_device::memory_hook_delegate());
-	m_maincpu->set_cached_access(g65816_device::cached_access_delegate());
+	m_maincpu->set_cached_access(m_mega_observe ? g65816_device::cached_access_delegate(&apple2gs_state::mega_slow_keyglu, this) :
+												  g65816_device::cached_access_delegate());
 	m_maincpu->set_internal_hook(g65816_device::internal_hook_delegate());
 	m_twgs_kernel_on = false;
+	m_maincpu->set_bus_yield_hook({});
 	m_maincpu->set_data_hook(g65816_device::data_hook_delegate(&apple2gs_state::twdc_access, this));
 	if (!m_twgs_real)
 		m_maincpu->reset();
@@ -1580,17 +1891,29 @@ void apple2gs_state::machine_reset()
 		else
 			twgs_reset_config();
 	}
-	if (m_twgs_real)
+	if (m_twgs_real || (m_mega_observe && m_twgs))
 	{
+		// Both ROM interfaces use the decoded GAL8/U30/GAL2 RDY path.
+		// The legacy compatibility path is retained when no card observes.
 		m_twgs_kernel_on = m_twgs;
+		if (m_mega_observe && m_twgs_kernel_on)
+			m_maincpu->set_bus_yield_hook([this]()
+			{
+				if (m_twgs_stream_owned)
+					twgs_kernel_schedule();
+			});
 		if (cold_start)
 		{
-			m_twgs_kernel = twgs_decoded::timing_scaled<TWGS_TIME_SCALE>{};
+			m_twgs_kernel = twgs_decoded::slot_timing<TWGS_TIME_SCALE>{};
 			m_twgs_kernel_started = false;
 			m_twgs_transaction = m_twgs_retired = m_twgs_visible = 0;
 			m_twgs_unemitted_cycles = 0;
 			m_twgs_cycle_charge = 0;
 		}
+		if (!m_twgs_real)
+			m_twgs_kernel.c.fpga.clock_full(0xbc0000, false, m_twgs_config, false);
+		m_twgs_access_pending = m_twgs_access_suspended = false;
+		m_twgs_kernel.pending = false;
 		m_maincpu->set_memory_hook(m_twgs ? g65816_device::memory_hook_delegate(&apple2gs_state::twgs_memory, this) : g65816_device::memory_hook_delegate());
 		m_maincpu->set_cached_access(m_twgs ? g65816_device::cached_access_delegate(&apple2gs_state::twgs_cached_access, this) : g65816_device::cached_access_delegate());
 		m_maincpu->set_internal_hook(m_twgs_kernel_on ? g65816_device::internal_hook_delegate(&apple2gs_state::twgs_internal, this) : g65816_device::internal_hook_delegate());
@@ -1600,29 +1923,22 @@ void apple2gs_state::machine_reset()
 	}
 	if (!m_accel_present)
 		m_maincpu->set_data_hook(g65816_device::data_hook_delegate());
-	if (m_glu_log_enabled)
-	{
-		m_glu_log_context = glu_log_context{};
-		m_glu_log_instruction_pc = 0;
-		m_glu_log_access_bank = 0;
-		m_glu_log_intended_address = m_sndglu_addr;
-		m_glu_log_intended_control = m_sndglu_ctrl;
-		m_glu_log_last_cycle = -1;
-		std::fill(std::begin(m_glu_log_counts), std::end(m_glu_log_counts), 0);
-		m_glu_log_summary_at = machine().time() + attotime::from_seconds(10);
-		m_maincpu->set_memory_hook(g65816_device::memory_hook_delegate(&apple2gs_state::sndglu_log_memory, this));
-	}
+	if (m_trace)
+		m_maincpu->set_memory_hook(g65816_device::memory_hook_delegate(&apple2gs_state::trace_memory, this));
+
 	if (m_as_model)
 	{
-		// Warm reset retains RAM and the runtime speed; pending posted writes
-		// are completed in order before the reset starts a fresh queue.
+		// Provisional reset model: warm reset cancels
+		// outstanding FIFO credits, retaining physical and private RAM writes.
+		// The card-absent legacy path retains its validated reset convention.
 		m_as_fifo = {};
 		m_as_mapping_until = 0;
 		m_as_io_until = 0;
 		m_as_cpu_access = false;
 		m_as_timer->adjust(attotime::never);
 		m_as_io_timer->adjust(attotime::never);
-		std::copy(std::begin(m_megaii_ram), std::end(m_megaii_ram), std::begin(m_as_slow_ram));
+		if (cold_start || !m_mega_observe)
+			std::copy(std::begin(m_megaii_ram), std::end(m_megaii_ram), std::begin(m_as_slow_ram));
 		if (cold_start)
 		{
 			m_as_speed = u8(ioport("as_clock")->read());
@@ -1643,7 +1959,7 @@ void apple2gs_state::raise_irq(int irq)
 
 		if (!(m_intflag & INTFLAG_IRQASSERTED))
 		{
-			//printf("raise IRQ %d (mask %x)\n", irq, m_irqmask);
+
 			// Zip AppleTalk delay
 			accel_temp_delay(5, BIT(m_accel_gsxsettings, 5));
 
@@ -1659,7 +1975,6 @@ void apple2gs_state::lower_irq(int irq)
 	{
 		m_irqmask &= ~(1 << irq);
 
-		//printf("lower IRQ %d (mask %x)\n", irq, m_irqmask);
 
 		if (!m_irqmask)
 		{
@@ -1729,6 +2044,7 @@ TIMER_CALLBACK_MEMBER(apple2gs_state::apply_speed)
 
 void apple2gs_state::accel_reset()
 {
+	m_zip_repsep_pending = false;
 	if (!m_accel_warm_boot)
 	{
 		m_accel_unlocked = false;
@@ -1940,7 +2256,11 @@ void apple2gs_state::twgs_w(offs_t offset, u8 data)
 			break;
 		}
 		case 0x16: if (arg < 3) twgs_speed_index(arg); break;
-		case 0x18: std::fill_n(m_zip_tag.get(), 0x10000, 0); break;
+		case 0x18:
+			std::fill_n(m_zip_tag.get(), 0x10000, 0);
+			if (m_twgs_kernel_on)
+				m_twgs_kernel.c.valid.fill(false);
+			break;
 		case 0x1a: twgs_set_config(m_twgs_config | 0x08); break;
 		case 0x1c: twgs_set_config(m_twgs_config & ~0x08); break;
 		case 0x1e: twgs_set_config((arg & ~0x02) | (m_twgs_config & 0x02)); break; // keeps the data cache bit
@@ -1955,6 +2275,8 @@ void apple2gs_state::twgs_set_config(u8 data)
 	if (m_twgs_real && ((m_twgs_config ^ data) & 0x02))
 		std::fill(std::begin(m_twgs_tag), std::end(m_twgs_tag), 0);
 	m_twgs_config = data & 0x0e;
+	if (m_twgs_kernel_on && !m_twgs_real)
+		m_twgs_kernel.c.fpga.clock_full(0xbc0000, false, m_twgs_config, false);
 	m_accel_fast = BIT(m_twgs_config, 2);
 	update_speed();
 }
@@ -2042,10 +2364,32 @@ bool apple2gs_state::twgs_shadowed(u32 address) const
 	return low >= 0x6000 && low < 0xa000 && aux && !(m_shadow & SHAD_SUPERHIRES);
 }
 
+bool apple2gs_state::twgs_keyglu_prepare(twgs_decoded::transaction const &w, u64 end)
+{
+	return keyglu_host_prepare(w.address, !w.read(), w.data, twgs_at(end), 1);
+}
+
+bool apple2gs_state::keyglu_host_prepare(u32 address, bool write, u8 data, attotime when, u8 bus)
+{
+	if (machine().phase() != machine_phase::RUNNING)
+		return true;
+	const u8 bank = address >> 16;
+	const bool mapped = bank == 0xe0 || bank == 0xe1 || (bank < 2 && !(m_shadow & SHAD_IOLC));
+	if (!mapped || (address & 0xff80) != 0xc000)
+		return true;
+	const int reg = keyglu_816_register(address & 0x7f, write);
+	if (reg < 0)
+		return true;
+	m_keyglu_host_bus = bus;
+	return keyglu_queue(false, reg, write, data, when);
+}
+
 u8 apple2gs_state::twgs_board_read(twgs_decoded::transaction const &w, u64 begin, u64 end)
 {
-	if (m_glu_log_enabled)
-		sndglu_log_note(w.address, w.type);
+	// The retained motherboard address can belong to an earlier CPU cycle.
+	// Instruction context comes from the CPU hook, including cache hits.
+	if (m_trace && (w.address & 0xfffc) == 0xc03c)
+		m_trace->m_glu_log_access_bank = w.address >> 16;
 	begin /= TWGS_TIME_SCALE;
 	end /= TWGS_TIME_SCALE;
 	const bool slow = m_bt_slow;
@@ -2055,7 +2399,7 @@ u8 apple2gs_state::twgs_board_read(twgs_decoded::transaction const &w, u64 begin
 	const bool mega = m_twgs_kernel.bus_class(w) == BC_MEGA;
 	m_bt_slot = mega ? end - ((end % BT_LINE) ? BT_MEGA : 16 * BT_CLK) : begin;
 	m_bt_slot_ok = true;
-	m_snd_force = bt_at(m_bt_slot);
+	m_snd_slot = m_bt_slot;
 	m_snd_force_on = true;
 	u8 data;
 	if (w.type == g65816_device::BUS_VECTOR)
@@ -2065,22 +2409,25 @@ u8 apple2gs_state::twgs_board_read(twgs_decoded::transaction const &w, u64 begin
 	else if ((w.address >> 16) == 0xbc)
 	{
 		m_twgs_boot = false;
-		data = twgs_rom_r(w.address & 0xffff);
+		data = m_twgs_real ? twgs_rom_r(w.address & 0xffff) : twgs_r(w.address & 0xffff);
 	}
 	else
 		data = m_maincpu->space(AS_PROGRAM).read_byte(w.address);
+	if (m_mega_observe && mega)
+		data = m_a2bus->mega_read_data(data);
 	m_snd_force_on = false;
 	m_bt_slow = slow;
 	return data;
 }
 
-void apple2gs_state::twgs_board_write(twgs_decoded::transaction const &w, u64 begin, u64 end)
+void apple2gs_state::twgs_board_write(twgs_decoded::transaction const &w, u64 begin, u64 end, bool complete)
 {
-	if (m_glu_log_enabled)
-		sndglu_log_note(w.address, w.type);
+	if (m_trace)
+		m_trace->sndglu_log_note(w.address, w.type);
 	begin /= TWGS_TIME_SCALE;
 	end /= TWGS_TIME_SCALE;
-	m_twgs_retired = std::max(m_twgs_retired, w.id);
+	if (complete)
+		m_twgs_retired = std::max(m_twgs_retired, w.id);
 	// BC belongs to the card. FPGA/register capture happens at CPU completion;
 	// it is never converted into a motherboard write by a barrier or drain.
 	if ((w.address >> 16) == 0xbc)
@@ -2090,16 +2437,129 @@ void apple2gs_state::twgs_board_write(twgs_decoded::transaction const &w, u64 be
 	const bool mega = m_twgs_kernel.bus_class(w) == BC_MEGA;
 	m_bt_slot = mega ? end - ((end % BT_LINE) ? BT_MEGA : 16 * BT_CLK) : begin;
 	m_bt_slot_ok = true;
-	m_snd_force = bt_at(m_bt_slot);
+	m_snd_slot = m_bt_slot;
 	m_snd_force_on = true;
 	m_maincpu->space(AS_PROGRAM).write_byte(w.address, w.data);
 	m_snd_force_on = false;
 	m_bt_slow = slow;
 }
 
+bool apple2gs_state::twgs_prepare_phase(u64 when)
+{
+	if (!m_mega_observe)
+		return true;
+	m_twgs_deferred_input_tick = ~u64(0);
+	auto &t = m_twgs_kernel;
+	// Idle clocks still advance U7 CPU_DELAY/BANK_WINDOW. In particular,
+	// the first low-phase falling 7M edge must precede M2B0's bank window.
+	if (m_twgs_phase_delivering && m_twgs_phase_tick == when)
+		return true;
+	// Once the inactive decode is settled, its periodic clocks have no host
+	// output transitions. U7 history is evaluated at the card's own next
+	// observation; the full selected and RDY-held edge path is unchanged.
+	if (twgs_at(when) < machine().scheduler().first_timer()->expire() && t.phase_idle(when) && t.ready.h && t.ready.dma &&
+		m_a2bus->defer_mega_idle(when / t.CLK))
+		return true;
+	if (twgs_at(when) < machine().scheduler().first_timer()->expire() && t.phase_read(when) && t.ready.h && t.ready.dma &&
+		m_a2bus->can_defer_mega_read(t.motherboard.address, t.motherboard.data))
+	{
+		m_a2bus->advance_mega_idle(when / t.CLK);
+		return true;
+	}
+	const bool bus_fall = when == t.gs_event && !t.next_gs_level &&
+		((t.c.active.valid && !t.c.active.bus.read()) || (!t.c.ctl.sync && t.c.word.read() && t.socket.valid));
+	// Actual motherboard strobes still rendezvous at their physical time.
+	if (!bus_fall && !m_observer_held && t.ready.h && t.ready.dma && twgs_at(when) < machine().scheduler().first_timer()->expire())
+	{
+		const auto next = t.phase_candidate(when);
+		if (m_a2bus->can_defer_mega_transition(next.address, next.read()))
+		{
+			m_twgs_deferred_input_tick = when;
+			return true;
+		}
+	}
+	if (twgs_at(when) < machine().scheduler().base_time())
+		fatalerror("TWGS late phase edge=%s global=%s local=%s now=%llu pending=%d idle=%d charge=%lld suspended=%d pc=%06x",
+			twgs_at(when).as_string(), machine().scheduler().base_time().as_string(), m_maincpu->local_time().as_string(),
+			(unsigned long long)t.now, m_twgs_access_pending, m_twgs_cpu_idle, (long long)m_twgs_cycle_charge, m_twgs_access_suspended,
+			m_maincpu->pc());
+	m_twgs_phase_tick = when;
+	m_twgs_phase_waiting = true;
+	t.bus_waiting = true;
+	m_twgs_write_timer->adjust_absolute(twgs_at(when));
+	return false;
+}
+
+int apple2gs_state::twgs_slot_phase(twgs_decoded::transaction const &w, u64 time, bool ph0, bool m7, bool selected, bool bank)
+{
+	if (!m_twgs_phase_delivering || m_twgs_phase_tick != time)
+	{
+		// prepare_phase granted a stable read with no host output changes.
+		if (!w.read())
+			fatalerror("TWGS deferred an active phase");
+		if (m_twgs_deferred_input_tick == time)
+		{
+			if (!m_a2bus->can_defer_mega_transition(w.address, true))
+				fatalerror("TWGS neutral prediction changed");
+			m_a2bus->defer_mega_transition(time / m_twgs_kernel.CLK, u16(w.address), w.data, !selected);
+		}
+		return -1; // The admitted observer does not drive the read bus.
+	}
+	if (machine().time() != twgs_at(time))
+		fatalerror("TWGS observer phase delivered outside its bus time");
+	m_mega_bus_time = twgs_at(time);
+	const u8 data = m_a2bus->mega_cycle(
+		{u16(w.address), w.data, w.read(), !selected, bank && BIT(w.address, 16), false, m_mega_bus_time, true, ph0, m7});
+	if (!ph0 && m_twgs_kernel.falling_valid)
+	{
+		if (!m_twgs_kernel.ready.gs_ok() && !m_observer_held)
+		{
+			m_observer_held = true;
+			m_observer_first_end = m_mega_bus_time;
+		}
+		else if (m_twgs_kernel.ready.gs_ok() && m_observer_held)
+		{
+			if (!observer_ticks(m_mega_bus_time - m_observer_first_end))
+				fatalerror("TWGS observer hold completed without elapsed time");
+			m_observer_held = false;
+		}
+	}
+	return m_a2bus->mega_read_driven() ? int(data) : -1;
+}
+
 void apple2gs_state::twgs_kernel_schedule()
 {
-	if (m_twgs_retired >= m_twgs_visible)
+	m_twgs_stream_owned = false;
+	if (m_mega_observe && m_twgs_phase_waiting)
+	{
+		m_twgs_write_timer->adjust_absolute(twgs_at(m_twgs_phase_tick));
+		return;
+	}
+	// A shared-latch rendezvous owns this unfinished motherboard edge.
+	// Its timer resumes the edge; rearming it here would spin at one time.
+	if (m_keyglu_host_bus == 1 && m_keyglu_pending[0] == 1)
+	{
+		m_twgs_write_timer->adjust(attotime::never);
+		return;
+	}
+	if (m_mega_observe)
+	{
+		if ((m_twgs_access_pending && m_twgs_kernel.pending) || m_twgs_retired < m_twgs_visible ||
+			(m_twgs_cpu_idle && m_twgs_kernel_started))
+		{
+			const u64 event = m_twgs_kernel.next_event();
+			if (twgs_at(event) < machine().scheduler().base_time())
+				fatalerror("TWGS late background edge=%s global=%s local=%s now=%llu pending=%d idle=%d charge=%lld suspended=%d pc=%06x",
+					twgs_at(event).as_string(), machine().scheduler().base_time().as_string(), m_maincpu->local_time().as_string(),
+					(unsigned long long)m_twgs_kernel.now, m_twgs_access_pending, m_twgs_cpu_idle, (long long)m_twgs_cycle_charge,
+					m_twgs_access_suspended, m_maincpu->pc());
+			m_twgs_write_timer->adjust_absolute(twgs_at(event));
+		}
+		else
+			m_twgs_write_timer->adjust(attotime::never);
+		return;
+	}
+	if (m_mega_waiting || m_twgs_retired >= m_twgs_visible)
 	{
 		if (m_twgs_write_timer->enabled())
 			m_twgs_write_timer->adjust(attotime::never);
@@ -2114,6 +2574,15 @@ void apple2gs_state::twgs_kernel_schedule()
 void apple2gs_state::twgs_kernel_cycle(u32 address, int type, u8 &data)
 {
 	auto &t = m_twgs_kernel;
+	// The active CPU advances this same edge stream to its next fall or
+	// rendezvous. Its background timer is not an external input/deadline.
+	// Re-arm below if a posted transfer remains when the CPU returns.
+	if (m_mega_observe && !m_twgs_phase_waiting)
+	{
+		m_twgs_stream_owned = true;
+		if (!m_twgs_write_timer->expire().is_never())
+			m_twgs_write_timer->adjust(attotime::never);
+	}
 	t.speed = (m_speed & m_motors_active) ? (m_speed & ~SPEED_HIGH) : m_speed;
 	t.shadow = m_shadow;
 	if (!m_twgs_kernel_started)
@@ -2123,17 +2592,64 @@ void apple2gs_state::twgs_kernel_cycle(u32 address, int type, u8 &data)
 		t.start(twgs_ticks(m_maincpu->local_time()));
 		m_twgs_kernel_started = true;
 	}
-	const u64 start = t.now, old_mega = t.mega_cycles, old_board = t.board_cycles, old_refresh = t.refresh_cycles;
-	twgs_decoded::transaction w{address, ++m_twgs_transaction, data, u8(type), false};
-	t.access(w, twgs_board{*this});
-	const u64 duration = t.now - start;
+	if (!m_twgs_access_pending)
+	{
+		m_twgs_access_start = t.now;
+		m_twgs_access_mega = t.mega_cycles;
+		m_twgs_access_board = t.board_cycles;
+		m_twgs_access_refresh = t.refresh_cycles;
+		twgs_decoded::transaction w{address, ++m_twgs_transaction, data, u8(type), false};
+		if (m_mega_observe)
+		{
+			t.begin(w);
+			m_twgs_access_pending = true;
+		}
+		else
+		{
+			t.access(w, twgs_board{*this});
+			m_twgs_access_pending = !t.c.completed;
+		}
+	}
+	else if (!m_mega_observe)
+		t.access(t.c.word, twgs_board{*this}, true);
+	const bool finished = m_mega_observe ? (!t.pending || t.access_or_wait(twgs_board{*this})) : t.c.completed;
+	if (!finished && t.bus_waiting)
+	{
+		// Software scheduling only: the physical clock/ready equations and
+		// the eventual transfer charge still belong to this same TWGS edge.
+		m_maincpu->suspend(SUSPEND_REASON_SYNC, false);
+		twgs_kernel_schedule();
+		m_maincpu->defer_bus_access();
+		return;
+	}
+	if (!finished)
+	{
+		if (!m_twgs_access_suspended)
+		{
+			m_twgs_access_suspended = true;
+			m_twgs_suspend_cycles = m_maincpu->total_cycles();
+		}
+		// This suspends the C++ instruction, not the physical TWGS clock.
+		// No byte is journalled until the same transaction reaches its CPU fall.
+		m_maincpu->set_bus_ready(false);
+		twgs_kernel_schedule();
+		m_maincpu->retry_bus_access();
+		fatalerror("TWGS unfinished access outside the waitable CPU");
+	}
+	const auto w = t.c.word;
+	if (w.address != address || w.type != type)
+		fatalerror("TWGS unfinished transaction changed from %06x/%u to %06x/%d", w.address, w.type, address, type);
+	const u64 old_mega = m_twgs_access_mega, old_board = m_twgs_access_board, old_refresh = m_twgs_access_refresh;
+	const u64 duration = t.now - m_twgs_access_start;
+	const u64 suspended = m_twgs_access_suspended ? (m_maincpu->total_cycles() - m_twgs_suspend_cycles) * t.x4 * 4 : 0;
+	m_twgs_access_pending = m_twgs_access_suspended = false;
 	const u64 charge = duration > t.x4 * 4 ? duration - t.x4 * 4 : 0;
 	const u64 stall = charge / TWGS_TIME_SCALE;
 	m_bt_idx++;
 	m_bt_istall += stall;
 	// Retain even the first partial clock's credit. Clamping each transfer
 	// would let machine time creep ahead of the decoded CPU/GS edge stream.
-	m_twgs_cycle_charge += s64(duration) - s64(t.x4 * 4);
+	m_twgs_cycle_charge += s64(duration) - s64(t.x4 * 4) - s64(suspended);
 	m_btc[BTC_MEGA] += t.mega_cycles - old_mega;
 	m_btc[BTC_FAST] += t.board_cycles - old_board - (t.mega_cycles - old_mega);
 	m_btc[BTC_REFRESH] += t.refresh_cycles - old_refresh;
@@ -2160,20 +2676,31 @@ void apple2gs_state::twgs_kernel_cycle(u32 address, int type, u8 &data)
 		m_btc[BTC_WRITES]++;
 		page[2]++;
 		if ((address >> 16) == 0xbc)
-			twgs_rom_w(address & 0xffff, data);
+		{
+			if (m_twgs_real)
+				twgs_rom_w(address & 0xffff, data);
+			else
+			{
+				// The synthetic ROM API remains virtual. Its argument/call
+				// stores must not become extra physical FPGA register writes.
+				twgs_w(address & 0xffff, data);
+				m_twgs_kernel.c.fpga.clock_full(0xbc0000, false, m_twgs_config, false);
+			}
+		}
 		else if ((address >> 16) >= 0x80 || t.bus_class(w) != BC_RAM)
 			m_twgs_visible = w.id;
 	}
 	m_btc[internal ? BTC_STALL_INTERNAL : w.read() ? BTC_STALL_READ : BTC_STALL_WRITE] += stall;
 	page[3] += stall / BT_PAGE_UNIT;
 	m_btpc[m_bt_ipc * 3] += stall / BT_PAGE_UNIT;
-	if (m_twgs_visible > m_twgs_retired || m_twgs_write_timer->enabled())
+	if (!m_twgs_stream_owned &&
+		(m_twgs_visible > m_twgs_retired || (m_mega_observe ? !m_twgs_write_timer->expire().is_never() : m_twgs_write_timer->enabled())))
 		twgs_kernel_schedule();
 }
 
 u64 apple2gs_state::twgs_kernel_instruction(u32 pc)
 {
-	const u64 now = m_maincpu->total_cycles();
+	const u64 now = m_maincpu->bus_active_cycles();
 	if (!m_bt_resync)
 	{
 		const u64 base = now - m_bt_cprev - m_bt_charged;
@@ -2181,7 +2708,21 @@ u64 apple2gs_state::twgs_kernel_instruction(u32 pc)
 		{
 			// WAI/STP expose their held read bus while the CPU is suspended.
 			const u64 deadline = twgs_ticks(m_maincpu->local_time());
-			m_twgs_kernel.advance_until(deadline, twgs_board{*this});
+			if (m_mega_observe)
+			{
+				while (m_twgs_kernel.next_event() <= deadline)
+					if (!m_twgs_kernel.step(twgs_board{*this}, deadline))
+						break;
+			}
+			else
+				m_twgs_kernel.advance_until(deadline, twgs_board{*this});
+			if (m_twgs_kernel.bus_waiting)
+			{
+				m_maincpu->suspend(SUSPEND_REASON_SYNC, false);
+				twgs_kernel_schedule();
+				m_maincpu->defer_bus_access();
+				return 0;
+			}
 		}
 		else if (base != m_bt_idx)
 		{
@@ -2204,11 +2745,19 @@ u64 apple2gs_state::twgs_kernel_instruction(u32 pc)
 
 int apple2gs_state::twgs_kernel_access(u32 address, int type, u8 &data)
 {
-	if (type == g65816_device::BUS_OPCODE)
+	if (type == g65816_device::BUS_OPCODE && !m_twgs_access_pending)
 		twgs_kernel_instruction(address);
+	if (m_maincpu->bus_access_deferred())
+		return 0;
 	twgs_kernel_cycle(address, type, data);
+	if (m_maincpu->bus_access_deferred()) return 0;
 	const u64 cycle = m_twgs_kernel.x4 * 4;
-	const u64 n = m_twgs_cycle_charge >= s64(cycle) ? u64(m_twgs_cycle_charge) / cycle : 0;
+	// The decoded CPU fall may precede the end of one nominal local clock.
+	// With timestamped phases, return that clock's credit immediately: keeping
+	// a negative remainder would prevent the core presenting its next word
+	// until after a slot edge that the controller has not delivered yet.
+	// This is conversion of the decoded elapsed time, not an added GAL delay.
+	const s64 n = twgs_decoded::local_cycle_charge(m_twgs_cycle_charge, cycle, m_mega_observe);
 	m_twgs_cycle_charge -= n * cycle;
 	m_bt_charged += n;
 	return int(n);
@@ -2224,9 +2773,14 @@ void apple2gs_state::twgs_drain(unsigned count)
 	// The bus latches retain the CPU bank byte. FPI performs shadowing when
 	// the transaction reaches the motherboard, using its then-current switches.
 	const bool slow = m_bt_slow;
-	while (count-- && m_twgs_wcount)
+	while (!m_mega_waiting && count-- && m_twgs_wcount)
 	{
 		m_maincpu->space(AS_PROGRAM).write_byte(m_twgs_waddr[0], m_twgs_wdata[0]);
+		if (m_mega_observe && mega_selected(m_twgs_waddr[0], true))
+		{
+			u8 data = m_twgs_wdata[0];
+			mega_transfer(m_twgs_waddr[0], false, data, bt_at(m_twgs_wend[0]));
+		}
 		--m_twgs_wcount;
 		for (unsigned i = 0; i < m_twgs_wcount; ++i)
 		{
@@ -2242,6 +2796,11 @@ void apple2gs_state::twgs_drain(unsigned count)
 
 void apple2gs_state::twgs_schedule_write()
 {
+	if (m_mega_waiting)
+	{
+		m_twgs_write_timer->adjust(attotime::never);
+		return;
+	}
 	// Unshadowed RAM has no autonomous reader. Cache misses and mapping/IO
 	// accesses drain it before use; slot DMA synchronizes at its bus access.
 	// Keep a timer whenever any queued write can affect a peripheral/video.
@@ -2266,10 +2825,28 @@ void apple2gs_state::twgs_schedule_write()
 
 void apple2gs_state::twgs_flush_due()
 {
+	if (m_mega_observe && m_twgs_kernel_on && m_twgs_kernel_started)
+	{
+		auto &t = m_twgs_kernel;
+		const u64 deadline = twgs_ticks(machine().time());
+		if (m_twgs_access_pending)
+		{
+			if (t.resume(deadline, twgs_board{*this}))
+				m_maincpu->set_bus_ready(true);
+		}
+		else
+			while (t.next_event() <= deadline)
+				if (!t.step(twgs_board{*this}, deadline))
+					break;
+		twgs_kernel_schedule();
+		return;
+	}
+	if (m_mega_waiting)
+		return;
 	if (m_twgs_kernel_on)
 	{
 		if (m_twgs_kernel_started)
-			m_twgs_kernel.advance_until(twgs_ticks(machine().time()), twgs_board{*this});
+			m_twgs_kernel.advance_until(twgs_ticks(machine().time()), twgs_board{*this}, m_mega_observe ? &m_mega_waiting : nullptr);
 		twgs_kernel_schedule();
 		return;
 	}
@@ -2286,6 +2863,22 @@ void apple2gs_state::twgs_flush_due()
 
 TIMER_CALLBACK_MEMBER(apple2gs_state::twgs_write_complete)
 {
+	if (m_mega_observe && m_twgs_kernel_on && m_twgs_phase_waiting)
+	{
+		if (!m_a2bus->synchronize_mega(twgs_at(m_twgs_phase_tick)))
+		{
+			m_twgs_write_timer->adjust(attotime::zero);
+			return;
+		}
+		m_twgs_phase_waiting = false;
+		m_twgs_phase_delivering = true;
+		m_twgs_kernel.bus_waiting = false;
+		twgs_flush_due();
+		m_twgs_phase_delivering = false;
+		if (!m_twgs_phase_waiting && !(m_keyglu_host_bus == 1 && m_keyglu_pending[0] == 1))
+			m_maincpu->resume(SUSPEND_REASON_SYNC);
+		return;
+	}
 	if (m_twgs_kernel_on)
 	{
 		twgs_flush_due();
@@ -2296,8 +2889,8 @@ TIMER_CALLBACK_MEMBER(apple2gs_state::twgs_write_complete)
 
 bool apple2gs_state::twgs_cached_access(u32 address, int type, u8 &data, int &cycles)
 {
-	if (m_glu_log_enabled)
-		sndglu_log_note(address, type);
+	if (m_trace)
+		m_trace->sndglu_log_note(address, type);
 	if (m_twgs_kernel_on)
 	{
 		cycles = twgs_kernel_access(address, type, data);
@@ -2551,52 +3144,104 @@ bool apple2gs_state::as_shadowed(u32 address)
 
 void apple2gs_state::as_schedule()
 {
-	if (!m_as_fifo.count)
+	if (!m_as_fifo.count || m_as_observer_pending || m_mega_waiting || (m_keyglu_host_bus == 2 && m_keyglu_pending[0] == 1))
 	{
 		m_as_timer->adjust(attotime::never);
 		return;
 	}
-	const attotime when = bt_at(m_as_fifo.entries[m_as_fifo.head].end);
+	const auto &front = m_as_fifo.entries[m_as_fifo.head];
+	const bool observed = m_mega_observe && (front.io ? as_io_class(front.address, true) == BC_MEGA : front.slow_address != 0xffffffff);
+	const attotime when = bt_at(front.end) - (observed ? bt_at(7 * BT_CLK) : attotime::zero);
 	const attotime now = machine().time();
-	m_as_timer->adjust(when > now ? when - now : attotime::zero);
+	if (observed)
+	{
+		if (when < machine().scheduler().base_time())
+			fatalerror("AS late entry %06x data=%02x count=%u observed=%d due=%s base=%s local=%s begin=%s retry=%d deadline=%s pc=%06x",
+				front.address, front.data, m_as_fifo.count, observed, when.as_string(15), machine().scheduler().base_time().as_string(15),
+				m_maincpu->local_time().as_string(15), bt_at(m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall).as_string(15),
+				m_as_bus_retry, bt_at(m_as_retry_deadline).as_string(15), m_maincpu->pc());
+		m_as_timer->adjust_absolute(when);
+	}
+	else
+		m_as_timer->adjust(when > now ? when - now : attotime::zero);
 }
 
 void apple2gs_state::as_flush(u64 time)
 {
-	while (m_as_fifo.count && m_as_fifo.entries[m_as_fifo.head].end <= time)
+	const attotime at = m_maincpu->executing() ? machine().scheduler().base_time() : machine().time();
+	while (!m_mega_waiting && m_as_fifo.count)
 	{
-		applesqueezer::write_entry entry;
-		m_as_fifo.retire(entry);
-		if (entry.io)
+		const auto &front = m_as_fifo.entries[m_as_fifo.head];
+		const bool observed = m_mega_observe && (front.io ? as_io_class(front.address, true) == BC_MEGA : front.slow_address != 0xffffffff);
+		if (m_mega_observe)
 		{
-			const bool slow = m_bt_slow;
-			m_snd_force = bt_at(entry.start);
-			m_snd_force_on = true;
-			m_maincpu->space(AS_PROGRAM).write_byte(entry.address, entry.data);
-			m_snd_force_on = false;
-			m_bt_slow = slow;
+			// Only an observed Mega II head is prepared at A. Every other
+			// FIFO entry retires at its own F, never through lookahead.
+			const attotime due = bt_at(front.end) - (observed ? bt_at(7 * BT_CLK) : attotime::zero);
+			const u64 tick = front.end - (observed ? 7 * BT_CLK : 0);
+			if (m_as_observer_pending || tick > time || due > at || (observed && m_maincpu->executing()))
+				break;
 		}
-		else if (entry.slow_address != 0xffffffff)
+		else if (front.end > time)
+			break;
+		if (!observed && front.io && !keyglu_host_prepare(front.address, true, front.data, bt_at(front.end), 2))
+			break;
+		applesqueezer::write_entry entry = front;
+		// Provisional FIFO ownership: the held head still owns one of
+		// the 31 entries. Private accesses continue; credit returns at F.
+		if (observed)
 		{
-			m_megaii_ram[entry.slow_address] = entry.data;
-			if (entry.palette >= 0)
-			{
-				const int color = entry.palette;
-				m_video->set_SHR_color(color, rgb_t(
-					((m_megaii_ram[0x19f00 + color] >> 0) & 0x0f) * 17,
-					((m_megaii_ram[0x15f00 + color] >> 4) & 0x0f) * 17,
-					((m_megaii_ram[0x15f00 + color] >> 0) & 0x0f) * 17));
-			}
+			m_as_observer_pending = true;
+			mega_transfer(entry.address, false, entry.data, bt_at(entry.end));
+			break;
+		}
+		m_as_fifo.retire(entry);
+		as_materialize(entry);
+		if (m_as_observer_blocked)
+		{
+			m_as_retry_deadline = std::max(m_as_retry_deadline, entry.end);
+			m_as_observer_blocked = false;
+			m_maincpu->resume(SUSPEND_REASON_SYNC);
 		}
 	}
-	if (time >= m_as_mapping_until)
+	if (time >= m_as_mapping_until && (!m_mega_observe || !m_as_fifo.count))
 		m_as_mapping_until = 0;
 	as_schedule();
 }
 
+void apple2gs_state::as_materialize(applesqueezer::write_entry const &entry)
+{
+	if (entry.io)
+	{
+		const bool slow = m_bt_slow;
+		m_snd_slot = entry.start;
+		m_snd_force_on = true;
+		m_maincpu->space(AS_PROGRAM).write_byte(entry.address, entry.data);
+		m_snd_force_on = false;
+		m_bt_slow = slow;
+	}
+	else if (entry.slow_address != 0xffffffff)
+	{
+		m_megaii_ram[entry.slow_address] = entry.data;
+		if (entry.palette >= 0)
+		{
+			const int color = entry.palette;
+			m_video->set_SHR_color(color,
+				rgb_t(((m_megaii_ram[0x19f00 + color] >> 0) & 0x0f) * 17, ((m_megaii_ram[0x15f00 + color] >> 4) & 0x0f) * 17,
+					((m_megaii_ram[0x15f00 + color] >> 0) & 0x0f) * 17));
+		}
+	}
+}
+
 TIMER_CALLBACK_MEMBER(apple2gs_state::as_write_complete)
 {
-	as_flush(u64(machine().time().as_double() * double(BT_PER_SEC)) + 1);
+	const u64 now = u64(machine().time().as_double() * double(BT_PER_SEC)) + 1;
+	as_flush(now);
+	if (m_mega_observe && m_as_timer->enabled() && m_as_timer->expire() <= machine().time())
+		fatalerror("AS unconsumed edge %s count=%u head=%06x end=%s executing=%d due_limit=%s waiting=%d pending=%d",
+			machine().time().as_string(18), m_as_fifo.count, m_as_fifo.entries[m_as_fifo.head].address,
+			bt_at(m_as_fifo.entries[m_as_fifo.head].end).as_string(18), m_maincpu->executing(), bt_at(now).as_string(18), m_mega_waiting,
+			m_as_observer_pending);
 }
 
 TIMER_CALLBACK_MEMBER(apple2gs_state::as_io_complete)
@@ -2605,16 +3250,16 @@ TIMER_CALLBACK_MEMBER(apple2gs_state::as_io_complete)
 	update_speed();
 }
 
-void apple2gs_state::as_io_access(u64 end)
+void apple2gs_state::as_io_access(u32 address, u64 end)
 {
-	if (!m_as_io_delay_us)
+	const u16 low = address;
+	const u32 delay = (low >= 0xc03c && low <= 0xc03f) ? m_as_sound_delay_us : m_as_io_delay_us;
+	if (!delay)
 		return;
-	// Inferred compatibility interval, not a published FPGA constant.
-	// The physical board's DOC-polled NOP test reports about 2.87 MHz;
-	// its longer batch takes about 0.3 ms at the motherboard CPU rate.
-	// Retain that rate for 0.5 ms after external I/O, including write-only
-	// device sequences. Posted RAM writes do not start this interval.
-	m_as_io_until = end + u64(m_as_io_delay_us) * (BT_PER_SEC / 1'000'000);
+	// Temporary I/O slowdown is a compatibility approximation. Its duration
+	// and extension from sound accesses to other I/O lack a published timing
+	// specification. Separate controls retain the experimental alternatives.
+	m_as_io_until = end + u64(delay) * (BT_PER_SEC / 1'000'000);
 	m_as_io_timer->adjust(std::max(attotime::zero, bt_at(m_as_io_until) - machine().time()));
 	if ((m_speed & SPEED_HIGH) && m_maincpu->unscaled_clock() > A2GS_2_8M.value())
 		update_speed();
@@ -2638,18 +3283,24 @@ u8 apple2gs_state::as_api_r(u32 address)
 {
 	switch (address)
 	{
-	case applesqueezer::presence_register: return 1;
-	case applesqueezer::version_register: return 14;
-	case 0xe20008: return 1; // flash byte interface idle; updating is not implemented
-	case 0xe4000e: return 1; // SD controller idle
-	case 0xe40012: return 0; // no SD card attached
+	case applesqueezer::presence_register:
+		return 1;
+	case applesqueezer::version_register:
+		return 14;
+	case 0xe20008:
+		return 1; // flash byte interface idle; updating is not implemented
+	case 0xe4000e:
+		return 1; // SD controller idle
+	case 0xe40012:
+		return 0; // no SD card attached
 	case applesqueezer::dram_data_register:
 	{
 		u8 value = 0xff;
 		m_as_dram.read(value, [this](u32 a) { return m_as_extended[a]; }, !machine().side_effects_disabled());
 		return value;
 	}
-	default: return 0xff;
+	default:
+		return 0xff;
 	}
 }
 
@@ -2677,12 +3328,40 @@ void apple2gs_state::as_api_w(u32 address, u8 data)
 
 bool apple2gs_state::as_access(u32 address, int type, u8 &data, int &cycles)
 {
-	if (m_glu_log_enabled)
-		sndglu_log_note(address, type);
-	u64 charge = type == g65816_device::BUS_OPCODE ? bt_instruction(address) : 0;
-	const u64 begin = m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
-	u64 now = begin;
-	as_flush(now);
+	if (m_trace)
+		m_trace->sndglu_log_note(address, type);
+	u64 charge = m_as_bus_retry ? m_as_retry_charge : (type == g65816_device::BUS_OPCODE ? bt_instruction(address) : 0);
+	if (!m_as_bus_retry)
+		m_as_retry_deadline = 0;
+	const auto flush = [this, charge](u64 deadline, bool dependency = false)
+	{
+		as_flush(deadline);
+		if (m_keyglu_host_bus == 2 && m_keyglu_pending[0] == 1)
+		{
+			m_as_bus_retry = true;
+			m_as_retry_charge = charge;
+			m_maincpu->suspend(SUSPEND_REASON_SYNC, false);
+			m_maincpu->synchronize_bus_access();
+		}
+		if (m_mega_observe && dependency && m_as_fifo.count && m_as_fifo.entries[m_as_fifo.head].end <= deadline)
+		{
+			m_as_bus_retry = true;
+			m_as_retry_charge = charge;
+			m_as_retry_deadline = std::max(m_as_retry_deadline, deadline);
+			m_as_observer_blocked = true;
+			m_maincpu->suspend(SUSPEND_REASON_SYNC, false);
+			m_maincpu->synchronize_bus_access();
+		}
+		if (m_mega_waiting && !m_mega_observe)
+		{
+			m_as_bus_retry = true;
+			m_as_retry_charge = charge;
+			m_maincpu->retry_bus_access();
+		}
+	};
+	const u64 begin = m_keyglu_host_bus == 3 ? m_as_keyglu_begin : m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
+	u64 now = m_mega_observe ? std::max(begin, m_as_retry_deadline) : begin;
+	flush(now);
 	const u8 bank = address >> 16;
 	const u16 low = address;
 	const bool write = type == g65816_device::BUS_WRITE;
@@ -2692,7 +3371,7 @@ bool apple2gs_state::as_access(u32 address, int type, u8 &data, int &cycles)
 	if (m_as_mapping_until && (mapped || write))
 	{
 		now = std::max(now, m_as_mapping_until);
-		as_flush(now);
+		flush(now, true);
 	}
 	const bool io_bank = bank == 0xe0 || bank == 0xe1 || (bank < 2 && !(m_shadow & SHAD_IOLC));
 	const bool io = io_bank && low >= 0xc000 && low < 0xd000;
@@ -2700,8 +3379,22 @@ bool apple2gs_state::as_access(u32 address, int type, u8 &data, int &cycles)
 	if (posted && m_as_fifo.count == applesqueezer::write_fifo::capacity)
 	{
 		now = std::max(now, m_as_fifo.entries[m_as_fifo.head].end);
-		as_flush(now);
-		m_btc[BTC_WBUF_FULL]++;
+		if (m_mega_observe)
+			m_btc[BTC_WBUF_FULL]++;
+		flush(now, true);
+		if (!m_mega_observe)
+			m_btc[BTC_WBUF_FULL]++;
+	}
+	// Experimental alternative to slowing subsequent CPU execution: finish
+	// earlier posted writes and the outstanding GLU transaction before the
+	// next sound data/pointer/control access. Status reads remain free to poll.
+	// This is a diagnostic protocol guard, not a claimed AppleSqueezer feature.
+	if (m_as_glu_wait && io && low >= 0xc03c && low <= 0xc03f && (write || low != 0xc03c))
+	{
+		now = std::max(now, m_bt_busfree);
+		flush(now, true);
+		if (sndglu_service(bt_at(now)))
+			now = std::max(now, u64(m_sndglu_busy_until.as_double() * double(BT_PER_SEC)) + 1);
 	}
 
 	address_space &space = m_maincpu->space(AS_PROGRAM);
@@ -2713,18 +3406,45 @@ bool apple2gs_state::as_access(u32 address, int type, u8 &data, int &cycles)
 	{
 		// Uncached reads observe all older posted writes. This conservative
 		// ordering is a model assumption, not recovered FPGA forwarding logic.
-		now = std::max(now, m_bt_busfree);
-		as_flush(now);
-		const u64 end = bt_bus(now, as_io_class(address, false));
-		m_bt_busfree = end;
-		m_snd_force = bt_at(m_bt_slot);
+		u64 end;
+		if (m_keyglu_host_bus == 3)
+		{
+			end = m_as_keyglu_end;
+			m_bt_slot = m_as_keyglu_slot;
+		}
+		else
+		{
+			now = std::max(now, m_bt_busfree);
+			flush(now, true);
+			end = bt_bus(now, as_io_class(address, false));
+			m_bt_busfree = end;
+			if (!(m_mega_observe && as_io_class(address, false) == BC_MEGA) && !keyglu_host_prepare(address, false, 0, bt_at(end), 3))
+			{
+				m_as_keyglu_begin = begin;
+				m_as_keyglu_slot = m_bt_slot;
+				m_as_keyglu_end = end;
+				m_as_bus_retry = true;
+				m_as_retry_charge = charge;
+				m_maincpu->suspend(SUSPEND_REASON_SYNC, false);
+				m_maincpu->synchronize_bus_access();
+			}
+		}
+		m_snd_slot = m_bt_slot;
 		m_snd_force_on = true;
-		data = space.read_byte(address);
+		if (m_mega_observe && as_io_class(address, false) == BC_MEGA)
+		{
+			// Prepare A now. The observer's F callback performs the actual
+			// read, including KEYGLU's chronological latch rendezvous.
+			data = 0xff;
+			mega_transfer(address, true, data, bt_at(end));
+		}
+		else
+			data = space.read_byte(address);
 		m_snd_force_on = false;
 		const u64 resume = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle;
 		stall = resume > begin + m_bt_cycle ? resume - begin - m_bt_cycle : 0;
 		if (as_io_class(address, false) == BC_MEGA)
-			as_io_access(end);
+			as_io_access(address, end);
 		m_btc[BTC_UNCACHED]++;
 		m_btpage[(address >> 8) * 4 + 1]++;
 	}
@@ -2743,7 +3463,8 @@ bool apple2gs_state::as_access(u32 address, int type, u8 &data, int &cycles)
 		}
 		if (posted)
 		{
-			const int cls = io ? as_io_class(address, true) : ((m_as_capture != 0xffffffff || bank == 0xe0 || bank == 0xe1) ? BC_MEGA : BC_RAM);
+			const int cls =
+				io ? as_io_class(address, true) : ((m_as_capture != 0xffffffff || bank == 0xe0 || bank == 0xe1) ? BC_MEGA : BC_RAM);
 			const u64 end = bt_bus(std::max(now, m_bt_busfree), cls);
 			m_bt_busfree = end;
 			applesqueezer::write_entry entry;
@@ -2761,12 +3482,14 @@ bool apple2gs_state::as_access(u32 address, int type, u8 &data, int &cycles)
 				fatalerror("AppleSqueezer write FIFO overflow");
 			as_schedule();
 			if (io && cls == BC_MEGA)
-				as_io_access(end);
+				as_io_access(address, end);
 		}
 		else if (!write)
 			m_btc[BTC_HITS]++; // native private-memory access, no tag lookup
 	}
 
+	m_as_bus_retry = false;
+	m_as_retry_deadline = 0;
 	m_bt_idx++;
 	m_btc[write ? BTC_WRITES : BTC_READS]++;
 	u64 *const page = &m_btpage[(address >> 8) * 4];
@@ -2804,6 +3527,7 @@ void apple2gs_state::bt_config()
 	m_twgs_mask = BIT(cfg, 11) ? 0x7fff : 0x1fff;
 	// GAL1/GAL2 write service adds no whole motherboard clocks.
 	m_bt_wcount = 0;
+	m_zip_write_ph0 = false;
 	m_bt_busfree = 0;
 	m_bt_fanchor = 0;
 }
@@ -2815,12 +3539,37 @@ void apple2gs_state::bt_setup(u32 speed)
 		mode = (speed == A2GS_2_8M.value()) ? BT_STOCK : (m_twgs ? BT_TWGS : (m_native_ram ? BT_NATIVE : BT_ZIP));
 	if (m_as_model)
 		mode = BT_APPLESQUEEZER;
+	const u64 cycle =
+		((mode == BT_ZIP) || (mode == BT_TWGS) || (mode == BT_NATIVE) || (mode == BT_APPLESQUEEZER)) ? (BT_PER_SEC / speed) : BT_FAST;
+	if (m_mega_observe && !m_twgs_kernel_on && !m_as_model && m_bt_mode != BT_OFF && m_observer_epoch_period &&
+		m_maincpu->bus_instruction_active() && cycle != m_bt_cycle)
+	{
+		// A ZipGS temporary slowdown may expire between the bytes of one
+		// 65816 word store (Instruction Manual v1.04, temporary slowdowns).
+		// Its completed motherboard edge cannot move when the local clock
+		// changes. Reinterpreting all earlier accesses with the new stride
+		// would schedule the high byte in the low byte's already used PH0.
+		const u64 boundary = m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
+		m_observer_epoch_time = apple2gs_observer::at(
+			boundary, m_observer_epoch_time, m_observer_epoch_tick, m_observer_epoch_period, m_observer_epoch_divisor);
+		m_observer_epoch_tick = boundary;
+		m_observer_epoch_period = m_maincpu->cycles_to_attotime(1).attoseconds();
+		m_observer_epoch_divisor = cycle;
+		m_bt_istart = apple2gs_observer::rebase(m_bt_istart, m_bt_idx, m_bt_cycle, cycle);
+	}
 	m_bt_mode = mode;
-	m_bt_cycle = ((mode == BT_ZIP) || (mode == BT_TWGS) || (mode == BT_NATIVE) || (mode == BT_APPLESQUEEZER)) ? (BT_PER_SEC / speed) : BT_FAST;
+	m_bt_cycle = cycle;
 	m_bt_twslow = false;
 	m_bt_resync = true;
-	m_bt_slow = false;
+	// TN #68 and Hardware Reference pp.14-15: the FPI selects a Mega II
+	// transfer from its address before the I/O operation. A handler may
+	// update the clock (C026/C05E/C05F), but must not reclassify the pending
+	// transfer. Retain its selection until bt_access consumes it, whether
+	// or not a slot card observes the bus; clear it outside CPU execution.
+	if (!m_maincpu->executing())
+		m_bt_slow = false;
 	m_bt_wcount = 0;
+	m_zip_write_ph0 = false;
 }
 
 void apple2gs_state::bt_control()
@@ -2837,7 +3586,9 @@ void apple2gs_state::bt_control()
 	header[3] = (m_bt_mode == BT_ZIP) ? (m_zip_mask + 1) : (m_bt_mode == BT_TWGS) ? (m_twgs_mask + 1) : 0;
 	header[5] = u32(m_bt_cycle);
 	header[6] = u32(BT_CLK);
-	header[7] = (m_bt_mode == BT_APPLESQUEEZER) ? 31 : (m_bt_mode == BT_NATIVE) ? 0 : (((m_bt_mode == BT_TWGS) ? TWGS_WRITE_LATCHES : ZIP_WRITE_DEPTH) | (u32(BUS_READ_RESUME) << 8));
+	header[7] = (m_bt_mode == BT_APPLESQUEEZER) ? 31 :
+		(m_bt_mode == BT_NATIVE)				? 0 :
+								   (((m_bt_mode == BT_TWGS) ? TWGS_WRITE_LATCHES : ZIP_WRITE_DEPTH) | (u32(BUS_READ_RESUME) << 8));
 }
 
 u64 apple2gs_state::bt_fast(u64 t, bool refresh)
@@ -2915,12 +3666,25 @@ u64 apple2gs_state::bt_bus(u64 t, int cls)
 u64 apple2gs_state::bt_instruction(u32 pc)
 {
 	u64 charge = 0;
-	const u64 now = m_maincpu->total_cycles();
+	const u64 now = m_maincpu->bus_active_cycles();
 	if (m_bt_resync)
 	{
 		m_bt_resync = false;
 		m_bt_istart = u64(m_maincpu->local_time().as_double() * double(BT_PER_SEC));
 		m_bt_frac = 0;
+		if (m_mega_observe)
+		{
+			// BT is the existing cycle-accounting coordinate. Its stock
+			// 5280 ticks imply 2863636.363636 Hz; MAME's CPU clock is the
+			// integer 2863636 Hz. Anchor observer deadlines to the SAME
+			// accumulated CPU period, not a second absolute clock that
+			// eventually places an undelivered edge in the scheduler's past.
+			// This changes no CPU/cache charge or card-absent bus arithmetic.
+			m_observer_epoch_time = m_maincpu->local_time();
+			m_observer_epoch_tick = m_bt_istart;
+			m_observer_epoch_period = m_maincpu->cycles_to_attotime(1).attoseconds();
+			m_observer_epoch_divisor = m_bt_cycle;
+		}
 	}
 	else
 	{
@@ -3145,8 +3909,16 @@ bool apple2gs_state::zip_cacheable(u32 address) const
 		&& !(mapped && BIT(m_accel_gsxsettings, 7) && (a >= 0xc000) && (a < 0xe000));
 }
 
-u32 apple2gs_state::zip_taddr(u32 address, bool write) const
+u32 apple2gs_state::zip_taddr(u32 address, int type) const
 {
+	// VPB selects the ROM vector independently of the language-card switches
+	// while I/O shadowing is enabled (Apple IIgs Firmware Reference, p. 173).
+	// With I/O shadowing disabled, vectors come from linear bank 00 RAM.
+	// Keep these sources distinct in the tag, as for other banked reads.
+	if (type == g65816_device::BUS_VECTOR)
+		return address | (m_zip_iolc ? 0 : 0x1000000);
+
+	const bool write = type == g65816_device::BUS_WRITE;
 	const u32 bank = address >> 16;
 	const u16 a = address;
 	u32 tag = address;
@@ -3189,7 +3961,7 @@ u8 apple2gs_state::zip_access(u32 address, int type, u8 data)
 	if (!cacheable)
 		return data;
 	const u32 slot = address & m_zip_mask;
-	const u32 tag = zip_taddr(address, write) + 1;
+	const u32 tag = zip_taddr(address, type) + 1;
 	// Even while slowed or disabled, CPU stores must update the cache.
 	if (!write && (m_bt_mode != BT_ZIP))
 		return data;
@@ -3217,8 +3989,7 @@ u8 apple2gs_state::twdc_access(u32 offset, int type, u8 data)
 		// C05D samples the CPU bank, not the program bank (long reads may
 		// address a different bank). Only CPU cycles reach this hook.
 		const u8 bank = offset >> 16;
-		if (m_accel_unlocked && type != g65816_device::BUS_WRITE &&
-			(offset & 0xffff) == 0xc05d &&
+		if (m_accel_unlocked && type != g65816_device::BUS_WRITE && (offset & 0xffff) == 0xc05d &&
 			(bank == 0xe0 || bank == 0xe1 || (bank < 2 && !(m_shadow & SHAD_IOLC))))
 			return bank;
 		if (m_accel_present && !m_native_ram)
@@ -3228,8 +3999,8 @@ u8 apple2gs_state::twdc_access(u32 offset, int type, u8 data)
 	if (m_twgs_real)
 		return twgs_bus(offset, type, data);
 	const bool write = type == g65816_device::BUS_WRITE;
-	m_twgs_access_cacheable = type != g65816_device::BUS_VECTOR && (offset >> 16) != 0xbc &&
-		!(twgs_io_bank(offset) && (offset & 0xf000) == 0xc000);
+	m_twgs_access_cacheable =
+		type != g65816_device::BUS_VECTOR && (offset >> 16) != 0xbc && !(twgs_io_bank(offset) && (offset & 0xf000) == 0xc000);
 	m_twgs_access_tag = twgs_taddr(offset, type) + 1;
 	m_twgs_access_hit = m_zip_tag[offset & m_twgs_mask] == m_twgs_access_tag;
 	twgs_snoop(offset, write, data);
@@ -3246,8 +4017,7 @@ u8 apple2gs_state::twdc_access(u32 offset, int type, u8 data)
 		return data;
 	}
 	const bool code = type == g65816_device::BUS_OPCODE || type == g65816_device::BUS_OPERAND;
-	const bool slow = type == g65816_device::BUS_OPCODE
-		? (!BIT(m_twgs_config, 3) && m_maincpu->irq_masked()) : m_bt_twslow;
+	const bool slow = type == g65816_device::BUS_OPCODE ? (!BIT(m_twgs_config, 3) && m_maincpu->irq_masked()) : m_bt_twslow;
 	if (m_bt_mode == BT_TWGS && !slow && (code || BIT(m_twgs_config, 1)) && m_twgs_access_hit)
 	{
 		return m_twgs_data[slot];
@@ -3258,19 +4028,479 @@ u8 apple2gs_state::twdc_access(u32 offset, int type, u8 data)
 	return data;
 }
 
-int apple2gs_state::bt_access(u32 address, int type, u8 data)
+// Only selected transfers are emitted. Idle clocks/video fetches are not CPU
+// transfers; debugger/Lua inspection also never creates a slot-bus cycle.
+bool apple2gs_state::mega_selected(u32 address, bool write)
+{
+	const u8 bank = address >> 16;
+	const u16 low = address;
+	const bool mapped = bank == 0xe0 || bank == 0xe1 || (bank < 2 && !(m_shadow & SHAD_IOLC));
+	if (mapped && low >= 0xc000 && low < 0xd000)
+	{
+		if (low < 0xc100)
+			return as_io_class(address, write) == BC_MEGA;
+		if (low < 0xc800)
+		{
+			const int slot = (low >> 8) & 7;
+			return slot == 3 ? (!m_intcxrom && m_slotc3rom) : (!m_intcxrom && BIT(m_slotromsel, slot));
+		}
+		return !m_intcxrom && !m_intc8rom && m_cnxx_slot > 0 && m_slotdevice[m_cnxx_slot];
+	}
+	if (bank == 0xe0 || bank == 0xe1)
+		return low < 0xc000 || write || m_lcram;
+	return write && as_shadowed(address);
+}
+
+void apple2gs_state::mega_transfer(u32 address, bool read, u8 &data, attotime when, int bank, bool zip_opcode, u64 raw_end)
+{
+	if (machine().side_effects_disabled())
+		return;
+	// TN #68: M2B0 is the CPU bank bit, before RAMWRT/80STORE translation.
+	// The card itself tracks those switches. Pin 35 is pulsed in the bank
+	// window; the observer carries the sampled value, not its high-phase level.
+	if (bank < 0)
+		bank = BIT(address, 16);
+	if (m_observer_count == MEGA_OBSERVER_QUEUE)
+		fatalerror("IIgs observer queue overflow");
+	const unsigned tail = (m_observer_head + m_observer_count++) % MEGA_OBSERVER_QUEUE;
+	m_observer_address[tail] = address;
+	m_observer_data[tail] = data;
+	m_observer_keyglu_cycle[tail] = false;
+	const bool blocking = m_maincpu->executing() && (read || (m_bt_mode != BT_ZIP && m_bt_mode != BT_TWGS && !m_as_model));
+	m_observer_flags[tail] = read | (bool(bank) << 1) | (blocking << 2) | ((m_as_observer_pending && !read) << 3) |
+		((read && m_bt_mode == BT_ZIP && zip_cacheable(address)) << 4) | ((read && m_bt_mode == BT_TWGS && m_twgs_access_cacheable) << 5) |
+		((read && m_as_model) << 6) | (zip_opcode << 7);
+	// Capture both endpoints and their clock conversion now: a queued
+	// posted write retains its epoch when software changes the CPU clock.
+	m_observer_tick[tail] = raw_end ? raw_end : observer_ticks(when);
+	m_observer_period[tail] = raw_end ? m_observer_epoch_period : 0;
+	m_observer_divisor[tail] = raw_end ? m_observer_epoch_divisor : 1;
+	m_observer_origin_time[tail] = m_observer_epoch_time;
+	m_observer_origin_tick[tail] = m_observer_epoch_tick;
+	m_observer_time[tail] = raw_end ? observer_at(tail, raw_end) : when;
+	m_observer_high_time[tail] = raw_end ? observer_at(tail, raw_end - 7 * BT_CLK) : when - bt_at(7 * BT_CLK);
+	if (blocking)
+	{
+		m_observer_read_pending = read;
+		m_maincpu->suspend(SUSPEND_REASON_SYNC, false);
+	}
+	if (m_maincpu->executing())
+		m_maincpu->synchronize_after_bus();
+	observer_schedule();
+}
+
+attotime apple2gs_state::observer_at(unsigned entry, u64 ticks) const
+{
+	return apple2gs_observer::at(
+		ticks, m_observer_origin_time[entry], m_observer_origin_tick[entry], m_observer_period[entry], m_observer_divisor[entry]);
+}
+
+u64 apple2gs_state::observer_ticks(attotime when) const
+{
+	// bt_at uses the established floating conversion. Recover its integer
+	// deadline to the nearest tick; truncation can misidentify a line-end
+	// 16-clock period by one tick. This adds no delay to the timer edge.
+	const u64 tick = twgs_decoded::time_base<BT_PER_SEC>::ticks(when.seconds(), when.attoseconds());
+	return tick + (when > bt_at(tick) + attotime(0, ATTOSECONDS_PER_SECOND / BT_PER_SEC / 2));
+}
+
+void apple2gs_state::observer_schedule()
+{
+	if (m_observer_count)
+	{
+		const attotime at = m_observer_high ? m_observer_high_time[m_observer_head] : m_observer_time[m_observer_head];
+		if (at < machine().scheduler().base_time())
+		{
+			for (unsigned n = 16; n; --n)
+			{
+				const unsigned i = (m_observer_head + MEGA_OBSERVER_QUEUE + 1 - n) % MEGA_OBSERVER_QUEUE;
+				osd_printf_error("OBSERVER_HISTORY i=%u a=%06x flags=%x raw=%llu A=%s F=%s epoch=%llu/%s period=%llu divisor=%llu\n", i,
+					m_observer_address[i], m_observer_flags[i], (unsigned long long)m_observer_tick[i],
+					m_observer_high_time[i].as_string(15), m_observer_time[i].as_string(15), (unsigned long long)m_observer_origin_tick[i],
+					m_observer_origin_time[i].as_string(15), (unsigned long long)m_observer_period[i],
+					(unsigned long long)m_observer_divisor[i]);
+			}
+			osd_printf_error("OBSERVER_ACCOUNT head=%u count=%u start=%llu idx=%u stall=%llu frac=%llu cprev=%llu active=%llu\n",
+				m_observer_head, m_observer_count, (unsigned long long)m_bt_istart, m_bt_idx, (unsigned long long)m_bt_istall,
+				(unsigned long long)m_bt_frac, (unsigned long long)m_bt_cprev, (unsigned long long)m_maincpu->bus_active_cycles());
+			fatalerror("Observer late enqueue a=%06x flags=%x high=%d held=%d edge=%s base=%s local=%s bt=%s mode=%d pc=%06x",
+				m_observer_address[m_observer_head], m_observer_flags[m_observer_head], m_observer_high, m_observer_held, at.as_string(15),
+				machine().scheduler().base_time().as_string(15), m_maincpu->local_time().as_string(15),
+				bt_at(m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall).as_string(15), m_bt_mode, m_maincpu->pc());
+		}
+		m_observer_timer->adjust_absolute(at);
+	}
+	else
+		m_observer_timer->adjust(attotime::never);
+}
+
+TIMER_CALLBACK_MEMBER(apple2gs_state::observer_deliver)
+{
+	if (!m_observer_count)
+		return;
+	const unsigned head = m_observer_head;
+	const attotime when = m_observer_high ? m_observer_high_time[head] : m_observer_time[head];
+	if (!m_a2bus->synchronize_mega(when))
+	{
+		m_observer_timer->adjust(attotime::zero);
+		return;
+	}
+	if (machine().time() != when)
+		fatalerror("IIgs observer delivery does not match its bus time");
+	const u32 address = m_observer_address[head];
+	const u8 flags = m_observer_flags[head];
+	m_mega_bus_time = when;
+	if (m_observer_keyglu_cycle[head] && !m_observer_high)
+	{
+		if (!keyglu_host_prepare(address, !BIT(flags, 0), m_observer_data[head], when, 5))
+		{
+			m_observer_timer->adjust(attotime::zero);
+			return;
+		}
+		const bool slow = m_bt_slow;
+		if (BIT(flags, 0))
+			m_observer_data[head] = m_maincpu->space(AS_PROGRAM).read_byte(address);
+		else
+			m_maincpu->space(AS_PROGRAM).write_byte(address, m_observer_data[head]);
+		m_bt_slow = slow;
+	}
+	if (BIT(flags, 6) && !m_observer_high)
+	{
+		if (!keyglu_host_prepare(address, false, 0, when, 4))
+		{
+			m_observer_timer->adjust(attotime::zero);
+			return;
+		}
+		const bool slow = m_bt_slow;
+		const u64 end = observer_ticks(when);
+		m_snd_slot = end - (end % BT_LINE ? BT_MEGA : BT_MEGA_LAST);
+		m_snd_force_on = true;
+		m_observer_data[head] = m_maincpu->space(AS_PROGRAM).read_byte(address);
+		m_snd_force_on = false;
+		m_bt_slow = slow;
+	}
+	if (BIT(flags, 3) && !m_observer_high)
+	{
+		auto const &front = m_as_fifo.entries[m_as_fifo.head];
+		if (front.io && !keyglu_host_prepare(front.address, true, front.data, when, 2))
+		{
+			m_observer_timer->adjust(attotime::zero);
+			return;
+		}
+		as_materialize(front);
+	}
+	u8 data = m_a2bus->mega_cycle({u16(address), m_observer_data[head], bool(BIT(flags, 0)), false, bool(BIT(flags, 1)), false, when, false,
+		m_observer_high, false, true, m_observer_held});
+	if (m_observer_high)
+	{
+		m_observer_high = false;
+		observer_schedule();
+		return;
+	}
+	if (m_mega_waiting)
+	{
+		if (!m_observer_held)
+		{
+			m_observer_first_end = when;
+			m_observer_first_tick = m_observer_tick[head];
+			m_observer_held = true;
+		}
+		const u64 end = m_observer_tick[head];
+		const u64 len = end % BT_LINE == 64 * BT_MEGA ? BT_MEGA_LAST : BT_MEGA;
+		// The failed fall consumes this complete motherboard period. Keep
+		// the posted byte/FIFO head outstanding and move only its followers.
+		m_bt_busfree += len;
+		for (int i = 0; i < m_bt_wcount; ++i)
+			m_bt_wbuf[i] += len;
+		for (unsigned i = 0; i < m_observer_count; ++i)
+		{
+			const unsigned entry = (head + i) % MEGA_OBSERVER_QUEUE;
+			m_observer_tick[entry] += len;
+			if (m_observer_period[entry])
+			{
+				// Reconvert both edges from this entry's original epoch. Adding
+				// rounded periods would accumulate attosecond error on retries.
+				m_observer_time[entry] = observer_at(entry, m_observer_tick[entry]);
+				m_observer_high_time[entry] = observer_at(entry, m_observer_tick[entry] - 7 * BT_CLK);
+			}
+			else
+			{
+				const attotime extra = bt_at(m_observer_tick[entry]) - m_observer_time[entry];
+				m_observer_time[entry] += extra;
+				m_observer_high_time[entry] += extra;
+			}
+		}
+		if (m_as_model)
+		{
+			for (auto &entry : m_as_fifo.entries)
+			{
+				entry.start += len;
+				entry.end += len;
+			}
+			if (m_as_mapping_until)
+				m_as_mapping_until += len;
+		}
+		m_observer_high = true;
+		observer_schedule();
+		return;
+	}
+	if (m_observer_held)
+	{
+		const u64 delay = m_observer_tick[head] - m_observer_first_tick;
+		if (!delay)
+			fatalerror("IIgs observer held transfer completed without elapsed time");
+		if ((!m_as_model || BIT(flags, 0)) && !m_observer_cpu_released)
+		{
+			m_bt_istall += delay;
+			m_btc[BIT(flags, 0) ? BTC_STALL_READ : BTC_STALL_WRITE] += delay;
+		}
+		m_observer_held = false;
+		m_maincpu->set_bus_ready(true);
+	}
+	if (BIT(flags, 3))
+	{
+		applesqueezer::write_entry retired;
+		m_as_fifo.retire(retired);
+		m_as_observer_pending = false;
+		if (retired.mapping && m_as_mapping_until == retired.end)
+			m_as_mapping_until = 0;
+		if (m_as_observer_blocked)
+		{
+			const u64 end = observer_ticks(when);
+			m_as_retry_deadline = std::max(m_as_retry_deadline, end);
+			m_as_observer_blocked = false;
+			m_maincpu->resume(SUSPEND_REASON_SYNC);
+		}
+	}
+	if (m_observer_keyglu_cycle[head] && BIT(flags, 2))
+	{
+		m_slow_keyglu_data = data;
+		m_slow_keyglu_pending = 2;
+		m_observer_read_pending = false;
+	}
+	else if (BIT(flags, 0) && BIT(flags, 2))
+	{
+		// Fill with the byte driven at the successful fall, not the byte
+		// that was present when the instruction first requested the read.
+		if (BIT(flags, 4))
+			m_zip_data[address & m_zip_mask] = data;
+		if (BIT(flags, 5))
+			m_twgs_data[address & m_twgs_mask] = data;
+		m_maincpu->complete_bus_read(data);
+		if (BIT(flags, 7))
+			m_zip_repsep_pending = data == 0xc2 || data == 0xe2;
+		m_observer_read_pending = false;
+	}
+	m_observer_high = true;
+	m_observer_cpu_released = false;
+	m_observer_head = (head + 1) % MEGA_OBSERVER_QUEUE;
+	--m_observer_count;
+	if (BIT(flags, 2))
+		m_maincpu->resume(SUSPEND_REASON_SYNC);
+	if (m_as_model)
+		as_schedule();
+	observer_schedule();
+}
+
+void apple2gs_state::mega_ready(int ready)
+{
+	if (m_observer_count)
+	{
+		// Acknowledgement changes the pin. The held transfer and its CPU
+		// continuation retire only at the next actual motherboard fall.
+		m_mega_waiting = !ready;
+		if (!ready && (!m_as_model || m_observer_read_pending))
+		{
+			m_observer_cpu_stop_cycles = m_maincpu->total_cycles();
+			m_observer_cpu_stop_time = m_maincpu->local_time();
+			m_maincpu->set_bus_ready(false);
+		}
+		else if (ready && m_bt_mode == BT_ZIP && !m_observer_read_pending)
+		{
+			// Provisional ZipGS model (US 4,794,523 Fig.3A RDY input): a private
+			// cache cycle resumes at R's next local edge; socket credit still
+			// waits for F. Preserve the validated one-byte posting arithmetic.
+			const u64 clocks = m_maincpu->total_cycles() - m_observer_cpu_stop_cycles;
+			const attotime hold = m_maincpu->cycles_to_attotime(clocks);
+			const u64 delay = m_observer_period[m_observer_head] ?
+				apple2gs_observer::elapsed_ticks(m_maincpu->local_time() - m_observer_cpu_stop_time, m_observer_period[m_observer_head],
+					m_observer_divisor[m_observer_head]) :
+				observer_ticks(hold);
+			m_bt_istall += delay;
+			m_btc[BTC_STALL_WRITE] += delay;
+			m_observer_cpu_released = true;
+			m_maincpu->set_bus_ready(true);
+		}
+		return;
+	}
+	if (m_twgs_kernel_on && m_mega_observe)
+	{
+		// SLOT_RDY is GAL8's input. U30/GAL2 hold TWGS PHI2; neither
+		// this callback nor RDY release completes the pending CPU read.
+		m_mega_waiting = !ready;
+		return;
+	}
+	if (ready && m_mega_waiting)
+	{
+		// Retain the held instruction and all queued writes. The rest of the
+		// transaction stream follows the stretched transfer when RDY releases.
+		// BT_PER_SEC exceeds the u32 frequency accepted by attotime::as_ticks.
+		const attotime held = std::max(attotime::zero, machine().time() - m_mega_bus_time);
+		const u64 delay = twgs_decoded::time_base<BT_PER_SEC>::ticks(held.seconds(), held.attoseconds());
+		m_bt_istall += delay;
+		m_bt_busfree += delay;
+		if (m_bt_mode == BT_ZIP)
+			for (int i = 0; i < m_bt_wcount; ++i)
+				m_bt_wbuf[i] += delay; // the posted byte remains occupied through RDY
+		if (m_as_model)
+		{
+			for (auto &entry : m_as_fifo.entries)
+			{
+				entry.start += delay;
+				entry.end += delay;
+			}
+			if (m_as_mapping_until)
+				m_as_mapping_until += delay;
+		}
+		if (m_twgs_real && m_twgs_kernel_started)
+		{
+			auto &t = m_twgs_kernel;
+			const u64 d = delay * TWGS_TIME_SCALE;
+			t.now += d;
+			t.early += d;
+			t.late += d;
+			t.gs_event += d;
+			t.gs_start += d;
+			t.slot_start += d;
+			t.slot_end += d;
+		}
+	}
+	m_mega_waiting = !ready;
+	m_maincpu->set_bus_ready(ready);
+	if (ready && m_as_model)
+		as_schedule();
+	if (ready && m_twgs_kernel_on && m_twgs_kernel_started)
+		twgs_kernel_schedule();
+	else if (ready && m_twgs_real && m_twgs_wcount)
+		twgs_schedule_write();
+}
+
+bool apple2gs_state::mega_slow_keyglu(u32 address, int type, u8 &data, int &cycles)
+{
+	if (m_slow_keyglu_pending == 2)
+	{
+		if (address != m_slow_keyglu_address)
+			fatalerror("Slow KEYGLU continuation changed address");
+		data = m_slow_keyglu_data;
+		m_slow_keyglu_pending = 0;
+		cycles = m_slow_keyglu_cycles;
+		if (type != g65816_device::BUS_WRITE && m_bt_mode != BT_OFF && m_accel_present)
+			data = twdc_access(address, type, data);
+		if (m_bt_mode == BT_ZIP && type == g65816_device::BUS_OPCODE)
+			m_zip_repsep_pending = data == 0xc2 || data == 0xe2;
+		return true;
+	}
+	const bool read = type != g65816_device::BUS_WRITE;
+	if ((address & 0xff80) != 0xc000 || !mega_selected(address, !read) ||
+		keyglu_816_register(address & 0x7f, !read) < 0)
+		return false;
+	// Both reads and writes meet the MCU at the Mega II completion edge F.
+	// Publish A and F before that rendezvous: even a one-fast-clock wait in
+	// c000_w can cross A and leave the observer trying to enqueue in the past.
+	// A ZipGS posted write still releases the CPU at latch acceptance; its
+	// KEYGLU side effect belongs to the queued motherboard transfer at F.
+	// Hardware Reference ch.6 pp.127-133; TN68 PH0/Mega II cycle ordering.
+	if (!m_slow_keyglu_pending)
+	{
+		const bool blocking = read || (m_bt_mode != BT_ZIP && m_bt_mode != BT_TWGS);
+		const unsigned tail = (m_observer_head + m_observer_count) % MEGA_OBSERVER_QUEUE;
+		int charge = 0;
+		if (m_bt_mode != BT_OFF)
+		{
+			// KEYGLU is uncached I/O. The data hook consumes the final byte
+			// on continuation; no provisional read may supply a cache hit.
+			if (!read && m_accel_present)
+				twdc_access(address, type, data);
+			m_zip_hit = false;
+			m_bt_slow = true;
+			charge = bt_access(address, type, data);
+		}
+		if (blocking)
+		{
+			m_slow_keyglu_pending = 1;
+			m_slow_keyglu_address = address;
+			m_slow_keyglu_cycles = charge;
+		}
+		const u64 end = m_bt_mode == BT_OFF ? 0 : m_bt_slot + sndglu_slot_len(m_bt_slot);
+		mega_transfer(address, read, data, end ? bt_at(end) : m_maincpu->access_completion_time(), -1, false, end);
+		m_observer_keyglu_cycle[tail] = true;
+		if (!blocking)
+		{
+			cycles = charge;
+			return true;
+		}
+	}
+	m_maincpu->defer_bus_access();
+	return false;
+}
+
+int apple2gs_state::mega_observed_access(u32 address, int type, u8 &data)
+{
+	const bool read = type != g65816_device::BUS_WRITE;
+	const bool selected = m_bt_slow || (m_bt_mode == BT_OFF && mega_selected(address, !read));
+	const bool posted = m_twgs_real && m_twgs_post;
+	const int mode = m_bt_mode;
+	const int cycles = bt_access(address, type, data);
+	const bool hit = read &&
+		((mode == BT_ZIP && m_zip_hit) ||
+			(mode == BT_TWGS && !m_bt_twslow && m_twgs_access_cacheable && m_twgs_access_hit &&
+				(type == g65816_device::BUS_OPCODE || type == g65816_device::BUS_OPERAND || BIT(m_twgs_config, 1))));
+	if (selected && !hit && !posted)
+	{
+		const bool zip_opcode = mode == BT_ZIP && type == g65816_device::BUS_OPCODE;
+		// The next-fetch allowance cannot be armed by a provisional read.
+		// The observer samples the opcode byte at its successful fall.
+		if (zip_opcode)
+			m_zip_repsep_pending = false;
+		mega_transfer(address, read, data,
+			mode == BT_OFF ? m_maincpu->local_time() + m_maincpu->cycles_to_attotime(1) : bt_at(m_bt_slot + sndglu_slot_len(m_bt_slot)), -1,
+			zip_opcode, mode == BT_OFF ? 0 : m_bt_slot + sndglu_slot_len(m_bt_slot));
+	}
+	return cycles;
+}
+
+int apple2gs_state::bt_access(u32 address, int type, u8 &data)
 {
 	const bool slow = m_bt_slow;
 	m_bt_slow = false;
 	m_bt_slot_ok = false;
 	if (m_bt_mode == BT_OFF)
+	{
+		if (type == g65816_device::BUS_OPCODE)
+			m_zip_repsep_pending = false;
 		return 0;
+	}
 
 	u64 charge = 0;
 	if (type == g65816_device::BUS_OPCODE)
 	{
 		charge = bt_instruction(address);
-		if (REPSEP_SLOW_CYCLES && ((m_bt_mode == BT_ZIP) || (m_bt_mode == BT_TWGS)))
+		const bool zip_allowance = m_bt_mode == BT_ZIP && m_zip_repsep_pending;
+		m_zip_repsep_pending = m_bt_mode == BT_ZIP && (data == 0xc2 || data == 0xe2);
+		if (zip_allowance)
+		{
+			// Calibration, not a recovered ASIC equation: Csa2 accelerator
+			// FAQ Q018 BENCHMARK v5, lines 953-983. WDC Feb 1991 section 8.23
+			// places the allowance on the
+			// NEXT opcode fetch. Use only the preceding completed opcode byte.
+			const u64 t0 = m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
+			const u64 end = bt_fast(std::max(t0, m_bt_busfree), true);
+			const u64 fall = ((end + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle;
+			const u64 extra = fall > t0 + m_bt_cycle ? fall - t0 - m_bt_cycle : 0;
+			m_bt_istall += extra;
+			charge += extra;
+		}
+		if (REPSEP_SLOW_CYCLES && m_bt_mode == BT_TWGS)
 		{
 			// The card decodes the opcode present on the CPU data pins,
 			// including a cache/EPROM hit. Do not perform another RAM read.
@@ -3354,28 +4584,33 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 		const bool cacheable = zip_cacheable(address);
 		if (write)
 		{
-			while (m_bt_wcount && (m_bt_wbuf[0] <= t))
+			while (m_bt_wcount && (zip_write_ready() <= t))
 			{
 				for (int i = 1; i < m_bt_wcount; i++)
 					m_bt_wbuf[i - 1] = m_bt_wbuf[i];
 				m_bt_wcount--;
 			}
 			u64 accept = t;
+			u64 bus_ready = t;
 			if (m_bt_wcount >= ZIP_WRITE_DEPTH)
 			{
-				// US 4,794,523 Table I: the CPU stops until the previous byte's
-				// cycle ends, and CLR can latch the new byte only after DL1/DL2
-				// see that end (two ZipGS clocks). The byte misses the PH2 cycle
-				// that starts there, so a slow write takes the Mega II cycle after.
-				accept = ((m_bt_wbuf[0] + m_bt_cycle - 1) / m_bt_cycle + 1) * m_bt_cycle;
+				// US 4,794,523 Table I: "HLD holds CLR for one following PH0".
+				// Selected interpretation of IIgs PH0: a preceding
+				// Mega II write retains CLR through the following PH0 cycle;
+				// an FPI fast-RAM cycle is not PH0 and adds no HLD. Keep the
+				// physical end separately so RDY retries also move this hold,
+				// including the stretched 65th cycle. This is not TWGS timing.
+				bus_ready = zip_write_ready();
+				accept = ((bus_ready + m_bt_cycle - 1) / m_bt_cycle) * m_bt_cycle;
 				for (int i = 1; i < m_bt_wcount; i++)
 					m_bt_wbuf[i - 1] = m_bt_wbuf[i];
 				m_bt_wcount--;
 				m_btc[BTC_WBUF_FULL]++;
 			}
-			const u64 end = bt_bus(std::max(accept, m_bt_busfree), cls);
+			const u64 end = bt_bus(std::max(bus_ready, m_bt_busfree), cls);
 			m_bt_busfree = end;
 			m_bt_wbuf[m_bt_wcount++] = end;
+			m_zip_write_ph0 = cls == BC_MEGA;
 			stall = accept - t;
 
 		}
@@ -3527,7 +4762,7 @@ int apple2gs_state::bt_access(u32 address, int type, u8 data)
 	{
 		if (m_bt_slot_ok)
 		{
-			m_snd_force = bt_at(m_bt_slot);
+			m_snd_slot = m_bt_slot;
 			m_snd_force_on = true;
 		}
 		if (m_glu_hold_reg == 0xc03c)
@@ -3778,7 +5013,6 @@ void apple2gs_state::auxbank_update()
 
 void apple2gs_state::update_slotrom_banks()
 {
-	//printf("update_slotrom_banks: intcxrom %d slotc3rom %d\n", m_intcxrom, m_slotc3rom);
 
 	if ((m_intcxrom) || (!m_slotc3rom))
 	{
@@ -3849,13 +5083,6 @@ void apple2gs_state::lc_update(int offset, bool writing)
 		lcrom_update();
 	}
 
-	#if 0
-	printf("LC: new state %c%c dxxx=%04x altzp=%d\n",
-			m_lcram ? 'R' : 'x',
-			m_lcwriteenable ? 'W' : 'x',
-			m_lcram2 ? 0x1000 : 0x0000,
-			m_altzp);
-	#endif
 }
 
 void apple2gs_state::lcrom_update()
@@ -3877,7 +5104,6 @@ void apple2gs_state::lcrom_update()
 }
 
 // most softswitches don't care about read vs write, so handle them here
-const char *const apple2gs_state::s_glu_cls[7] = { "flo", "fhi", "vol", "ptr", "ctl", "siz", "oth" };
 
 // The $C03C nibble is the amplifier after the DOC/speaker sum.
 // Step 0 is mute. No resistor values for a log taper were found, so
@@ -3922,26 +5148,23 @@ attotime apple2gs_state::bt_at(u64 t) const
 	return attotime(secs, attoseconds_t(double(rem) * (double(ATTOSECONDS_PER_SECOND) / double(BT_PER_SEC))));
 }
 
-// A GLU access reaches the GLU when its own bus cycle does. Zip and TransWarp
-// register writes set m_snd_force to that cycle.
-// Anything else still sees the bus once earlier buffered writes have finished.
-attotime apple2gs_state::sndglu_now() const
+// SlotMaker selects the GLU during the CPU half of a Mega II cycle.
+// Writes close at select end; data reads request at select start and sample
+// at select end. The exact internal select delay is not published.
+u64 apple2gs_state::sndglu_slot() const
 {
 	if (m_snd_force_on)
-		return m_snd_force;
-	if (m_bt_mode == BT_ZIP || m_bt_mode == BT_NATIVE)
-	{
-		// ZipGS writes arrive forced, so this is a $C03C-$C03F read. The GLU
-		// select is a PH0 strobe: the read gets there only in the Mega II
-		// cycle that bt_access will charge for it, after any posted write.
-		const u64 t = m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
-		return bt_at(bt_mega_start(std::max(t, m_bt_busfree)));
-	}
-	const attotime now = machine().time();
-	if (m_bt_mode != BT_TWGS)
-		return now;
-	const attotime bus = bt_at(m_bt_busfree);
-	return (bus > now) ? bus : now;
+		return m_snd_slot;
+	if (m_bt_mode == BT_OFF)
+		return u64(machine().time().as_double() * double(BT_PER_SEC));
+	const u64 t = m_bt_istart + m_bt_idx * m_bt_cycle + m_bt_istall;
+	return bt_mega_start(std::max(t, m_bt_busfree));
+}
+
+attotime apple2gs_state::sndglu_now() const
+{
+	const u64 slot = sndglu_slot();
+	return bt_at(slot + sndglu_slot_len(slot));
 }
 
 bool apple2gs_state::sndglu_service()
@@ -3955,305 +5178,168 @@ bool apple2gs_state::sndglu_service(attotime time)
 		return false;
 	if (machine().side_effects_disabled())
 		return time < m_sndglu_busy_until;
-	// Service by event time, not timer-dispatch time. This also runs before
-	// the DOC advances, so neither its scan nor its audio can pass a due
-	// transfer. The latch is cleared before entering the DOC again.
-	while (m_sndglu_pending && m_sndglu_busy_until <= time)
+	// Lock address before any later CPU pointer store, then sample the
+	// transfer, then release busy. Timer dispatch may be later than all three.
+	if (!m_sndglu_addr_locked && time >= m_sndglu_host_rise + attotime::from_nsec(210))
+	{
+		m_sndglu_lock_addr = m_sndglu_addr;
+		m_sndglu_addr_locked = true;
+	}
+	if (!m_sndglu_landed && m_sndglu_transfer_at <= time)
 		sndglu_commit();
+	if (m_sndglu_pending && m_sndglu_busy_until <= time)
+		m_sndglu_pending = false;
+	sndglu_schedule();
 	return m_sndglu_pending;
 }
 
-// Capture the instruction PC and access bank at the CPU bus hook. A later
-// deferred GLU write uses this context; the CPU may have advanced by then.
-void apple2gs_state::sndglu_log_note(u32 address, int type)
+void apple2gs_state::sndglu_schedule()
 {
-	if (type == g65816_device::BUS_OPCODE)
-		m_glu_log_instruction_pc = address;
-	if ((address & 0xfffc) == 0xc03c)
-		m_glu_log_access_bank = address >> 16;
-}
-
-bool apple2gs_state::sndglu_log_memory(u32 address, int type, u8 &data)
-{
-	sndglu_log_note(address, type);
-	return m_twgs_real && m_twgs ? twgs_memory(address, type, data) : false;
-}
-
-std::string apple2gs_state::sndglu_log_prefix(const glu_log_context &event) const
-{
-	const std::string gap = event.gap < 0 ? "first" : util::string_format("%lld", (long long)event.gap);
-	return util::string_format("Sound GLU t=%.9f PC=%02X:%04X bank=%02X gap=%s bus cycles CPU=%.3fMHz accelerator=%s/%.3fMHz: ",
-		event.time.as_double(), event.pc >> 16, event.pc & 0xffff, event.bank, gap,
-		event.cpu_hz / 1.0e6, event.accelerator, event.accelerator_hz / 1.0e6);
-}
-
-std::string apple2gs_state::sndglu_log_cpu_state()
-{
-	const unsigned p = m_maincpu->state_int(g65816_device::G65816_P);
-	return util::string_format("A=%04X X=%04X Y=%04X S=%04X D=%04X DBR=%02X P=%02X (m=%u x=%u e=%u)",
-		unsigned(m_maincpu->state_int(g65816_device::G65816_A)),
-		unsigned(m_maincpu->state_int(g65816_device::G65816_X)),
-		unsigned(m_maincpu->state_int(g65816_device::G65816_Y)),
-		unsigned(m_maincpu->state_int(g65816_device::G65816_S)),
-		unsigned(m_maincpu->state_int(g65816_device::G65816_D)),
-		unsigned(m_maincpu->state_int(g65816_device::G65816_DB)), p,
-		BIT(p, 5), BIT(p, 4), unsigned(m_maincpu->state_int(g65816_device::G65816_E)));
-}
-
-std::string apple2gs_state::sndglu_log_stack()
-{
-	// Pushed data can resemble return addresses. Verify a preceding call
-	// opcode when possible, scan upward from S, and never execute CPU hooks.
-	auto const disable = machine().disable_side_effects();
-	auto &space = m_maincpu->space(AS_PROGRAM);
-	const u16 s = m_maincpu->state_int(g65816_device::G65816_S);
-	const bool emulation = m_maincpu->state_int(g65816_device::G65816_E);
-	auto stack_byte = [&space, s, emulation](unsigned offset)
+	if (!m_sndglu_pending)
+		m_sndglu_timer->adjust(attotime::never);
+	else
 	{
-		const u16 address = emulation ? 0x100 | ((s + offset) & 0xff) : u16(s + offset);
-		return space.read_byte(address);
-	};
-	unsigned bank = m_glu_log_context.pc >> 16, found = 0;
-	std::string text;
-	for (unsigned offset = 1; offset <= 62 && found < 3; ++offset)
-	{
-		const u16 saved = stack_byte(offset) | (u16(stack_byte(offset + 1)) << 8);
-		const unsigned long_bank = stack_byte(offset + 2);
-		const bool jsl = space.read_byte((long_bank << 16) | u16(saved - 3)) == 0x22;
-		const u8 short_opcode = space.read_byte((bank << 16) | u16(saved - 2));
-		const bool jsr = short_opcode == 0x20 || short_opcode == 0xfc;
-		if (!jsl && !jsr)
-			continue;
-		if (jsl)
-			bank = long_bank;
-		if (found++)
-			text += ", ";
-		text += util::string_format("%02X:%04X (%s at S+%u)", bank, u16(saved + 1), jsl ? "JSL" : "JSR", offset);
-		offset += jsl ? 2 : 1;
+		const attotime next = m_sndglu_landed ? m_sndglu_busy_until : m_sndglu_transfer_at;
+		const attotime left = next - machine().time();
+		m_sndglu_timer->adjust(left < attotime::zero ? attotime::zero : left);
 	}
-	return text.empty() ? "no plausible return addresses in 64 bytes" : text;
 }
 
-void apple2gs_state::sndglu_log_event(unsigned kind, std::string details)
-{
-	++m_glu_log_counts[kind];
-	const std::string prefix = sndglu_log_prefix(m_glu_log_context);
-	std::string state;
-	if (VERBOSE & LOG_GLUTRACE)
-		state = "; " + sndglu_log_cpu_state();
-	LOGMASKED(LOG_GLU, "%s%s%s\n", prefix, details, state);
-	static const char *const kinds[] = { "busy data write", "busy control write", "busy address-low write", "busy address-high write", "busy data read", "data setup change" };
-	LOGMASKED(LOG_GLUTRACE, "%sCPU/stack for %s%s; call trace (best guess; pushed data may look like returns): %s\n",
-		prefix, kinds[kind], state, sndglu_log_stack());
-}
-
-void apple2gs_state::sndglu_log_summary()
-{
-	if (std::none_of(std::begin(m_glu_log_counts), std::end(m_glu_log_counts), [](u64 count) { return count != 0; }))
-		return;
-	LOGMASKED(LOG_GLU | LOG_GLUTRACE, "%slast interval: busy data writes=%llu, busy control writes=%llu, busy address-low writes=%llu, busy address-high writes=%llu, busy data reads=%llu, setup changes=%llu\n",
-		sndglu_log_prefix(m_glu_log_context), (unsigned long long)m_glu_log_counts[0], (unsigned long long)m_glu_log_counts[1],
-		(unsigned long long)m_glu_log_counts[2], (unsigned long long)m_glu_log_counts[3],
-		(unsigned long long)m_glu_log_counts[4], (unsigned long long)m_glu_log_counts[5]);
-	std::fill(std::begin(m_glu_log_counts), std::end(m_glu_log_counts), 0);
-}
-
-void apple2gs_state::sndglu_log_access(unsigned port, bool read, u8 data, u8 result)
-{
-	if (machine().side_effects_disabled())
-		return;
-	const attotime now = sndglu_now();
-	const u64 ticks = now.as_ticks(A2GS_14M);
-	const int64_t cycle = (ticks / 912) * 65 + std::min<u64>((ticks % 912) / 14, 64);
-	m_glu_log_context = { now, m_glu_log_last_cycle < 0 ? -1 : cycle - m_glu_log_last_cycle,
-		m_glu_log_instruction_pc, u32(m_bt_twslow ? BT_PER_SEC / BT_FAST : (m_bt_mode == BT_OFF ? m_maincpu->clock() : BT_PER_SEC / m_bt_cycle)),
-		m_accel_present ? m_accel_speed : 0, m_glu_log_access_bank, m_accel_present ? (m_twgs ? "TransWarp GS" : "ZipGS") : "none" };
-	m_glu_log_last_cycle = cycle;
-	if (now >= m_glu_log_summary_at)
-	{
-		sndglu_log_summary();
-		m_glu_log_summary_at = now + attotime::from_seconds(10);
-	}
-	auto destination = [](u16 address, bool ram)
-	{
-		return util::string_format("%s $%04X", ram ? "sound RAM" : "DOC register", ram ? address : address & 0xff);
-	};
-	const bool busy = m_sndglu_pending && now < m_sndglu_busy_until;
-	if (busy && !read && port != 13)
-	{
-		const u16 next = port == 12 ? (BIT(data, 6) ? m_sndglu_addr : m_sndglu_addr & 0xff)
-			: port == 14 ? (m_sndglu_addr & 0xff00) | data : (m_sndglu_addr & 0xff) | (u16(data) << 8);
-		sndglu_log_event(port == 12 ? 1 : port - 12,
-			util::string_format("$C03%X write $%02X while busy; local register changes; pending %s will use %s (was %s)",
-				port, data, m_sndglu_pend_read ? "read" : "write", destination(next, m_sndglu_pend_ram), destination(m_sndglu_addr, m_sndglu_pend_ram)));
-	}
-	if (busy && port == 13)
-	{
-		const std::string requested = destination(m_glu_log_intended_address, BIT(m_glu_log_intended_control, 6));
-		const std::string target = destination(m_sndglu_addr, BIT(m_sndglu_ctrl, 6));
-		if (read)
-			sndglu_log_event(4, util::string_format("$C03D read while busy returned $%02X; pending transfer becomes a read of %s at the existing deadline; program requested %s", result, target, requested));
-		else
-		{
-			const std::string old = m_sndglu_pend_read ? "pending read" : util::string_format("pending byte $%02X", m_sndglu_pend_data);
-			sndglu_log_event(0, util::string_format("$C03D write $%02X while busy replaces %s; transfer goes to %s at the existing deadline; program requested %s", data, old, target, requested));
-			if (!m_sndglu_pend_read && !m_sndglu_pend_ram && data != m_sndglu_pend_data && m_sndglu_busy_until - now < attotime::from_nsec(150))
-				sndglu_log_event(5, util::string_format("DOC data changed $%02X -> $%02X inside 150ns setup; %.1fns before transfer to %s", m_sndglu_pend_data, data, (m_sndglu_busy_until - now).as_double() * 1.0e9, target));
-		}
-	}
-	if (port == 13 && BIT(m_glu_log_intended_control, 5))
-		++m_glu_log_intended_address;
-	else if (!read && port == 12)
-		m_glu_log_intended_control = data & 0x7f;
-	else if (!read && port == 14)
-		m_glu_log_intended_address = (m_glu_log_intended_address & 0xff00) | data;
-	else if (!read && port == 15)
-		m_glu_log_intended_address = (m_glu_log_intended_address & 0xff) | (u16(data) << 8);
-}
-
+// One holding latch and one request flag. These internal selection rules
+// are inferred from the board wiring and the paired NinjaTracker sequences;
+// they are not a recovered GLU netlist.
 void apple2gs_state::sndglu_ctrl_write(u8 data)
 {
-	sndglu_service();
-	if (m_glu_log_enabled)
-		sndglu_log_access(12, false, data);
-	m_sndglu_ctrl = data & 0x7f; // bit 7 (busy) is read-only
-	if (!(m_sndglu_ctrl & 0x40)) // clear hi byte of address pointer on DOC access
+	const attotime now = sndglu_now();
+	sndglu_service(now);
+	if (m_trace)
+		m_trace->sndglu_log_access(12, false, data);
+	m_sndglu_ctrl = data & 0x7f;
+	if (!(m_sndglu_ctrl & 0x40))
 		m_sndglu_addr &= 0xff;
+	if (m_sndglu_pending && now + attotime::from_nsec(317) < m_sndglu_host_rise)
+	{
+		m_sndglu_pend_ram = BIT(m_sndglu_ctrl, 6);
+		m_sndglu_pend_auto = BIT(m_sndglu_ctrl, 5);
+		sndglu_set_deadline();
+	}
 	sndglu_apply_vca();
 }
 
-void apple2gs_state::sndglu_arm(bool is_read, u8 data)
+void apple2gs_state::sndglu_arm(bool is_read, u8 data, attotime request)
 {
-	const attotime now = sndglu_now();
-	const u64 ticks = now.as_ticks(A2GS_7M);
-	// Time to the next free phase, plus three DOC clocks for the strobe.
-	// Missing the phase waits from three clocks to a slot plus three.
-	const u64 commit_tick = (ticks / 8 + 1) * 8 + 3;
+	// Selected candidate: commit at the preceding DOC fetch /RAS fall,
+	// about 317 ns before E-rise. The published register/RAM pair failure
+	// constrains this edge but does not uniquely identify the internal gate.
+	const auto host = m_doc->host_cycle(request + attotime::from_nsec(317));
+	m_sndglu_host_rise = m_doc->clock_time(host.rise);
+	m_sndglu_host_fall = host.fall;
 	m_sndglu_pend_read = is_read;
-	m_sndglu_pend_ram = (m_sndglu_ctrl & 0x40) != 0;
-	m_sndglu_pend_auto = (m_sndglu_ctrl & 0x20) != 0;
+	m_sndglu_pend_ram = BIT(m_sndglu_ctrl, 6);
+	m_sndglu_pend_auto = BIT(m_sndglu_ctrl, 5);
 	m_sndglu_pend_addr = m_sndglu_addr;
 	m_sndglu_pend_data = data;
-	m_sndglu_busy_until = attotime::from_ticks(commit_tick, A2GS_7M);
+	m_sndglu_addr_locked = m_sndglu_landed = false;
 	m_sndglu_pending = true;
-	// Absolute commit time. now may be a future bus cycle; scheduling the
-	// interval from now would fire early and drop the collision.
-	const attotime left = m_sndglu_busy_until - machine().time();
-	m_sndglu_timer->adjust((left < attotime::zero) ? attotime::zero : left);
+	sndglu_set_deadline();
 }
 
-// Register write of $C03D. A write that arrives while the latch is still
-// waiting replaces the byte. The commit time does not move.
+void apple2gs_state::sndglu_set_deadline()
+{
+	if (m_sndglu_pend_ram)
+	{
+		// Early-write hold completion, or worst-case -150 DRAM read data,
+		// using the DOC /RAS and the GLU-generated /CAS (not DOC /CAS).
+		m_sndglu_transfer_at = m_sndglu_host_rise + attotime::from_nsec(m_sndglu_pend_read ? 396 : 366);
+		m_sndglu_busy_until = m_sndglu_transfer_at;
+	}
+	else
+	{
+		m_sndglu_transfer_at = m_doc->clock_time(m_sndglu_host_fall);
+		m_sndglu_busy_until = m_sndglu_transfer_at + attotime::from_nsec(m_sndglu_pend_read ? 0 : 30);
+	}
+	sndglu_schedule();
+}
+
+void apple2gs_state::sndglu_merge(bool is_read, attotime request)
+{
+	if (m_sndglu_landed || request + attotime::from_nsec(317) >= m_sndglu_host_rise)
+		return;
+	m_sndglu_pend_read = is_read;
+	m_sndglu_pend_ram = BIT(m_sndglu_ctrl, 6);
+	m_sndglu_pend_auto = BIT(m_sndglu_ctrl, 5);
+	sndglu_set_deadline();
+}
+
 void apple2gs_state::sndglu_addr_write(u16 reg, u8 data)
 {
 	sndglu_service();
-	if (m_glu_log_enabled)
-		sndglu_log_access(reg & 15, false, data);
+	if (m_trace)
+		m_trace->sndglu_log_access(reg & 15, false, data);
 	if (reg == 0xc03e)
 		m_sndglu_addr = (m_sndglu_addr & 0xff00) | data;
 	else
-		m_sndglu_addr = (m_sndglu_addr & 0x00ff) | (data << 8);
+		m_sndglu_addr = (m_sndglu_addr & 0xff) | (u16(data) << 8);
 }
 
 void apple2gs_state::sndglu_reg_write(u8 data)
 {
-	const bool busy = sndglu_service();
-	if (m_glu_log_enabled)
-		sndglu_log_access(13, false, data);
+	const attotime now = sndglu_now();
+	const bool busy = sndglu_service(now);
+	if (m_trace)
+		m_trace->sndglu_log_access(13, false, data);
+	m_sndglu_dummy_read = data;
 	if (busy)
 	{
-		logerror("Sound GLU busy: write %02x to %04x dropped\n", m_sndglu_pend_data, m_sndglu_pend_addr);
-		sndglu_tally(m_sndglu_pend_addr, false);
-		m_sndglu_pend_read = false;
-		m_sndglu_pend_ram = (m_sndglu_ctrl & 0x40) != 0;
-		m_sndglu_pend_auto = (m_sndglu_ctrl & 0x20) != 0;
-		m_sndglu_pend_addr = m_sndglu_addr;
+		if (!m_sndglu_landed)
+		{
+			if (m_trace) m_trace->emit("Sound GLU busy: holding byte %02x for %04x replaced by %02x\n", m_sndglu_pend_data, m_sndglu_pend_addr, data);
+			if (m_trace) m_trace->sndglu_tally(m_sndglu_pend_addr, false);
+		}
 		m_sndglu_pend_data = data;
+		sndglu_merge(false, now);
 		return;
 	}
-	sndglu_arm(false, data);
-}
-
-void apple2gs_state::sndglu_tally(u16 addr, bool land)
-{
-	const int osc = addr & 0x1f;
-	int cls;
-	switch ((addr >> 5) & 7)
-	{
-		case 0: cls = 0; break;
-		case 1: cls = 1; break;
-		case 2: cls = 2; break;
-		case 4: cls = 3; break;
-		case 5: cls = 4; break;
-		case 6: cls = 5; break;
-		default: cls = 6; break;
-	}
-	if (land)
-		m_glu_land[osc][cls]++;
-	else
-		m_glu_repl[osc][cls]++;
-}
-
-void apple2gs_state::sndglu_log_table()
-{
-	logerror("Sound GLU vca %02x\n", m_sndglu_ctrl & 0x0f);
-	logerror("Sound GLU ram bytes %u\n", m_glu_ram);
-	for (int osc = 0; osc < 32; osc++)
-	{
-		bool any = false;
-		for (int c = 0; c < 7; c++)
-			any = any || m_glu_land[osc][c] || m_glu_repl[osc][c];
-		if (!any)
-			continue;
-		logerror("Sound GLU osc %02d", osc);
-		for (int c = 0; c < 7; c++)
-			logerror(" %s %u/%u", s_glu_cls[c], m_glu_land[osc][c], m_glu_repl[osc][c]);
-		logerror("\n");
-	}
+	sndglu_arm(false, data, now);
 }
 
 void apple2gs_state::sndglu_commit()
 {
-	if (!m_sndglu_pending)
+	if (!m_sndglu_pending || m_sndglu_landed)
 		return;
-	m_sndglu_pending = false;
-	m_sndglu_timer->adjust(attotime::never);
-	// The GLU drives the pointer on SND-LA at the sample point, so a pointer
-	// store that arrives while a byte waits redirects that byte.
-	const u16 addr = m_sndglu_addr;
+	m_sndglu_landed = true;
+	// A pointer change can redirect only before the sound-side address
+	// has been established; it cannot retroactively change a sampled byte.
+	const u16 addr = m_sndglu_addr_locked ? m_sndglu_lock_addr : m_sndglu_addr;
 	if (!m_sndglu_pend_read && (addr != m_sndglu_pend_addr))
-		logerror("Sound GLU redirect: %02x for %04x went to %04x\n", m_sndglu_pend_data, m_sndglu_pend_addr, addr);
+		if (m_trace) m_trace->emit("Sound GLU redirect: %02x for %04x went to %04x\n", m_sndglu_pend_data, m_sndglu_pend_addr, addr);
 	if (m_sndglu_pend_read)
 	{
 		if (m_sndglu_pend_ram)
 		{
-			m_doc->synchronize_to(m_sndglu_busy_until);
+			m_doc->synchronize_to(m_sndglu_transfer_at);
 			m_sndglu_dummy_read = m_docram[addr];
 		}
 		else
-			m_sndglu_dummy_read = m_doc->read_at(addr, m_sndglu_busy_until);
+			m_sndglu_dummy_read = m_doc->read_latched(addr, m_sndglu_host_fall);
 	}
 	else if (m_sndglu_pend_ram)
 	{
-		m_doc->synchronize_to(m_sndglu_busy_until);
+		m_doc->synchronize_to(m_sndglu_transfer_at);
 		m_docram[addr] = m_sndglu_pend_data;
-		m_glu_ram++;
+		if (m_trace) ++m_trace->m_glu_ram;
 	}
 	else
 	{
-		m_doc->write_at(addr, m_sndglu_pend_data, m_sndglu_busy_until);
-		sndglu_tally(addr, true);
+		m_doc->write_latched(addr, m_sndglu_pend_data, m_sndglu_host_fall);
+		if (m_trace) m_trace->sndglu_tally(addr, true);
 	}
 	// The pointer increments only if the CPU has not stored a new address
 	// since this transfer was accepted. A store to $C03E/$C03F replaces
 	// the pointer; the completing cycle must not add one to that new value.
 	if (m_sndglu_pend_auto && m_sndglu_addr == m_sndglu_pend_addr)
 		m_sndglu_addr = (addr + 1) & 0xffff;
-	if (machine().time() >= m_glu_log_at)
-	{
-		m_glu_log_at += attotime::from_seconds(10);
-		sndglu_log_table();
-	}
+
 }
 
 TIMER_CALLBACK_MEMBER(apple2gs_state::sndglu_commit_cb)
@@ -4466,6 +5552,9 @@ void apple2gs_state::clear_vgcint(u8 data)
 
 u8 apple2gs_state::c000_r(offs_t offset)
 {
+	u8 keydata = 0;
+	if (!keyglu_816_access(offset, false, keydata))
+		m_maincpu->synchronize_bus_access();
 	u8 ret;
 
 	if (offset < 0x71)
@@ -4502,7 +5591,7 @@ u8 apple2gs_state::c000_r(offs_t offset)
 
 	const u8 uFloatingBus = read_floatingbus(); // video side-effects latch after reading
 	const u8 uFloatingBus7 = uFloatingBus & 0x7f;
-	const u8 uKeyboard = keyglu_816_read(GLU_C000);
+	const u8 uKeyboard = keydata;
 
 	switch (offset)
 	{
@@ -4513,9 +5602,7 @@ u8 apple2gs_state::c000_r(offs_t offset)
 			return uKeyboard;
 
 		case 0x10:  // read any key down, reset keyboard strobe
-			if (!machine().side_effects_disabled())
-				keyglu_816_write(GLU_C010, 0);
-			return keyglu_816_read(GLU_C010) | (uKeyboard & 0x7f);
+			return keydata;
 
 		// Mega II status replaces D7; D0-D6 retain the keyboard latch,
 		// as in the IIe soft-switch readback (apple2e_state::c000_r).
@@ -4571,16 +5658,16 @@ u8 apple2gs_state::c000_r(offs_t offset)
 			return m_vgcint;
 
 		case 0x24:  // MOUSEDATA
-			return keyglu_816_read(GLU_MOUSEX);
+			return keydata;
 
 		case 0x25:  // KEYMODREG
-			return keyglu_816_read(GLU_KEYMOD);
+			return keydata;
 
 		case 0x26:  // DATAREG
-			return keyglu_816_read(GLU_DATA);
+			return keydata;
 
 		case 0x27:  // KMSTATUS
-			return keyglu_816_read(GLU_SYSSTAT);
+			return keydata;
 
 		case 0x29:  // NEWVIDEO
 			return m_video->get_newvideo();
@@ -4641,52 +5728,46 @@ u8 apple2gs_state::c000_r(offs_t offset)
 			return m_a2bus->dma_bank();
 
 		case 0x3c:  // SOUNDCTL
-			// Bit 7 is the DOC port. Bit 4 is reserved and reads as 1. Bits 3-0
-			// are the VCA, returned as stored (not forced on).
 			if (!machine().side_effects_disabled())
 			{
 				sndglu_service();
-				if (m_glu_log_enabled)
-					sndglu_log_access(12, true, 0);
+				if (m_trace)
+					m_trace->sndglu_log_access(12, true, 0);
 			}
-			return (m_sndglu_ctrl & 0x7f) | 0x10 | ((m_sndglu_pending && sndglu_now() < m_sndglu_busy_until) ? 0x80 : 0x00);
+			// Real ROM 1 hardware test, upstream #15626: the volume nibble
+			// is write-only and bits 0-4 all read as ones.
+			return (m_sndglu_ctrl & 0x60) | 0x1f | ((m_sndglu_pending && sndglu_now() < m_sndglu_busy_until) ? 0x80 : 0);
 
 		case 0x3d:  // SOUNDDATA
 		{
 			if (machine().side_effects_disabled())
 				return m_sndglu_dummy_read;
-			// The GLU has no ready line, so it cannot hold the CPU. The read returns
-			// the byte already in the latch and posts a fetch; while busy, the new
-			// request takes the place of the waiting one.
-			// Finish a transfer whose deadline has passed before sampling the
-			// CPU read latch. The scheduler may not have dispatched its timer
-			// yet while this CPU instruction is still executing.
-			const bool busy = sndglu_service();
-			ret = m_sndglu_dummy_read;
-			if (m_glu_log_enabled)
-				sndglu_log_access(13, true, 0, ret);
+			const u64 slot = sndglu_slot();
+			// The stretched cycle adds two clocks in PH0-high (Kruszyna's
+			// measured FPI timing); selection still starts seven clocks in.
+			const attotime request = bt_at(slot + 7 * BT_CLK);
+			const attotime sample = bt_at(slot + sndglu_slot_len(slot));
+			const bool busy = sndglu_service(request);
+			if (m_trace)
+				m_trace->sndglu_log_access(13, true, 0, m_sndglu_dummy_read);
 			if (busy)
-			{
-				m_sndglu_pend_read = true;
-				m_sndglu_pend_ram = (m_sndglu_ctrl & 0x40) != 0;
-				m_sndglu_pend_auto = (m_sndglu_ctrl & 0x20) != 0;
-				m_sndglu_pend_addr = m_sndglu_addr;
-			}
+				sndglu_merge(true, request);
 			else
-				sndglu_arm(true, 0);
-			return ret;
+				sndglu_arm(true, 0, request);
+			sndglu_service(sample);
+			return m_sndglu_dummy_read;
 		}
 
 		case 0x3e:  // SOUNDADRL
 			sndglu_service();
-			if (m_glu_log_enabled)
-				sndglu_log_access(0xe, true, 0);
+			if (m_trace)
+				m_trace->sndglu_log_access(0xe, true, 0);
 			return m_sndglu_addr & 0xff;
 
 		case 0x3f:  // SOUNDADRH
 			sndglu_service();
-			if (m_glu_log_enabled)
-				sndglu_log_access(0xf, true, 0);
+			if (m_trace)
+				m_trace->sndglu_log_access(0xf, true, 0);
 			return (m_sndglu_addr >> 8) & 0xff;
 
 		case 0x41:  // INTEN
@@ -4808,6 +5889,9 @@ u8 apple2gs_state::c000_r(offs_t offset)
 void apple2gs_state::c000_w(offs_t offset, u8 data)
 {
 	if(machine().side_effects_disabled()) return;
+	u8 keydata = data;
+	if (!keyglu_816_access(offset, true, keydata))
+		m_maincpu->synchronize_bus_access();
 
 	switch (offset)
 	{
@@ -4900,7 +5984,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 		case 0x14: case 0x15: case 0x16: case 0x17:
 		case 0x18: case 0x19: case 0x1a: case 0x1b:
 		case 0x1c: case 0x1d: case 0x1e: case 0x1f: // IIe/Mega II keyboard strobe aliases
-			keyglu_816_write(GLU_C010, data);
+			// The ordered KEYGLU edge has already committed this write.
 			break;
 
 		case 0x21:  // MONOCHROME
@@ -4922,17 +6006,17 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 
 			m_vgcint &= 0xf0;
 			m_vgcint |= (data & 0x07);
-			//printf("%02x to VGCINT, now %02x\n", data, m_vgcint);
+
 			break;
 
 		case 0x26:  // DATAREG
 			// allow ADBuC sync if the Zip is on
 			accel_temp_delay(30, true);
-			keyglu_816_write(GLU_COMMAND, data);
+			// The ordered KEYGLU edge has already committed this write.
 			break;
 
 		case 0x27:  // KMSTATUS
-			keyglu_816_write(GLU_SYSSTAT, data);
+			// The ordered KEYGLU edge has already committed this write.
 			break;
 
 		case 0x29:  // NEWVIDEO
@@ -4961,7 +6045,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 			break;
 
 		case 0x32:  // VGCINTCLEAR
-			//printf("%02x to VGCINTCLEAR\n", data);
+
 			clear_vgcint(data);
 			break;
 
@@ -5074,7 +6158,7 @@ void apple2gs_state::c000_w(offs_t offset, u8 data)
 			{
 				lower_irq(IRQS_VBL);
 			}
-			//printf("%02x to INTEN, now %02x\n", data, m_vgcint);
+
 			break;
 
 		case 0x59: // Zip GS-specific settings
@@ -5316,7 +6400,6 @@ u8 apple2gs_state::read_slot_rom(int slotbias, int offset)
 {
 	const int slotnum = ((offset>>8) & 0xf) + slotbias;
 
-//  printf("read_slot_rom: sl %d offs %x, cnxx_slot %d\n", slotnum, offset, m_cnxx_slot);
 	slow_cycle();
 
 	if (m_slotdevice[slotnum] != nullptr)
@@ -5849,17 +6932,29 @@ u8 apple2gs_state::read_floatingbus()
     ADDRESS MAP
 ***************************************************************************/
 
-template <int Addr>
-u8 apple2gs_state::e0ram_r(offs_t offset) { slow_cycle(); return as_slow_r(offset + Addr); }
+template <int Addr> u8 apple2gs_state::e0ram_r(offs_t offset)
+{
+	slow_cycle();
+	return as_slow_r(offset + Addr);
+}
 
-template <int Addr>
-void apple2gs_state::e0ram_w(offs_t offset, u8 data) { slow_cycle(); as_slow_w(offset + Addr, data); }
+template <int Addr> void apple2gs_state::e0ram_w(offs_t offset, u8 data)
+{
+	slow_cycle();
+	as_slow_w(offset + Addr, data);
+}
 
-template <int Addr>
-u8 apple2gs_state::e1ram_r(offs_t offset) { slow_cycle(); return as_slow_r(offset + Addr + 0x10000); }
+template <int Addr> u8 apple2gs_state::e1ram_r(offs_t offset)
+{
+	slow_cycle();
+	return as_slow_r(offset + Addr + 0x10000);
+}
 
-template <int Addr>
-void apple2gs_state::e1ram_w(offs_t offset, u8 data) { slow_cycle(); as_slow_w(offset + Addr + 0x10000, data); }
+template <int Addr> void apple2gs_state::e1ram_w(offs_t offset, u8 data)
+{
+	slow_cycle();
+	as_slow_w(offset + Addr + 0x10000, data);
+}
 
 template u8 apple2gs_state::e0ram_r<0x0000>(offs_t offset);
 template u8 apple2gs_state::e0ram_r<0x0200>(offs_t offset);
@@ -5903,7 +6998,7 @@ u8 apple2gs_state::auxram0000_r(offs_t offset)
 			offset = ((offset - 0x2000) >> 1) + 0x2000;
 		}
 	}
-	return as_slow_r(offset+0x10000);
+	return as_slow_r(offset + 0x10000);
 }
 
 void apple2gs_state::auxram0000_w(offs_t offset, u8 data)
@@ -5924,7 +7019,7 @@ void apple2gs_state::auxram0000_w(offs_t offset, u8 data)
 		}
 	}
 
-	as_slow_w(offset+0x10000, data);
+	as_slow_w(offset + 0x10000, data);
 
 	if ((orig_addr >= 0x9e00) && (orig_addr <= 0x9fff))
 	{
@@ -5957,7 +7052,7 @@ void apple2gs_state::b0ram0400_w(offs_t offset, u8 data)
 	if (!(m_shadow & SHAD_TXTPG1))
 	{
 		slow_cycle();
-		as_slow_w(offset+0x0400, data);
+		as_slow_w(offset + 0x0400, data);
 	}
 }
 u8 apple2gs_state::b0ram0800_r(offs_t offset)  { return m_ram_ptr[offset+0x800]; }
@@ -5969,7 +7064,7 @@ void apple2gs_state::b0ram0800_w(offs_t offset, u8 data)
 		if (!(m_shadow & SHAD_TXTPG2) && m_is_rom3)
 		{
 			slow_cycle();
-			as_slow_w(offset+0x800, data);
+			as_slow_w(offset + 0x800, data);
 		}
 	}
 }
@@ -5980,7 +7075,7 @@ void apple2gs_state::b0ram2000_w(offs_t offset, u8 data)
 	if (!(m_shadow & SHAD_HIRESPG1))
 	{
 		slow_cycle();
-		as_slow_w(offset+0x2000, data);
+		as_slow_w(offset + 0x2000, data);
 	}
 }
 u8 apple2gs_state::b0ram4000_r(offs_t offset)  { return m_ram_ptr[offset+0x4000]; }
@@ -5992,7 +7087,7 @@ void apple2gs_state::b0ram4000_w(offs_t offset, u8 data)
 		if (!(m_shadow & SHAD_HIRESPG2))
 		{
 			slow_cycle();
-			as_slow_w(offset+0x4000, data);
+			as_slow_w(offset + 0x4000, data);
 		}
 	}
 }
@@ -6008,7 +7103,7 @@ void apple2gs_state::b1ram0400_w(offs_t offset, u8 data)
 	if (!(m_shadow & SHAD_TXTPG1))
 	{
 		slow_cycle();
-		as_slow_w(offset+0x10400, data);
+		as_slow_w(offset + 0x10400, data);
 	}
 }
 u8 apple2gs_state::b1ram0800_r(offs_t offset) { return m_ram_ptr[offset+0x10800]; }
@@ -6020,7 +7115,7 @@ void apple2gs_state::b1ram0800_w(offs_t offset, u8 data)
 		if (!(m_shadow & SHAD_TXTPG2) && m_is_rom3)
 		{
 			slow_cycle();
-			as_slow_w(offset+0x10800, data);
+			as_slow_w(offset + 0x10800, data);
 		}
 	}
 }
@@ -6415,10 +7510,45 @@ void apple2gs_state::adbmicro_p1_out(u8 data)
 
 void apple2gs_state::adbmicro_p2_out(u8 data)
 {
+	u8 glu_data = m_glu_bus;
+	if (!BIT(data, 4) && !keyglu_access(true, data & 7, m_adbmicro->are_port_bits_output(0, 0xff), glu_data))
+	{
+		m_adbmicro->retry_access();
+		return;
+	}
 	if (!BIT(data, 5) && BIT(m_adb_p2_last, 5))
 	{
 		m_adb_reset_freeze = 2;
+		if (m_mega_observe)
+		{
+			// Provisional reset model: discard unaccepted FIFO work;
+			// retain physical writes already driven. No drain or replay.
+			m_observer_count = m_observer_head = 0;
+			m_twgs_phase_waiting = m_twgs_phase_delivering = false;
+			m_twgs_write_timer->adjust(attotime::never);
+			m_observer_cpu_released = false;
+			m_observer_held = m_observer_read_pending = false;
+			m_observer_high = true;
+			m_mega_waiting = false;
+			m_as_observer_pending = m_as_observer_blocked = false;
+			m_as_retry_deadline = 0;
+			m_observer_timer->adjust(attotime::never);
+			if (m_as_model)
+			{
+				m_as_fifo = {};
+				m_as_mapping_until = 0;
+				as_schedule();
+			}
+		}
 		m_a2bus->reset_bus();
+		// RESET cancels the CPU's unfinished software continuation, not
+		// latch writes already committed at an earlier KEYGLU bus edge.
+		m_keyglu_pending[0] = 0;
+		m_keyglu_timer[0]->adjust(attotime::never);
+		m_keyglu_host_bus = 0;
+		m_slow_keyglu_pending = 0;
+		m_as_bus_retry = false;
+		m_twgs_access_pending = m_twgs_access_suspended = m_twgs_kernel.pending = false;
 		m_maincpu->reset();
 		if (m_twgs)
 			twgs_reset_switches();
@@ -6449,14 +7579,8 @@ void apple2gs_state::adbmicro_p2_out(u8 data)
 
 	if (!(data & 0x10))
 	{
-		if (m_adbmicro->are_port_bits_output(0, 0xff))
-		{
-			keyglu_mcu_write(data & 7, m_glu_bus);
-		}
-		else    // read GLU
-		{
-			m_glu_bus = keyglu_mcu_read(data & 7);
-		}
+		if (!m_adbmicro->are_port_bits_output(0, 0xff))
+			m_glu_bus = glu_data;
 	}
 	else
 	{
@@ -6485,12 +7609,143 @@ void apple2gs_state::set_adb_line(int linestate)
 	m_adb_line = (linestate == CLEAR_LINE);
 }
 
+// Hardware Reference ch. 6, pp.127-133: two independent buses meet at
+// byte/full-flag latches. Read the state at this edge, after every earlier
+// operation on either bus. Deferring C++ execution consumes no guest clocks.
+// Both reads and writes stop before their effects; the retry consumes the
+// saved result exactly once. No interleave quantum or propagation delay.
+bool apple2gs_state::keyglu_access(bool mcu, u8 reg, bool write, u8 &data)
+{
+	const unsigned side = mcu ? 1 : 0;
+	device_execute_interface &cpu = mcu ? static_cast<device_execute_interface &>(*m_adbmicro) : *m_maincpu;
+	if (machine().side_effects_disabled() || (!cpu.executing() && !(m_keyglu_host_bus && !mcu)))
+	{
+		data = keyglu_edge(mcu, reg, write, data);
+		return true;
+	}
+	// The observer clock stream has not yet charged this access's base
+	// clock. Sample its completion, without precharging later RMW accesses.
+	// Explicit motherboard preparations already supply their physical edge.
+	const attotime when = !mcu && !m_keyglu_host_bus && m_mega_observe ? m_maincpu->access_completion_time() : cpu.local_time();
+	if (keyglu_queue(mcu, reg, write, data, when))
+	{
+		data = m_keyglu_result[side];
+		m_keyglu_pending[side] = 0;
+		if (!mcu)
+			m_keyglu_host_bus = 0;
+		return true;
+	}
+	if (!mcu && !m_keyglu_host_bus && m_mega_observe)
+		m_maincpu->suspend(SUSPEND_REASON_SYNC, false);
+	return false;
+}
+
+bool apple2gs_state::keyglu_queue(bool mcu, u8 reg, bool write, u8 data, attotime when)
+{
+	const unsigned side = mcu ? 1 : 0;
+	const u16 request = (write << 15) | (reg << 8) | (write ? data : 0);
+	if (m_keyglu_pending[side] && m_keyglu_request[side] != request)
+		fatalerror("KEYGLU continuation changed request");
+	if (!m_keyglu_pending[side])
+	{
+		m_keyglu_pending[side] = 1;
+		m_keyglu_request[side] = request;
+		m_keyglu_time[side] = when;
+		m_keyglu_timer[side]->adjust(when - machine().time(), side);
+	}
+	return m_keyglu_pending[side] == 2;
+}
+
+int apple2gs_state::keyglu_816_register(offs_t offset, bool write)
+{
+	int reg = -1;
+	if (!write && offset < 0x20)
+		reg = offset == 0x10 ? GLU_C010 : GLU_C000;
+	if (write && offset >= 0x10 && offset < 0x20)
+		reg = GLU_C010;
+	if (!write && offset == 0x24)
+		reg = GLU_MOUSEX;
+	if (!write && offset == 0x25)
+		reg = GLU_KEYMOD;
+	if (offset == 0x26)
+		reg = write ? GLU_COMMAND : GLU_DATA;
+	if (offset == 0x27)
+		reg = GLU_SYSSTAT;
+	return reg;
+}
+
+bool apple2gs_state::keyglu_816_access(offs_t offset, bool write, u8 &data)
+{
+	const int reg = keyglu_816_register(offset, write);
+	return reg < 0 || keyglu_access(false, reg, write, data);
+}
+
+TIMER_CALLBACK_MEMBER(apple2gs_state::keyglu_sync)
+{
+	const unsigned side = param;
+	m_keyglu_timer[side]->adjust(attotime::never);
+	device_execute_interface &peer = side ? static_cast<device_execute_interface &>(*m_maincpu) : *m_adbmicro;
+	const bool caught_up = machine().scheduler().synchronize_before(peer, m_keyglu_time[side]);
+	if (m_keyglu_pending[side] != 1)
+		return; // RESET can cancel it while the peer runs.
+	if (!caught_up)
+	{
+		m_keyglu_timer[side]->adjust(attotime::zero, side);
+		return;
+	}
+	const u16 request = m_keyglu_request[side];
+	m_keyglu_result[side] = keyglu_edge(side, (request >> 8) & 0x7f, BIT(request, 15), u8(request));
+	m_keyglu_pending[side] = 2;
+	if (!side && !m_keyglu_host_bus && m_mega_observe)
+		m_maincpu->resume(SUSPEND_REASON_SYNC);
+	if (!side && m_keyglu_host_bus)
+	{
+		if (m_mega_observe && (m_keyglu_host_bus == 4 || m_keyglu_host_bus == 5 || (m_keyglu_host_bus == 2 && m_as_observer_pending)))
+		{
+			m_observer_timer->adjust(attotime::zero);
+			return;
+		}
+		m_maincpu->resume(SUSPEND_REASON_SYNC);
+		if (m_keyglu_host_bus == 1 && (!m_twgs_access_pending || m_twgs_access_suspended))
+			twgs_kernel_schedule();
+		if (m_keyglu_host_bus == 2)
+			as_schedule();
+	}
+}
+
+u8 apple2gs_state::keyglu_edge(bool mcu, u8 reg, bool write, u8 data)
+{
+	if (write)
+	{
+		if (!machine().side_effects_disabled())
+		{
+			if (mcu)
+				keyglu_mcu_write(reg, data);
+			else
+				keyglu_816_write(reg, data);
+		}
+		return data;
+	}
+	const u8 result = mcu ? keyglu_mcu_read(reg) : keyglu_816_read(reg);
+	if (!machine().side_effects_disabled())
+	{
+		if (mcu)
+			keyglu_mcu_ack(reg);
+		else if (reg == GLU_C010)
+			keyglu_816_write(GLU_C010, 0);
+		else
+			keyglu_816_ack(reg);
+	}
+	return result;
+}
+
 u8 apple2gs_state::keyglu_mcu_read(u8 offset)
 {
-	u8 rv = m_glu_regs[offset];
+	return m_glu_regs[offset];
+}
 
-//  printf("MCU reads reg %x\n", offset);
-
+void apple2gs_state::keyglu_mcu_ack(u8 offset)
+{
 	// the command full flag is cleared by the MCU reading
 	// first the KGS register and then the command register
 	if ((offset == GLU_COMMAND) && (m_glu_mcu_read_kgs))
@@ -6504,11 +7759,9 @@ u8 apple2gs_state::keyglu_mcu_read(u8 offset)
 	{
 		m_glu_mcu_read_kgs = true;
 	}
-
-	return rv;
 }
 
-void  apple2gs_state::keyglu_mcu_write(u8 offset, u8 data)
+void apple2gs_state::keyglu_mcu_write(u8 offset, u8 data)
 {
 	m_glu_regs[offset] = data;
 
@@ -6590,27 +7843,14 @@ u8 apple2gs_state::keyglu_816_read(u8 offset)
 			return m_glu_regs[GLU_KEY_DATA];
 
 		case GLU_C010:
-			return (m_glu_regs[GLU_ANY_KEY_DOWN] & 0x80);
+			return (m_glu_regs[GLU_ANY_KEY_DOWN] & 0x80) | (m_glu_regs[GLU_KEY_DATA] & 0x7f);
 
 		case GLU_KEYMOD:
 			return m_glu_regs[GLU_KEYMOD];
 
 		case GLU_MOUSEX:
 		case GLU_MOUSEY:
-			if (!m_glu_mouse_read_stat)
-			{
-				if (!machine().side_effects_disabled())
-					m_glu_mouse_read_stat = true;
-				return m_glu_regs[GLU_MOUSEX];
-			}
-			if (!machine().side_effects_disabled())
-			{
-				m_glu_mouse_read_stat = false;
-				m_glu_regs[GLU_KG_STATUS] &= ~KGS_MOUSEX_FULL;
-				m_glu_regs[GLU_SYSSTAT] &= ~GLU_STATUS_MOUSEIRQ;
-				keyglu_regen_irqs();
-			}
-			return m_glu_regs[GLU_MOUSEY];
+			return m_glu_regs[m_glu_mouse_read_stat ? GLU_MOUSEY : GLU_MOUSEX];
 
 		case GLU_SYSSTAT:
 			{
@@ -6636,19 +7876,11 @@ u8 apple2gs_state::keyglu_816_read(u8 offset)
 				{
 					sysstat |= GLU_STATUS_MOUSEIRQ;
 				}
-				if (!machine().side_effects_disabled())
-					m_glu_816_read_dstat = true;
-				//printf("Read SYSSTAT %02x (PC=%x)\n", sysstat, m_maincpu->pc());
+
 				return sysstat;
 			}
 
 		case GLU_DATA:
-			if (m_glu_816_read_dstat && !machine().side_effects_disabled())
-			{
-				m_glu_816_read_dstat = false;
-				m_glu_regs[GLU_KG_STATUS] &= ~KGS_DATA_FULL;
-				keyglu_regen_irqs();
-			}
 			return m_glu_regs[GLU_DATA];
 
 		default:
@@ -6657,6 +7889,34 @@ u8 apple2gs_state::keyglu_816_read(u8 offset)
 	}
 
 	return 0xff;
+}
+
+void apple2gs_state::keyglu_816_ack(u8 offset)
+{
+	switch (offset)
+	{
+	case GLU_MOUSEX:
+	case GLU_MOUSEY:
+		m_glu_mouse_read_stat = !m_glu_mouse_read_stat;
+		if (!m_glu_mouse_read_stat)
+		{
+			m_glu_regs[GLU_KG_STATUS] &= ~KGS_MOUSEX_FULL;
+			m_glu_regs[GLU_SYSSTAT] &= ~GLU_STATUS_MOUSEIRQ;
+			keyglu_regen_irqs();
+		}
+		break;
+	case GLU_SYSSTAT:
+		m_glu_816_read_dstat = true;
+		break;
+	case GLU_DATA:
+		if (m_glu_816_read_dstat)
+		{
+			m_glu_816_read_dstat = false;
+			m_glu_regs[GLU_KG_STATUS] &= ~KGS_DATA_FULL;
+			keyglu_regen_irqs();
+		}
+		break;
+	}
 }
 
 void apple2gs_state::keyglu_816_write(u8 offset, u8 data)
@@ -6988,7 +8248,7 @@ INPUT_PORTS_START( apple2gsrom3 )
 	PORT_CONFSETTING(0x08, DEF_STR(Yes))
 INPUT_PORTS_END
 
-INPUT_PORTS_START( applesqueezer )
+INPUT_PORTS_START(applesqueezer)
 	PORT_MODIFY("a2_config")
 	PORT_CONFNAME(0x07, 0x00, "CPU type")
 	PORT_CONFSETTING(0x00, "AppleSqueezer GS")
@@ -7006,12 +8266,12 @@ INPUT_PORTS_START( applesqueezer )
 	PORT_CONFSETTING(0xdf, "3 MHz (nominal)")
 INPUT_PORTS_END
 
-INPUT_PORTS_START( apple2gsas )
+INPUT_PORTS_START(apple2gsas)
 	PORT_INCLUDE(apple2gsrom3)
 	PORT_INCLUDE(applesqueezer)
 INPUT_PORTS_END
 
-INPUT_PORTS_START( apple2gs1as )
+INPUT_PORTS_START(apple2gs1as)
 	PORT_INCLUDE(apple2gsj13)
 	PORT_INCLUDE(applesqueezer)
 INPUT_PORTS_END
@@ -7080,6 +8340,9 @@ void apple2gs_state::apple2gs(machine_config &config)
 	m_speaker->add_route(ALL_OUTPUTS, "sndright", 1.00);
 
 	ES5503(config, m_doc, A2GS_7M);
+	// Same exact NTSC clock ratio as BT_PER_SEC / (2 * BT_CLK), with
+	// 1.06 ns resolution for the DOC pin propagation delays.
+	m_doc->set_clock_fraction(945'000'000U, 132);
 	m_doc->set_channels(2);
 	// ROM03 sound sheet 8: SR51/SR2/SR15=15k, SC24=1.5nF, SC15=3.9nF,
 	// SC14=220pF; SR16/SR43=10k, SC17=3.9nF, SC16=560pF. Including
@@ -7129,6 +8392,8 @@ void apple2gs_state::apple2gs(machine_config &config)
 	m_a2bus->nmi_w().set(FUNC(apple2gs_state::a2bus_nmi_w));
 	m_a2bus->inh_w().set(FUNC(apple2gs_state::a2bus_inh_w));
 	m_a2bus->dma_w().set_inputline(m_maincpu, INPUT_LINE_HALT);
+	m_a2bus->rdy_w().set(FUNC(apple2gs_state::mega_ready));
+	// U3 changes at acknowledgement; the bus owner samples it at F.
 	A2BUS_SLOT(config, "sl1", A2GS_7M, m_a2bus, apple2gs_cards, nullptr);
 	A2BUS_SLOT(config, "sl2", A2GS_7M, m_a2bus, apple2gs_cards, nullptr);
 	A2BUS_SLOT(config, "sl3", A2GS_7M, m_a2bus, apple2gs_cards, nullptr);
@@ -7345,5 +8610,7 @@ COMP( 1991, apple2gsmt,   apple2gs, 0,      apple2gsmt, apple2gsrom3, apple2gs_s
 // Core-14 interface subset; native local memory and inferred I/O compatibility timing.
 #define rom_apple2gsas rom_apple2gs
 #define rom_apple2gs1as rom_apple2gsr1
-COMP( 2023, apple2gsas,  apple2gs,   0, apple2gsas,  apple2gsas, apple2gs_state, rom3_init, "Apple Computer / AppleSqueezer", "Apple IIgs (ROM03, AppleSqueezer GS, preliminary)", MACHINE_SUPPORTS_SAVE )
-COMP( 2023, apple2gs1as, apple2gs,   0, apple2gs1as, apple2gs1as, apple2gs_state, rom1_init, "Apple Computer / AppleSqueezer", "Apple IIgs (ROM01, AppleSqueezer GS, preliminary)", MACHINE_SUPPORTS_SAVE )
+COMP(2023, apple2gsas, apple2gs, 0, apple2gsas, apple2gsas, apple2gs_state, rom3_init, "Apple Computer / AppleSqueezer",
+	"Apple IIgs (ROM03, AppleSqueezer GS, preliminary)", MACHINE_SUPPORTS_SAVE)
+COMP(2023, apple2gs1as, apple2gs, 0, apple2gs1as, apple2gs1as, apple2gs_state, rom1_init, "Apple Computer / AppleSqueezer",
+	"Apple IIgs (ROM01, AppleSqueezer GS, preliminary)", MACHINE_SUPPORTS_SAVE)

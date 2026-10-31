@@ -65,7 +65,9 @@ inline DeviceClass &device_type_impl<DeviceClass>::operator()(machine_config_rep
 template <typename... T>
 inline emu_timer *device_t::timer_alloc(T &&... args)
 {
-	return machine().scheduler().timer_alloc(timer_expired_delegate(std::forward<T>(args)...));
+	auto *timer = machine().scheduler().timer_alloc(timer_expired_delegate(std::forward<T>(args)...));
+	timer->set_owner(*this);
+	return timer;
 }
 
 template <typename Format, typename... Params>

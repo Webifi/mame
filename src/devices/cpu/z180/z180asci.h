@@ -22,6 +22,8 @@ public:
 	auto txa_handler() { return m_txa_handler.bind(); }
 	auto rts_handler() { return m_rts_handler.bind(); }
 	auto cka_handler() { return m_cka_handler.bind(); }
+	// Opt in for an idle-input clock optimization; wire-level RX stays live.
+	void set_idle_receive_clock_gating(bool enabled) { m_idle_receive_clock_gating = enabled; }
 
 	uint8_t cntla_r();
 	uint8_t cntlb_r();
@@ -40,6 +42,7 @@ public:
 	void astcl_w(uint8_t data);
 	void astch_w(uint8_t data);
 
+	void iostop_w(bool stopped);
 	void rxa_wr(int state);
 	void cts_wr(int state);
 	void dcd_wr(int state);
@@ -47,8 +50,16 @@ public:
 
 	virtual void state_add(device_state_interface &parent) = 0;
 
-	int check_interrupt() { return m_irq; }
-	void clear_interrupt() { m_irq = 0; }
+	// UM0050 Fig55 and pp145-146: requests remain levels until status clears.
+	ATTR_FORCE_INLINE int check_interrupt() const {
+		if ((m_asci_stat & 3) == 3) return 1;
+		if (!(m_asci_stat & 8)) return 0;
+		u8 const rx = (m_asci_stat & ((m_ext && (m_asci_ext & 0x80)) ? 0x70 : 0xf0)) |
+			(m_id ? 0 : (m_asci_stat & 4));
+		return rx != 0;
+	}
+	void clear_interrupt() { }
+	bool dma_request(bool receive) const { return (m_asci_stat & (receive ? 0x80 : 2)) != 0; }
 protected:
 	z180asci_channel_base(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, uint32_t clock, const int id, const bool ext);
 
@@ -60,7 +71,9 @@ protected:
 	void transmit_edge();
 	void receive_edge();
 	void set_fifo_data(uint8_t data, uint8_t error);
+	void update_fifo_status();
 	void prepare_tsr();
+	void update_tdre();
 	void update_received();
 	void update_total_bits();
 
@@ -75,13 +88,19 @@ protected:
 
 	void output_txa(int txa);
 	void output_rts(int rts);
-	TIMER_CALLBACK_MEMBER(rcv_clock) { receive_edge(); }
+	TIMER_CALLBACK_MEMBER(rcv_clock);
 	TIMER_CALLBACK_MEMBER(tra_clock) { transmit_edge(); }
+	void park_receive_clock();
+	void resume_receive_clock();
 
 	emu_timer *m_rcv_clock;
 	emu_timer *m_tra_clock;
 	attotime m_bit_rate;
 	attotime m_sample_rate;
+	attotime m_receive_epoch = attotime::zero;
+	bool m_receive_parked = false;
+	bool m_iostop = false;
+	bool m_idle_receive_clock_gating = false;
 
 	devcb_write_line m_txa_handler;
 	devcb_write_line m_rts_handler;
@@ -95,12 +114,15 @@ protected:
 	uint8_t   m_asci_ext;                    // ASCI extension control register
 	PAIR16    m_asci_tc;                     // ASCI time constant
 
+	bool m_tdr_empty = true;
 	uint16_t  m_tsr;
 	uint16_t  m_rsr;
 	uint8_t   m_data_fifo[4];
 	uint8_t   m_error_fifo[4];
 	uint8_t   m_fifo_wr;
 	uint8_t   m_fifo_rd;
+	uint8_t   m_fifo_count = 0;
+	bool      m_fifo_overrun = false;
 
 	uint8_t   m_cts;
 	uint8_t   m_dcd;

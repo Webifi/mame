@@ -15,6 +15,10 @@ class es5503_device : public device_t,
 public:
 	es5503_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0);
 	void set_channels(int channels) { m_output_channels = channels; }
+	// An exact common timebase prevents a divided motherboard clock from
+	// drifting against an independently rounded device clock. The finer
+	// resolution also retains the specified pin propagation delays.
+	void set_clock_fraction(uint32_t numerator, uint32_t divider) { m_clock_numerator = numerator; m_clock_divider = divider; }
 	// Optional external mono reconstruction network, before output sampling.
 	void set_output_filter(const dac_filter::modes &poles, const dac_filter::modes &gains, unsigned count = 3)
 	{
@@ -33,6 +37,13 @@ public:
 	void synchronize_to(attotime time);
 	u8 read_at(offs_t offset, attotime time);
 	void write_at(offs_t offset, u8 data, attotime time);
+	// Completed host transfers, at a host E-fall returned by host_cycle().
+	// Unlike write_at/read_at, these do not queue another E-high transaction.
+	struct host_window { uint64_t rise, fall; };
+	host_window host_cycle(attotime earliest_rise) const;
+	attotime clock_time(uint64_t tick) const;
+	u8 read_latched(offs_t offset, uint64_t fall);
+	void write_latched(offs_t offset, u8 data, uint64_t fall);
 	u8 read(offs_t offset);
 	void write(offs_t offset, u8 data);
 	uint8_t get_channel_strobe() { return m_channel_strobe; }
@@ -69,6 +80,10 @@ private:
 	devcb_read8 m_adc_func;
 	int m_output_channels = 1;
 	uint32_t m_input_clock = 0;
+	uint32_t m_clock_numerator = 0;
+	uint32_t m_clock_divider = 1;
+	uint32_t m_e_rise_delay = 0, m_e_fall_delay = 0, m_q_rise_delay = 0;
+	uint64_t m_clock_epoch = 0;
 	uint8_t m_oscsenabled = 1;
 	uint8_t m_scan_enabled = 1;
 	uint8_t m_slot = 0;
@@ -126,6 +141,11 @@ private:
 	TIMER_CALLBACK_MEMBER(wakeup);
 	void synchronize();
 	void advance_to(attotime time);
+	void advance_ticks(uint64_t target, bool before_host = false);
+	void configure_clock();
+	uint64_t address_to_sample() const { return 4 * uint64_t(m_clock_divider) + m_e_rise_delay - m_e_fall_delay; }
+	uint64_t to_host() const { return m_phase == CHANNEL ? 6 * uint64_t(m_clock_divider) + m_e_fall_delay - m_q_rise_delay : m_phase == SAMPLE ? 4 * uint64_t(m_clock_divider) + m_e_fall_delay - m_e_rise_delay : 0; }
+	uint64_t to_sample() const { return m_phase == ADDRESS ? address_to_sample() : m_phase == CHANNEL ? 2 * uint64_t(m_clock_divider) + m_e_rise_delay - m_q_rise_delay : 0; }
 	void integrate_to(uint64_t tick);
 	void filter_to(uint64_t tick);
 	void address_phase();

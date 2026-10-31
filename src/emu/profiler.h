@@ -275,7 +275,13 @@ typedef dummy_profiler_state profiler_state;
 //  GLOBAL VARIABLES
 //**************************************************************************
 
+#ifdef MAME_PROFILER
+extern thread_local profiler_state g_profiler;
+#else
+// The disabled profiler is stateless. Keeping it global lets its empty
+// scopes disappear instead of looking up thread-local storage per edge.
 extern profiler_state g_profiler;
+#endif
 
 
 #endif // MAME_EMU_PROFILER_H

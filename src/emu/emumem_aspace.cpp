@@ -309,6 +309,7 @@ public:
 	}
 
 	virtual void remove_passthrough(std::unordered_set<handler_entry *> &handlers) override {
+		map_update update(*this);
 		invalidate_caches(read_or_write::READWRITE);
 		m_root_read->detach(handlers);
 		m_root_write->detach(handlers);
@@ -435,6 +436,7 @@ private:
 	template<int AccessWidth, typename READ>
 	void install_read_handler_helper(offs_t addrstart, offs_t addrend, offs_t addrmask, offs_t addrmirror, offs_t addrselect, u64 unitmask, int cswidth, u16 flags, const READ &handler_r)
 	{
+		map_update update(*this);
 		if constexpr (Width < AccessWidth) {
 			fatalerror("install_read_handler: cannot install a %d-wide handler in a %d-wide bus", 8 << AccessWidth, 8 << Width);
 		} else {
@@ -468,6 +470,7 @@ private:
 	void install_write_handler_helper(offs_t addrstart, offs_t addrend, offs_t addrmask, offs_t addrmirror, offs_t addrselect, u64 unitmask, int cswidth, u16 flags,
 								 const WRITE &handler_w)
 	{
+		map_update update(*this);
 		if constexpr (Width < AccessWidth) {
 			fatalerror("install_write_handler: cannot install a %d-wide handler in a %d-wide bus", 8 << AccessWidth, 8 << Width);
 		} else {
@@ -829,6 +832,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> void address_
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::unmap_generic(offs_t addrstart, offs_t addrend, offs_t addrmirror, u16 flags, read_or_write readorwrite, bool quiet)
 {
+	map_update update(*this);
 	VPRINTF("address_space::unmap(%*x-%*x mirror=%*x, %s, %s)\n",
 			m_addrchars, addrstart, m_addrchars, addrend,
 			m_addrchars, addrmirror,
@@ -868,6 +872,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> void address_
 //-------------------------------------------------
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_view(offs_t addrstart, offs_t addrend, offs_t addrmirror, memory_view &view)
 {
+	map_update update(*this);
 	offs_t nstart, nend, nmask, nmirror;
 	check_optimize_mirror("install_view", addrstart, addrend, addrmirror, nstart, nend, nmask, nmirror);
 
@@ -897,6 +902,7 @@ std::shared_ptr<emu::detail::memory_passthrough_handler_impl> address_space::mak
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> memory_passthrough_handler address_space_specific<Level, Width, AddrShift, Endian>::install_read_tap(offs_t addrstart, offs_t addrend, offs_t addrmirror, std::string name, std::function<void (offs_t offset, uX &data, uX mem_mask)> tap, memory_passthrough_handler *mph)
 {
+	map_update update(*this);
 	offs_t nstart, nend, nmask, nmirror;
 	check_optimize_mirror("install_read_tap", addrstart, addrend, addrmirror, nstart, nend, nmask, nmirror);
 	auto impl = make_mph(mph);
@@ -916,6 +922,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> memory_passth
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> memory_passthrough_handler address_space_specific<Level, Width, AddrShift, Endian>::install_write_tap(offs_t addrstart, offs_t addrend, offs_t addrmirror, std::string name, std::function<void (offs_t offset, uX &data, uX mem_mask)> tap, memory_passthrough_handler *mph)
 {
+	map_update update(*this);
 	offs_t nstart, nend, nmask, nmirror;
 	check_optimize_mirror("install_write_tap", addrstart, addrend, addrmirror, nstart, nend, nmask, nmirror);
 	auto impl = make_mph(mph);
@@ -934,6 +941,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> memory_passth
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> memory_passthrough_handler address_space_specific<Level, Width, AddrShift, Endian>::install_readwrite_tap(offs_t addrstart, offs_t addrend, offs_t addrmirror, std::string name, std::function<void (offs_t offset, uX &data, uX mem_mask)> tapr, std::function<void (offs_t offset, uX &data, uX mem_mask)> tapw, memory_passthrough_handler *mph)
 {
+	map_update update(*this);
 	offs_t nstart, nend, nmask, nmirror;
 	check_optimize_mirror("install_readwrite_tap", addrstart, addrend, addrmirror, nstart, nend, nmask, nmirror);
 	auto impl = make_mph(mph);
@@ -962,6 +970,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> memory_passth
 
  template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_device_delegate(offs_t addrstart, offs_t addrend, device_t &device, address_map_constructor &delegate, u64 unitmask, int cswidth, u16 flags)
 {
+	map_update update(*this);
 	check_address("install_device_delegate", addrstart, addrend);
 	address_map map(*this, addrstart, addrend, unitmask, cswidth, flags, m_device, delegate);
 	map.import_submaps(m_manager.machine(), device, data_width(), endianness(), addr_shift());
@@ -978,6 +987,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> memory_passth
 
  template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_readwrite_port(offs_t addrstart, offs_t addrend, offs_t addrmirror, u16 flags, std::string rtag, std::string wtag)
 {
+	map_update update(*this);
 	VPRINTF("address_space::install_readwrite_port(%*x-%*x mirror=%*x, read=\"%s\" / write=\"%s\")\n",
 			m_addrchars, addrstart, m_addrchars, addrend,
 			m_addrchars, addrmirror,
@@ -1022,6 +1032,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> memory_passth
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_read_before_time(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_time_delegate ws)
 {
+	map_update update(*this);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_device.tag());
@@ -1041,6 +1052,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> void address_
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_read_before_delay(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_delay_delegate ws)
 {
+	map_update update(*this);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_device.tag());
@@ -1060,6 +1072,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> void address_
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_read_after_delay(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_delay_delegate ws)
 {
+	map_update update(*this);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_device.tag());
@@ -1081,6 +1094,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> void address_
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_write_before_time(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_time_delegate ws)
 {
+	map_update update(*this);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_device.tag());
@@ -1100,6 +1114,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> void address_
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_write_before_delay(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_delay_delegate ws)
 {
+	map_update update(*this);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_device.tag());
@@ -1119,6 +1134,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> void address_
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_write_after_delay(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_delay_delegate ws)
 {
+	map_update update(*this);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_device.tag());
@@ -1139,6 +1155,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> void address_
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_readwrite_before_time(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_time_delegate ws)
 {
+	map_update update(*this);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_device.tag());
@@ -1160,6 +1177,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> void address_
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_readwrite_before_delay(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_delay_delegate ws)
 {
+	map_update update(*this);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_device.tag());
@@ -1181,6 +1199,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> void address_
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_readwrite_after_delay(offs_t addrstart, offs_t addrend, offs_t addrmirror, ws_delay_delegate ws)
 {
+	map_update update(*this);
 	auto *cpu = dynamic_cast<cpu_device *>(&m_device);
 	if (!cpu)
 		fatalerror("Attempted set to a waitstate handler on non-cpu device '%s'\n", m_device.tag());
@@ -1210,6 +1229,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> void address_
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_bank_generic(offs_t addrstart, offs_t addrend, offs_t addrmirror, u16 flags, memory_bank *rbank, memory_bank *wbank)
 {
+	map_update update(*this);
 	VPRINTF("address_space::install_readwrite_bank(%*x-%*x mirror=%*x, read=\"%s\" / write=\"%s\")\n",
 			m_addrchars, addrstart, m_addrchars, addrend,
 			m_addrchars, addrmirror,
@@ -1245,6 +1265,7 @@ template<int Level, int Width, int AddrShift, endianness_t Endian> void address_
 
 template<int Level, int Width, int AddrShift, endianness_t Endian> void address_space_specific<Level, Width, AddrShift, Endian>::install_ram_generic(offs_t addrstart, offs_t addrend, offs_t addrmirror, u16 flags, read_or_write readorwrite, void *baseptr)
 {
+	map_update update(*this);
 	VPRINTF("address_space::install_ram_generic(%s-%s mirror=%s, %s, %p)\n",
 			m_addrchars, addrstart, m_addrchars, addrend,
 			m_addrchars, addrmirror,

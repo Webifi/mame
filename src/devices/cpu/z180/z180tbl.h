@@ -72,22 +72,22 @@ static const uint8_t cc_cb[0x100] = {
 
 static const uint8_t cc_ed[0x100] = {
 /*-0 -1 -2 -3 -4 -5 -6 -7 -8 -9 -a -b -c -d -e -f */
-	12,13, 6, 6, 9, 6, 6, 6,12,13, 6, 6, 9, 6, 6, 6,
-	12,13, 6, 6, 9, 6, 6, 6,12,13, 6, 6, 9, 6, 6, 6,
-	12,13, 6, 6, 9, 6, 6, 6,12,13, 6, 6,10, 6, 6, 6,
-	12,13, 6, 6, 9, 6, 6, 6,12,13, 6, 6, 9, 6, 6, 6,
-	9,10,10,19, 6,12, 6, 6, 9,10,10,18,17,12, 6, 6,
-	9,10,10,19, 6,12, 6, 6, 9,10,10,18,17,12, 6, 6,
-	9,10,10,19, 6,12, 6,16, 9,10,10,18,17,12, 6,16,
-	9,10,10,19,12,12, 8, 6, 9,10,10,18,17,12, 6, 6,
-	6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-	6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+	12,13, 6, 6, 7, 6, 6, 6,12,13, 6, 6, 7, 6, 6, 6,
+	12,13, 6, 6, 7, 6, 6, 6,12,13, 6, 6, 7, 6, 6, 6,
+	12,13, 6, 6, 7, 6, 6, 6,12,13, 6, 6, 7, 6, 6, 6,
+	12,13, 6, 6,10, 6, 6, 6,12,13, 6, 6, 7, 6, 6, 6,
+	 9,10,10,19, 6,12, 6, 6, 9,10,10,18,17,12, 6, 6,
+	 9,10,10,19, 6,12, 6, 6, 9,10,10,18,17,12, 6, 6,
+	 9,10,10,19, 9,12, 6,16, 9,10,10,18,17,12, 6,16,
+	 9,10,10,19,12,12, 8, 6, 9,10,10,18,17,12, 6, 6,
+	 6, 6, 6,14, 6, 6, 6, 6, 6, 6, 6,14, 6, 6, 6, 6,
+	 6, 6, 6,14, 6, 6, 6, 6, 6, 6, 6,14, 6, 6, 6, 6,
 	12,12,12,12, 6, 6, 6, 6,12,12,12,12, 6, 6, 6, 6,
 	12,12,12,12, 6, 6, 6, 6,12,12,12,12, 6, 6, 6, 6,
-	6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-	6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-	6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-	6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6
+	 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+	 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+	 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+	 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6
 };
 
 static const uint8_t cc_xy[0x100] = {
@@ -144,7 +144,7 @@ static const uint8_t cc_ex[0x100] = {
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	4, 4, 4, 4, 0, 0, 0, 0, 4, 4, 4, 4, 0, 0, 0, 0,   /* LDIR/CPIR/INIR/OTIR LDDR/CPDR/INDR/OTDR */
+	2, 2, 2, 2, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0,   /* UM0050 pp238,241-242: repeat adds two states */
 	5, 0, 3, 0,10, 0, 0, 2, 5, 0, 3, 0,10, 0, 0, 2,
 	5, 0, 3, 0,10, 0, 0, 2, 5, 0, 3, 0,10, 0, 0, 2,
 	5, 0, 3, 0,10, 0, 0, 2, 5, 0, 3, 0,10, 0, 0, 2,
@@ -206,7 +206,7 @@ const z180_device::opcode_func z180_device::s_z180ops[Z180_PREFIX_COUNT][0x100] 
 /***************************************************************
  * define an opcode function
  ***************************************************************/
-#define OP(prefix,opcode)  void z180_device::prefix##_##opcode()
+#define OP(prefix,opcode)  ATTR_FORCE_INLINE void z180_device::prefix##_##opcode()
 
 /***************************************************************
  * adjust cycle count by n T-states
@@ -217,16 +217,32 @@ const z180_device::opcode_func z180_device::s_z180ops[Z180_PREFIX_COUNT][0x100] 
  * execute an opcode
  ***************************************************************/
 
-#define EXEC_PROTOTYPE(prefix) \
-int z180_device::exec##_##prefix(const uint8_t opcode)    \
-{                                                                       \
-	(this->*s_z180ops[Z180_PREFIX_##prefix][opcode])();                                     \
-	return m_cc[Z180_TABLE_##prefix][opcode];                   \
+// Defined opcode map, UM0050 Tables 48-50 (pp248-250). Z80 aliases,
+// SLL, IXH/IXL/IYH/IYL and indexed-CB register destinations trap on Z180.
+static constexpr u16 valid_ed[16] = {
+	0x1313, 0x1313, 0x1313, 0x1311, 0xbfff, 0xdfcf, 0x9f9f, 0x1f5d,
+	0x0808, 0x0808, 0x0f0f, 0x0f0f, 0, 0, 0, 0
+};
+static constexpr u16 valid_index[16] = {
+	0x0200, 0x0200, 0x0e0e, 0x0270, 0x4040, 0x4040, 0x4040, 0x40bf,
+	0x4040, 0x4040, 0x4040, 0x4040, 0x0800, 0, 0x022a, 0x0200
+};
+
+#include "z180dispatch.hxx"
+
+#define EXEC_PROTOTYPE(prefix, valid, third) \
+int z180_device::exec##_##prefix(const uint8_t opcode) \
+{ \
+	if (m_cycle_executing) cycle_decode(Z180_TABLE_##prefix, opcode); \
+	if (!(valid)) return take_trap(third); \
+	if(m_cycle_executing&&!m_cycle_reference) { Z180_DIRECT_DISPATCH(prefix) } \
+	else (this->*s_z180ops[Z180_PREFIX_##prefix][opcode])(); \
+	return m_cc[Z180_TABLE_##prefix][opcode]; \
 }
 
-EXEC_PROTOTYPE(op)
-EXEC_PROTOTYPE(cb)
-EXEC_PROTOTYPE(dd)
-EXEC_PROTOTYPE(ed)
-EXEC_PROTOTYPE(fd)
-EXEC_PROTOTYPE(xycb)
+EXEC_PROTOTYPE(op, true, false)
+EXEC_PROTOTYPE(cb, (opcode & 0xf8) != 0x30, false)
+EXEC_PROTOTYPE(dd, (valid_index[opcode >> 4] >> (opcode & 15)) & 1, false)
+EXEC_PROTOTYPE(ed, (valid_ed[opcode >> 4] >> (opcode & 15)) & 1, false)
+EXEC_PROTOTYPE(fd, (valid_index[opcode >> 4] >> (opcode & 15)) & 1, false)
+EXEC_PROTOTYPE(xycb, (opcode & 7) == 6 && opcode != 0x36, true)
