@@ -700,7 +700,9 @@ u8 oak_oti087_vga_device::io_r(offs_t port, bool *driven)
 			bool const vb = (field_y - vga.crtc.vert_blank_start + vt * 2) % vt < vb_len;
 			bool const active = hchar >= vga.crtc.disp_enable_skew &&
 				hchar <= vga.crtc.horz_disp_end + vga.crtc.disp_enable_skew && field_y <= vga.crtc.vert_disp_end;
-			return (hb || vb || !active ? 1 : 0) | (vertical_retrace() ? 8 : 0);
+			// IBM 2-74: CRTC $17 bit 7 = 0 forces the retrace signals inactive,
+			// so bit 3 stays 0. Display enable (bit 0) does not depend on it.
+			return (hb || vb || !active ? 1 : 0) | (vga.crtc.sync_en && vertical_retrace() ? 8 : 0);
 		}
 		}
 	}
