@@ -133,6 +133,9 @@ class a2bus_secondsight_device : public device_t, public device_a2bus_card_inter
 	required_ioport m_lattice_chip;
 	secondsight_lattice_bbb1 m_logic;
 	bool m_lattice_v2 = false, m_lattice_chip_configured = false;
+	// Z180 /INT0 pull-up, a card modification; sampled only at power-up.
+	required_ioport m_int0_mod;
+	bool m_int0_pullup = false, m_int0_configured = false, m_cint = false;
 	secondsight_lattice::inputs m_pins;
 	secondsight_lattice::inputs m_cpu_pins;
 	bool m_dma_owned = false, m_cpu_bank = false;
@@ -200,6 +203,7 @@ class a2bus_secondsight_device : public device_t, public device_a2bus_card_inter
 	u8 io_r(offs_t port);
 	void io_w(offs_t port, u8 data);
 
+	void cint_w(int state);
 	void rts0_w(int state)
 	{
 		m_rom_overlay = bool(state);

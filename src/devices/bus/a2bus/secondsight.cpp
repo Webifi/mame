@@ -34,6 +34,10 @@ static INPUT_PORTS_START(secondsight)
 	PORT_CONFNAME(0x01, 0x00, "Lattice chip (power cycle)")
 	PORT_CONFSETTING(0x00, "Original (BE8C)")
 	PORT_CONFSETTING(0x01, "v2.0 (BBB1)")
+	PORT_START("INT0")
+	PORT_CONFNAME(0x01, 0x00, "INT0 pull-up (power cycle)")
+	PORT_CONFSETTING(0x00, "None (stock card)")
+	PORT_CONFSETTING(0x01, "Added (card modification)")
 INPUT_PORTS_END
 
 a2bus_secondsight_device::a2bus_secondsight_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
@@ -44,6 +48,7 @@ a2bus_secondsight_device::a2bus_secondsight_device(machine_config const &mconfig
 	, m_rom(*this, "rom")
 	, m_sram(*this, "sram", 0x20000, ENDIANNESS_LITTLE)
 	, m_lattice_chip(*this, "LATTICE")
+	, m_int0_mod(*this, "INT0")
 {
 }
 
@@ -443,7 +448,7 @@ void a2bus_secondsight_device::device_add_mconfig(machine_config &config)
 	SECONDSIGHT_VIDEO(config, m_video);
 	// Schematic: Oak's open-collector CINT feeds INT0. The video callback
 	// uses logical assertion (1), not the electrical active-low pin level.
-	m_video->cint_cb().set_inputline(m_cpu, INPUT_LINE_IRQ0);
+	m_video->cint_cb().set(FUNC(a2bus_secondsight_device::cint_w));
 	m_video->scan_test_cb().set([this](int state) {
 		m_oak_scan_test = bool(state);
 		// Assumed ext03 convention: SD7:0 is the last Z180 bus byte.
@@ -613,6 +618,9 @@ void a2bus_secondsight_device::device_start()
 	save_item(NAME(m_logic.clocks));
 	save_item(NAME(m_lattice_v2));
 	save_item(NAME(m_lattice_chip_configured));
+	save_item(NAME(m_int0_pullup));
+	save_item(NAME(m_int0_configured));
+	save_item(NAME(m_cint));
 	save_item(NAME(m_pins.address));
 	save_item(NAME(m_pins.data));
 	save_item(NAME(m_pins.port));
@@ -685,6 +693,11 @@ void a2bus_secondsight_device::device_reset()
 		m_lattice_v2 = BIT(m_lattice_chip->read(), 0);
 		m_lattice_chip_configured = true;
 	}
+	if (!m_int0_configured)
+	{
+		m_int0_pullup = BIT(m_int0_mod->read(), 0);
+		m_int0_configured = true;
+	}
 	materialize_idle(machine().time());
 	m_idle_limit = m_idle_clock = 0;
 	m_idle_inputs.head = m_idle_inputs.count = 0;
@@ -748,6 +761,14 @@ void a2bus_secondsight_device::drive_hd(u8 data)
 		// fast read drives the already-valid byte with no extra hot-path work.
 		update_direct_reads();
 	}
+}
+
+void a2bus_secondsight_device::cint_w(int state)
+{
+	// Schematic: the /INT0 net joins only Z180 pin 10 and Oak CINT (pin 90),
+	// with no pull-up, so on a stock card CINT never reaches INT0.
+	m_cint = bool(state);
+	m_cpu->set_input_line(INPUT_LINE_IRQ0, m_int0_pullup && m_cint ? ASSERT_LINE : CLEAR_LINE);
 }
 
 IRQ_CALLBACK_MEMBER(a2bus_secondsight_device::irq0_ack)
