@@ -135,6 +135,7 @@ class oak_oti087_vga_device : public svga_device
 	int begin_row_change();
 	void end_row_change(int beam);
 	void schedule_character_map();
+	void schedule_pan();
 	struct row_state
 	{
 		u32 address;
@@ -157,6 +158,7 @@ class oak_oti087_vga_device : public svga_device
 	TIMER_CALLBACK_MEMBER(display_latch_tick);
 	TIMER_CALLBACK_MEMBER(display_end_tick);
 	TIMER_CALLBACK_MEMBER(character_map_tick);
+	TIMER_CALLBACK_MEMBER(pan_tick);
 
 	bool packed() const { return (m_ext[0x21] & 0x0c) == 4; }
 
@@ -199,6 +201,7 @@ class oak_oti087_vga_device : public svga_device
 	emu_timer *m_eeprom_ready_timer = nullptr;
 	emu_timer *m_display_end_timer = nullptr;
 	emu_timer *m_character_map_timer = nullptr;
+	emu_timer *m_pan_timer = nullptr;
 	u8 m_character_map[2]{};
 	// Only live row-control changes need a history. Each entry packs the
 	// address counter, five-bit row scan, double-scan phase and split latch.

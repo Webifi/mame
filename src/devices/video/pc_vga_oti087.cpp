@@ -108,11 +108,12 @@ void oak_oti087_vga_device::device_start()
 	m_ready_timer = timer_alloc(FUNC(oak_oti087_vga_device::ready_tick), this);
 	m_ready_listener = !m_iochrdy_cb.isunset();
 	m_eeprom_ready_timer = timer_alloc(FUNC(oak_oti087_vga_device::eeprom_ready_tick), this);
-	// Keep the VGA core's display-start/panning latch semantics, with an Oak
-	// timer that accounts for vertical overflow and the two interlaced fields.
+	// Keep the VGA core's display-start latch semantics, with an Oak timer
+	// that accounts for vertical overflow and the two interlaced fields.
 	m_vblank_timer = timer_alloc(FUNC(oak_oti087_vga_device::display_latch_tick), this);
 	m_display_end_timer = timer_alloc(FUNC(oak_oti087_vga_device::display_end_tick), this);
 	m_character_map_timer = timer_alloc(FUNC(oak_oti087_vga_device::character_map_tick), this);
+	m_pan_timer = timer_alloc(FUNC(oak_oti087_vga_device::pan_tick), this);
 	save_item(NAME(m_character_map));
 	save_item(NAME(m_row_history));
 	save_item(NAME(m_row_history_frame));
@@ -199,6 +200,7 @@ void oak_oti087_vga_device::device_reset()
 	m_vblank_timer->adjust(attotime::never);
 	m_display_end_timer->adjust(attotime::never);
 	m_character_map_timer->adjust(attotime::never);
+	m_pan_timer->adjust(attotime::never);
 	m_character_map[0] = m_character_map[1] = 0;
 	m_iochrdy_cb(1);
 	eeprom_update();
@@ -324,7 +326,6 @@ TIMER_CALLBACK_MEMBER(oak_oti087_vga_device::display_latch_tick)
 {
 	flush_display();
 	vga.crtc.start_addr = latch_start_addr();
-	vga.attribute.pel_shift = vga.attribute.pel_shift_latch;
 	m_frame_preset = vga.crtc.preset_row_scan;
 	m_character_map[0] = vga.sequencer.char_sel.B;
 	m_character_map[1] = vga.sequencer.char_sel.A;
@@ -338,6 +339,28 @@ TIMER_CALLBACK_MEMBER(oak_oti087_vga_device::character_map_tick)
 	flush_display();
 	m_character_map[0] = vga.sequencer.char_sel.B;
 	m_character_map[1] = vga.sequencer.char_sel.A;
+}
+
+TIMER_CALLBACK_MEMBER(oak_oti087_vga_device::pan_tick)
+{
+	flush_display();
+	vga.attribute.pel_shift = vga.attribute.pel_shift_latch;
+}
+
+void oak_oti087_vga_device::schedule_pan()
+{
+	// IBM 2-67 latches only the start address; 2-95 gives the pan no latch,
+	// and Abrash Listing 23.1 writes it after vertical sync. The line under
+	// the beam keeps its pan. Outside active display no line shows it.
+	unsigned const vd = vertical_divisor();
+	unsigned const field_total = (vga.crtc.vert_total + 2) * vd;
+	if ((crtc_vpos() % field_total) / vd > vga.crtc.vert_disp_end)
+	{
+		m_pan_timer->adjust(attotime::never);
+		vga.attribute.pel_shift = vga.attribute.pel_shift_latch;
+		return;
+	}
+	m_pan_timer->adjust(time_until_crtc_pos((crtc_vpos() + 1) % m_screen->height()));
 }
 
 void oak_oti087_vga_device::schedule_character_map()
@@ -1042,6 +1065,10 @@ void oak_oti087_vga_device::attribute_map(address_map &map)
 	// IBM VGA register compatibility; the generic VGA map drops bits 7-6.
 	map(0x11, 0x11).mirror(0x20).lrw8(NAME([this] { return vga.attribute.data[0x11]; }), NAME([this] (u8 data) {
 		vga.attribute.data[0x11] = data;
+	}));
+	map(0x13, 0x13).mirror(0x20).lrw8(NAME([this] { return vga.attribute.data[0x13]; }), NAME([this] (u8 data) {
+		vga.attribute.data[0x13] = vga.attribute.pel_shift_latch = data & 15;
+		schedule_pan();
 	}));
 	map(0x14, 0x14).mirror(0x20).lrw8(NAME([this] { return vga.attribute.data[0x14]; }), NAME([this] (u8 data) {
 		vga.attribute.data[0x14] = data & 15;
