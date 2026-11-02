@@ -219,6 +219,9 @@ class oak_oti087_vga_device : public svga_device
 	std::array<s32, 2> m_display_origin{0, 0};
 	s32 m_crtc_origin = 0;
 	attotime m_origin_phase = attotime::zero;
+	bool m_out_of_range = false, m_lock_candidate = true;
+	attotime m_lock_since = attotime::zero;
+	std::array<double, 3> m_lock_rates{};
 	u8 m_system_data = 0xff;
 	u8 m_packed_layout_diagnostics = 0;
 	u8 m_latch[8]{};

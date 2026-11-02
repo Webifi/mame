@@ -40,6 +40,67 @@ rectangle output_span(rectangle area, int x, int y)
 	return area;
 }
 
+// The monitors the card drives are CRTs. Each places the picture by the
+// signal's timing; the owner only centers it with the position controls.
+//
+// VGA, a multisync monitor: it keeps its raster a fixed part of the line and
+// of the frame. At 31.5 kHz the sync polarities select the IBM vertical size
+// for 350, 400 or 480 lines (IBM PS/2 Video Subsystem, Oct 1990, Fig. 103);
+// the windows are 656 of 800 dots (Fig. 108) and 362 of 449, 414 of 449 and
+// 496 of 525 lines (Figs. 104-106). It locks from the IBM 31.469 kHz and
+// 50 Hz (Fig. 6) to the fastest VESA DMT 1.10 timings the card's 78 MHz clock
+// makes: 1024 x 768 at 75 Hz (60.023 kHz) and 1024 x 768 interlaced
+// (86.96 Hz fields). The card's own VGA record $61 runs 1.0% below the IBM
+// rates, so each limit has that tolerance.
+constexpr double vga_line = 25'175'000.0 / 800, vga_tolerance = 0.01;
+constexpr double vga_window_part = 656.0 / 800.0;
+constexpr double vga_line_min = vga_line * (1 - vga_tolerance), vga_line_max = 78'750'000.0 / 1312 * (1 + vga_tolerance);
+constexpr double vga_field_min = 50.0 * (1 - vga_tolerance), vga_field_max = 44'900'000.0 / 1264 / 817 * 2 * (1 + vga_tolerance);
+// AppleColor RGB Monitor (Apple TIL01930): its sweep is set at the factory so
+// that the IIgs 640 x 200 picture fills 200 x 150 mm of the 11.5-inch
+// viewable face. The IIgs line is 65 counts of 14 cycles of the 14.318 MHz
+// clock plus 2 for the long count, and 40 counts show (Apple IIe Technical
+// Reference, video display), so the face spans that time x 292.1 / 250.
+constexpr double applecolor_face = 11.5 * 25.4 / 250.0;
+constexpr double applecolor_window_time = 40 * 14 / 14'318'180.0 * applecolor_face;
+constexpr double applecolor_window_frame = 200 * (65 * 14 + 2) / 14'318'180.0 * applecolor_face;
+// Apple specifies 15.734 kHz and 50 or 60 Hz. The AppleColor RGB records
+// Sequential shipped for the card run from 13.31 kHz (M640X200.18M) to
+// 18.75 kHz (M80X25.1575M) and up to 74.5 Hz (M560X192); the monitor shows
+// nothing at 31 kHz.
+constexpr double applecolor_line_min = 28'322'000.0 / 2 / 1064, applecolor_line_max = 72'000'000.0 / 4 / 960;
+constexpr double applecolor_field_min = 50.0, applecolor_field_max = 28'322'000.0 / 2 / 856 / 222;
+
+struct monitor_window
+{
+	unsigned width, height;
+	bool locked;
+};
+
+// The signal's line, field and pixel rates, its line in pixels, its frame in
+// lines (both fields when interlaced), fields per frame and sync polarities.
+monitor_window card_monitor(bool vga, double line_hz, double field_hz, double pixel_hz, unsigned ht, unsigned vt,
+	unsigned fields, bool h_negative, bool v_negative)
+{
+	if (vga)
+	{
+		double part = 496.0 / 525.0;
+		if (std::abs(line_hz / vga_line - 1.0) <= vga_tolerance && h_negative != v_negative)
+			part = (v_negative ? 362.0 : 414.0) / 449.0;
+		return { unsigned(ht * vga_window_part + 0.5), unsigned(vt * part + 0.5),
+			line_hz >= vga_line_min && line_hz <= vga_line_max && field_hz >= vga_field_min && field_hz <= vga_field_max };
+	}
+	return { unsigned(applecolor_window_time * pixel_hz + 0.5), unsigned(applecolor_window_frame * line_hz * fields + 0.5),
+		line_hz >= applecolor_line_min && line_hz <= applecolor_line_max &&
+		field_hz >= applecolor_field_min && field_hz <= applecolor_field_max };
+}
+
+// Floor of half a signed difference, so both directions round the same way.
+int floor_half(int value)
+{
+	return value >= 0 ? value / 2 : -((1 - value) / 2);
+}
+
 // Oak STD8_HC.DRV SetCursor (ordinal 102, segment 1:4BE3):
 // plane A is the Windows AND mask, plane B is XOR. This primary driver
 // evidence supersedes the conflicting secondary OAK.TXT code table.
@@ -123,6 +184,10 @@ void oak_oti087_vga_device::device_start()
 	save_item(NAME(m_display_origin));
 	save_item(NAME(m_crtc_origin));
 	save_item(NAME(m_origin_phase));
+	save_item(NAME(m_out_of_range));
+	save_item(NAME(m_lock_candidate));
+	save_item(NAME(m_lock_since));
+	save_item(NAME(m_lock_rates));
 	save_item(NAME(m_system_data));
 	save_item(NAME(m_latch));
 	save_item(NAME(m_latch_diagnostics));
@@ -331,6 +396,15 @@ TIMER_CALLBACK_MEMBER(oak_oti087_vga_device::display_latch_tick)
 	m_character_map[1] = vga.sequencer.char_sel.A;
 	m_character_map_timer->adjust(attotime::never);
 	m_row_history_frame = ~u64(0);
+	// A monitor locks to timing that holds for a whole frame. The states that
+	// pass while a mode is programmed never reach the screen.
+	if (m_lock_candidate == m_out_of_range && machine().time() - m_lock_since >= m_screen->frame_period())
+	{
+		m_out_of_range = !m_lock_candidate;
+		if (m_out_of_range)
+			popmessage("Second Sight %s monitor: out of range (%.2f kHz, %.2f Hz)",
+				m_lock_rates[2] ? "VGA" : "AppleColor RGB", m_lock_rates[0] / 1000.0, m_lock_rates[1]);
+	}
 	schedule_display_latch(1);
 }
 
@@ -1152,30 +1226,46 @@ void oak_oti087_vga_device::recompute_params()
 	u32 const dotclock = vclk_hz() / (BIT(vga.sequencer.data[1], 3) ? 2 : 1) / (m_output_divider ? 2 : 1);
 	// Type 0 straps pass PCLK; do not apply a second Oak DAC clock divider.
 	attotime const frame = attotime::from_ticks(u64(ht) * vt * div, dotclock);
-	// IBM 2-59/60 and 2-73: blanking end is a low-bit comparator,
-	// not an absolute full-width count. The monitor shows the interval from
-	// blanking end to the next blanking start, including overscan. Keep the
-	// pixel/line counters and U12 AppleColor timing GAL divider unchanged.
-	unsigned const hlength = (vga.crtc.horz_blank_end - vga.crtc.horz_blank_start) & 63;
-	unsigned const vlength = vertical_blank_length();
-	unsigned const hw = std::min(ht, (hlength ? hlength : 64) * dots * mult / div);
-	unsigned const vw = std::min(vt, vlength * interlace * vertical_divisor());
-	unsigned const hx = ((vga.crtc.horz_blank_start + (hlength ? hlength : 64)) * dots * mult / div) % ht;
-	unsigned const vy = ((vga.crtc.vert_blank_start + vlength) * interlace * vertical_divisor()) % vt;
-	// A fully blanked raster still needs a valid screen allocation; the
-	// blanking stage paints its single placeholder pixel black.
-	rectangle const visible(0, std::max(1U, ht - hw) - 1, 0, std::max(1U, vt - vw) - 1);
-	m_active_display = { s32((ht - hx) % ht), s32((vt - vy) % vt), s32(hd), s32(vd) };
+	// The monitor window, centered on the active display by the owner's
+	// position controls. Keep the pixel and line counters and the U12
+	// AppleColor timing GAL divider unchanged.
+	double const line_hz = double(dotclock) / (double(ht) * div);
+	bool const vga_monitor = (m_monitor_override < 0 ? m_monitor->read() : m_monitor_override) & 1;
+	monitor_window window = card_monitor(vga_monitor, line_hz, line_hz * interlace / vt, double(dotclock) / div, ht, vt,
+		interlace, BIT(vga.miscellaneous_output, 6), BIT(vga.miscellaneous_output, 7));
+	if (!window.locked)
+	{
+		// No picture, as on a monitor that cannot lock. Keep the screen
+		// allocation so that the guest-visible timing does not change.
+		window.width = hd;
+		window.height = vd;
+	}
+	// The lock follows at the vertical retrace once this timing has held for
+	// a whole frame (display_latch_tick).
+	if (window.locked != m_lock_candidate)
+	{
+		m_lock_candidate = window.locked;
+		m_lock_since = machine().time();
+	}
+	m_lock_rates = { line_hz, line_hz * interlace / vt, double(vga_monitor) };
+	unsigned const width = std::clamp(window.width, 1U, ht), height = std::clamp(window.height, 1U, vt);
+	int const left = floor_half(int(width) - int(hd)), top = floor_half(int(height) - int(vd));
+	// A window that starts left of counter zero starts in the preceding
+	// CRTC line. A linear pixel offset retains that carry when status and
+	// timers cross X=0.
+	unsigned const carry = left > 0 ? 1 : 0;
+	unsigned const hx = (ht - left) % ht;
+	unsigned const vy = (vt - top) % vt;
+	rectangle const visible(0, width - 1, 0, height - 1);
+	m_active_display = { s32(left), s32(top), s32(hd), s32(vd) };
 	m_display_origin = { s32(hx), s32(vy) };
-	// A monitor row starts in the preceding CRTC line's left border. A
-	// linear pixel offset retains that carry when status/timers cross X=0.
-	m_crtc_origin = ((vy + vt - (hx ? 1 : 0)) % vt) * ht + hx;
+	m_crtc_origin = ((vy + vt - carry) % vt) * ht + hx;
 	m_screen->set_output_interlace(interlace == 2, m_crtc_origin);
 	// screen_device anchors time at the end of its visible area. Rebase
 	// that anchor by the coordinate change, preserving subpixel time; a
 	// monitor crop must not change any guest-visible H/V or interrupt edge.
 	attoseconds_t const period = frame.as_attoseconds();
-	int const rows = (visible.height() - int(vd) + int(vy) - (hx ? 1 : 0) + int(vt) * 2) % int(vt);
+	int const rows = (visible.height() - int(vd) + int(vy) - int(carry) + int(vt) * 2) % int(vt);
 	attotime const phase(0, rows * (period / vt) + hx * (period / (ht * vt)));
 	if (m_screen->width() != ht || m_screen->height() != vt ||
 		m_screen->visible_area() != visible || m_screen->frame_period() != frame || phase != m_origin_phase)
@@ -2017,6 +2107,11 @@ u32 oak_oti087_vga_device::draw_raster(bitmap_rgb32 &bitmap, rectangle const &cl
 u32 oak_oti087_vga_device::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect)
 {
 	rectangle const bounds = cliprect & bitmap.cliprect();
+	if (m_out_of_range)
+	{
+		bitmap.fill(rgb_t::black(), bounds);
+		return 0;
+	}
 	int const w = screen.width(), h = screen.height();
 	for (int y = bounds.min_y; y <= bounds.max_y;)
 	{
