@@ -179,6 +179,12 @@ void cycle_flush_quiet();
 void cycle_sample_stable_inputs();
 void cycle_resume_admission();
 void cycle_advance_quiet(unsigned ticks);
+// A counting PRT is a timed source only when it can raise an interrupt
+// (TIE0, TIE1) or drive TOUT (TOC1, TOC0). Otherwise its count and flags are
+// seen only through its registers, and every register access first brings
+// the deferred clocks up to date.
+bool cycle_prt_timed() const { return ((m_tcr & 0x01) && (m_tcr & 0x10)) || ((m_tcr & 0x02) && (m_tcr & 0x2c)); }
+void cycle_quiet_timers(unsigned phi);
 u8 cycle_transaction(cycle_kind kind, offs_t address, u8 data, bool no_arbitration = false);
 void cycle_begin(cycle_owner owner, cycle_kind kind, offs_t address, u8 data = 0, bool no_arbitration = false);
 void cycle_run();

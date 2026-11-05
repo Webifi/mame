@@ -4,7 +4,7 @@
 
 inline void z180_device::cycle_defer_clocks(unsigned phi)
 {
-	assert(!(m_tcr & 3) && !(m_rcr & 0x80) && !m_advance_left && m_icount >= int(2 * phi));
+	assert(!cycle_prt_timed() && !(m_rcr & 0x80) && !m_advance_left && m_icount >= int(2 * phi));
 	m_icount -= 2 * phi;
 	m_half_phi += 2 * phi;
 	m_quiet_phi += phi;

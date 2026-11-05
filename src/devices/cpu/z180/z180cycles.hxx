@@ -252,25 +252,35 @@ inline void z180_device::cycle_flush_quiet()
 	// phi_half is unchanged. No register/callback can change these divider
 	// inputs until after this flush. Refresh is disabled, but its phase still
 	// runs and must be retained for a later RCR write.
-	assert(!(m_tcr & 3) && !(m_rcr & 0x80));
-	unsigned const prescale = m_frc_prescale + m_quiet_phi;
-	m_frc -= prescale / 10;
-	m_frc_prescale = prescale % 10;
+	assert(!cycle_prt_timed() && !(m_rcr & 0x80));
+	cycle_quiet_timers(m_quiet_phi);
 	m_refresh_phase = (m_refresh_phase + 2 * m_quiet_phi) % 160;
 	m_quiet_phi = 0;
 }
 
+inline void z180_device::cycle_quiet_timers(unsigned phi)
+{
+	// handle_io_timers applies the FRC and PRT recurrences for any span, so
+	// one update equals the same span in single steps.
+	if (m_tcr & 3)
+		handle_io_timers(phi);
+	else
+	{
+		unsigned const prescale = m_frc_prescale + phi;
+		m_frc -= prescale / 10;
+		m_frc_prescale = prescale % 10;
+	}
+}
+
 inline void z180_device::cycle_advance_quiet(unsigned ticks)
 {
-	assert(!m_quiet_phi && !(m_tcr & 3) && !m_advance_left && m_icount >= int(ticks));
+	assert(!m_quiet_phi && !cycle_prt_timed() && !m_advance_left && m_icount >= int(ticks));
 	m_icount -= ticks;
 	m_half_phi += ticks;
 	m_cycle.elapsed += ticks;
 	unsigned const phi = (m_phi_half + ticks) / 2;
 	m_phi_half = (m_phi_half + ticks) & 1;
-	unsigned const prescale = m_frc_prescale + phi;
-	m_frc -= prescale / 10;
-	m_frc_prescale = prescale % 10;
+	cycle_quiet_timers(phi);
 	unsigned const period = 20U << (m_rcr & 3);
 	if ((m_rcr & 0x80) && (m_refresh_phase % period + ticks >= period) && !m_bus_acknowledged)
 		m_refresh_pending = true;
@@ -467,7 +477,7 @@ bool z180_device::cycle_run_unobserved()
 	// A memory callback can shorten the budget: in
 	// that case leave its exact saved phase for the ordinary continuation.
 	if (m_cycle_reference || m_cycle_observer || m_cycle.phase || m_advance_left || m_cycle.ttp || m_cycle.trailing || m_wait_line ||
-		(m_tcr & 3) || (m_cycle.owner == cycle_owner::dma && m_dma_stage && m_dma_bcr[m_dma_channel].w == 1))
+		cycle_prt_timed() || (m_cycle.owner == cycle_owner::dma && m_dma_stage && m_dma_bcr[m_dma_channel].w == 1))
 		return false;
 	bool const internal = m_cycle.kind == cycle_kind::internal || m_cycle.kind == cycle_kind::release;
 	if (!internal && (m_cycle.nominal != 3 || m_cycle.kind >= cycle_kind::internal))
@@ -539,7 +549,7 @@ bool z180_device::cycle_run_io_unobserved()
 		std::copy(std::begin(m_dma_edge_generation), std::end(m_dma_edge_generation), m_dma_edge_sampled);
 	};
 	auto admitted = [this](unsigned remaining)
-	{ return m_icount >= int(remaining) && !m_wait_line && !(m_tcr & 3) && !m_cycle_observer && !m_cycle_reference; };
+	{ return m_icount >= int(remaining) && !m_wait_line && !cycle_prt_timed() && !m_cycle_observer && !m_cycle_reference; };
 	unsigned const waits = 2U * m_cycle.waits;
 	if (m_cycle.io_select_edge == 1)
 	{
@@ -596,7 +606,7 @@ unsigned z180_device::cycle_resume_quiet()
 		(m_cycle.owner == cycle_owner::cpu && !m_instruction_active) || m_cycle.kind > cycle_kind::write || m_cycle_reference ||
 		m_cycle_observer || m_instruction_interrupt >= 0 || m_trapping ||
 		(machine().debug_flags & (DEBUG_FLAG_ENABLED | DEBUG_FLAG_CALL_HOOK)) || m_icount <= 0 || m_advance_left > 1 ||
-		m_cycle.nominal != 3 || m_cycle.waits > 32765 || m_cycle.ttp || m_cycle.trailing || m_wait_line || (m_tcr & 3) ||
+		m_cycle.nominal != 3 || m_cycle.waits > 32765 || m_cycle.ttp || m_cycle.trailing || m_wait_line || cycle_prt_timed() ||
 		(m_cycle.owner == cycle_owner::dma && m_dma_stage && m_dma_bcr[m_dma_channel].w == 1))
 		return false;
 	unsigned const phase = m_cycle.phase;
@@ -670,7 +680,7 @@ unsigned z180_device::cycle_resume_quiet()
 bool z180_device::cycle_run_partial()
 {
 	if (m_cycle_reference || m_cycle_observer || m_icount <= 0 || m_advance_left > 1 || m_cycle.nominal != 3 ||
-		m_cycle.kind >= cycle_kind::internal || m_cycle.ttp || m_cycle.trailing || m_cycle.io_select_edge || m_wait_line || (m_tcr & 3) ||
+		m_cycle.kind >= cycle_kind::internal || m_cycle.ttp || m_cycle.trailing || m_cycle.io_select_edge || m_wait_line || cycle_prt_timed() ||
 		m_cycle.waits > 32765 || (m_cycle.owner == cycle_owner::dma && m_dma_stage && m_dma_bcr[m_dma_channel].w == 1))
 		return false;
 	// A deadline can split any half-PHI. Advance directly to the next pin
@@ -1218,7 +1228,7 @@ void z180_device::cycle_resume_admission()
 	// not take a new pin sample here: a late IRQ after T2 must wait for the
 	// next real Ti/memory cycle, if this instruction has one at all.
 	if (m_icount >= 2 && !m_cycle_reference && !m_cycle_observer && !m_trapping && m_instruction_interrupt < 0 && !m_cycle.active &&
-		m_cursor == m_history_count && m_boundary_allowed && !(m_dstat & 0xc0) && !(m_rcr & 0x80) && !(m_tcr & 3) && !(m_dcntl & 0xf0) &&
+		m_cursor == m_history_count && m_boundary_allowed && !(m_dstat & 0xc0) && !(m_rcr & 0x80) && !cycle_prt_timed() && !(m_dcntl & 0xf0) &&
 		!m_wait_line && !m_bus_released && !m_sampled_bus_request && !m_bus_acknowledged && !m_nmi_pending && !m_refresh_pending &&
 		m_dma_channel == 0xff && m_dma_continue == 0xff)
 	{
@@ -1816,7 +1826,7 @@ next_grant:
 				{
 					m_fast_irq_valid = false;
 					m_instruction_fast = !m_cycle_reference && m_instruction_interrupt < 0 && m_icount >= 6 && !(m_dstat & 0xc0) &&
-						!(m_rcr & 0x80) && !(m_tcr & 3) && !(m_dcntl & 0xf0) && !m_wait_line && !m_bus_released && !m_nmi_pending;
+						!(m_rcr & 0x80) && !cycle_prt_timed() && !(m_dcntl & 0xf0) && !m_wait_line && !m_bus_released && !m_nmi_pending;
 				}
 				if (m_instruction_fast)
 					++m_fast_instructions;
