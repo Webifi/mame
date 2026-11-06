@@ -41,7 +41,10 @@ rectangle output_span(rectangle area, int x, int y)
 }
 
 // The monitors the card drives are CRTs. Each places the picture by the
-// signal's timing; the owner only centers it with the position controls.
+// signal's timing. The owner sets the position and size controls for the best
+// picture: the whole unblanked signal, the active picture and its border,
+// shows and is centered. Where the monitor's own window is larger, the rest
+// of the window is blanked signal.
 //
 // VGA, a multisync monitor: it keeps its raster a fixed part of the line and
 // of the frame. At 31.5 kHz the sync polarities select the IBM vertical size
@@ -78,27 +81,58 @@ struct monitor_window
 };
 
 // The signal's line, field and pixel rates, its line in pixels, its frame in
-// lines (both fields when interlaced), fields per frame and sync polarities.
+// lines (both fields when interlaced), its unblanked pixels and lines, fields
+// per frame and sync polarities.
 monitor_window card_monitor(bool vga, double line_hz, double field_hz, double pixel_hz, unsigned ht, unsigned vt,
-	unsigned fields, bool h_negative, bool v_negative)
+	unsigned uw, unsigned uh, unsigned fields, bool h_negative, bool v_negative)
 {
+	monitor_window window;
 	if (vga)
 	{
 		double part = 496.0 / 525.0;
 		if (std::abs(line_hz / vga_line - 1.0) <= vga_tolerance && h_negative != v_negative)
 			part = (v_negative ? 362.0 : 414.0) / 449.0;
-		return { unsigned(ht * vga_window_part + 0.5), unsigned(vt * part + 0.5),
+		window = { unsigned(ht * vga_window_part + 0.5), unsigned(vt * part + 0.5),
 			line_hz >= vga_line_min && line_hz <= vga_line_max && field_hz >= vga_field_min && field_hz <= vga_field_max };
 	}
-	return { unsigned(applecolor_window_time * pixel_hz + 0.5), unsigned(applecolor_window_frame * line_hz * fields + 0.5),
-		line_hz >= applecolor_line_min && line_hz <= applecolor_line_max &&
-		field_hz >= applecolor_field_min && field_hz <= applecolor_field_max };
+	else
+		window = { unsigned(applecolor_window_time * pixel_hz + 0.5), unsigned(applecolor_window_frame * line_hz * fields + 0.5),
+			line_hz >= applecolor_line_min && line_hz <= applecolor_line_max &&
+			field_hz >= applecolor_field_min && field_hz <= applecolor_field_max };
+	window.width = std::max(window.width, uw);
+	window.height = std::max(window.height, uh);
+	return window;
 }
 
 // Floor of half a signed difference, so both directions round the same way.
 int floor_half(int value)
 {
 	return value >= 0 ? value / 2 : -((1 - value) / 2);
+}
+
+// The unblanked part of one axis, in pixels or lines from the start of the
+// active display: blanking starts at blank_first and lasts blank_length of
+// total. start is negative when the unblanked part begins before the active
+// display, in the border of the preceding line or frame.
+struct unblanked_span
+{
+	int start, length;
+};
+
+unblanked_span unblanked(int total, int active, int blank_first, int blank_length)
+{
+	int const length = total - std::clamp(blank_length, 0, total);
+	int const end = (blank_first + blank_length) % total;
+	return { end < active ? end : end - total, length };
+}
+
+// Offset of the active display in a window that is centered on the unblanked
+// part. With no unblanked part, center the window on the active display.
+int active_offset(int window, int active, unblanked_span span)
+{
+	if (span.length <= 0)
+		return floor_half(window - active);
+	return floor_half(window - span.length) - span.start;
 }
 
 // Oak STD8_HC.DRV SetCursor (ordinal 102, segment 1:4BE3):
@@ -1226,13 +1260,19 @@ void oak_oti087_vga_device::recompute_params()
 	u32 const dotclock = vclk_hz() / (BIT(vga.sequencer.data[1], 3) ? 2 : 1) / (m_output_divider ? 2 : 1);
 	// Type 0 straps pass PCLK; do not apply a second Oak DAC clock divider.
 	attotime const frame = attotime::from_ticks(u64(ht) * vt * div, dotclock);
-	// The monitor window, centered on the active display by the owner's
-	// position controls. Keep the pixel and line counters and the U12
-	// AppleColor timing GAL divider unchanged.
+	// The monitor window holds the whole unblanked signal, centered, as the
+	// owner's position and size controls would set it. Keep the pixel and
+	// line counters and the U12 AppleColor timing GAL divider unchanged.
+	unsigned const blank_chars = (vga.crtc.horz_blank_end - vga.crtc.horz_blank_start) & 63;
+	unsigned const line_rows = interlace * vertical_divisor();
+	unblanked_span const hspan = unblanked(ht, hd, vga.crtc.horz_blank_start * dots * mult / div % ht,
+		std::min(ht, (blank_chars ? blank_chars : 64) * dots * mult / div));
+	unblanked_span const vspan = unblanked(vt, vd, vga.crtc.vert_blank_start * line_rows % vt,
+		std::min(vt, vertical_blank_length() * line_rows));
 	double const line_hz = double(dotclock) / (double(ht) * div);
 	bool const vga_monitor = (m_monitor_override < 0 ? m_monitor->read() : m_monitor_override) & 1;
 	monitor_window window = card_monitor(vga_monitor, line_hz, line_hz * interlace / vt, double(dotclock) / div, ht, vt,
-		interlace, BIT(vga.miscellaneous_output, 6), BIT(vga.miscellaneous_output, 7));
+		hspan.length, vspan.length, interlace, BIT(vga.miscellaneous_output, 6), BIT(vga.miscellaneous_output, 7));
 	if (!window.locked)
 	{
 		// No picture, as on a monitor that cannot lock. Keep the screen
@@ -1249,7 +1289,8 @@ void oak_oti087_vga_device::recompute_params()
 	}
 	m_lock_rates = { line_hz, line_hz * interlace / vt, double(vga_monitor) };
 	unsigned const width = std::clamp(window.width, 1U, ht), height = std::clamp(window.height, 1U, vt);
-	int const left = floor_half(int(width) - int(hd)), top = floor_half(int(height) - int(vd));
+	int const left = window.locked ? active_offset(width, hd, hspan) : floor_half(int(width) - int(hd));
+	int const top = window.locked ? active_offset(height, vd, vspan) : floor_half(int(height) - int(vd));
 	// A window that starts left of counter zero starts in the preceding
 	// CRTC line. A linear pixel offset retains that carry when status and
 	// timers cross X=0.
