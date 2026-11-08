@@ -41,10 +41,14 @@ rectangle output_span(rectangle area, int x, int y)
 }
 
 // The monitors the card drives are CRTs. Each places the picture by the
-// signal's timing. The owner sets the position and size controls for the best
-// picture: the whole unblanked signal, the active picture and its border,
-// shows and is centered. Where the monitor's own window is larger, the rest
-// of the window is blanked signal.
+// signal's timing. The user sets the size and position controls for the best
+// picture of each mode: the picture keeps the aspect that the monitor's
+// factory raster, below, gives its scan rates, and fills the screen. Both
+// sizes change together until the unblanked signal, the active picture and its
+// border, covers the screen, and further only where the whole active picture
+// needs it. The unblanked signal is centered: border that does not fit is
+// cropped evenly, the active picture never; any rest of the window is blanked
+// signal.
 //
 // VGA, a multisync monitor: it keeps its raster a fixed part of the line and
 // of the frame. At 31.5 kHz the sync polarities select the IBM vertical size
@@ -81,27 +85,31 @@ struct monitor_window
 };
 
 // The signal's line, field and pixel rates, its line in pixels, its frame in
-// lines (both fields when interlaced), its unblanked pixels and lines, fields
-// per frame and sync polarities.
+// lines (both fields when interlaced), its unblanked and active pixels and
+// lines, fields per frame and sync polarities.
 monitor_window card_monitor(bool vga, double line_hz, double field_hz, double pixel_hz, unsigned ht, unsigned vt,
-	unsigned uw, unsigned uh, unsigned fields, bool h_negative, bool v_negative)
+	unsigned uw, unsigned uh, unsigned aw, unsigned ah, unsigned fields, bool h_negative, bool v_negative)
 {
-	monitor_window window;
+	double width, height;
+	bool locked;
 	if (vga)
 	{
 		double part = 496.0 / 525.0;
 		if (std::abs(line_hz / vga_line - 1.0) <= vga_tolerance && h_negative != v_negative)
 			part = (v_negative ? 362.0 : 414.0) / 449.0;
-		window = { unsigned(ht * vga_window_part + 0.5), unsigned(vt * part + 0.5),
-			line_hz >= vga_line_min && line_hz <= vga_line_max && field_hz >= vga_field_min && field_hz <= vga_field_max };
+		width = ht * vga_window_part;
+		height = vt * part;
+		locked = line_hz >= vga_line_min && line_hz <= vga_line_max && field_hz >= vga_field_min && field_hz <= vga_field_max;
 	}
 	else
-		window = { unsigned(applecolor_window_time * pixel_hz + 0.5), unsigned(applecolor_window_frame * line_hz * fields + 0.5),
-			line_hz >= applecolor_line_min && line_hz <= applecolor_line_max &&
-			field_hz >= applecolor_field_min && field_hz <= applecolor_field_max };
-	window.width = std::max(window.width, uw);
-	window.height = std::max(window.height, uh);
-	return window;
+	{
+		width = applecolor_window_time * pixel_hz;
+		height = applecolor_window_frame * line_hz * fields;
+		locked = line_hz >= applecolor_line_min && line_hz <= applecolor_line_max &&
+			field_hz >= applecolor_field_min && field_hz <= applecolor_field_max;
+	}
+	double const scale = std::max({ std::min(uw / width, uh / height), aw / width, ah / height });
+	return { unsigned(width * scale + 0.5), unsigned(height * scale + 0.5), locked };
 }
 
 // Floor of half a signed difference, so both directions round the same way.
@@ -127,12 +135,12 @@ unblanked_span unblanked(int total, int active, int blank_first, int blank_lengt
 }
 
 // Offset of the active display in a window that is centered on the unblanked
-// part. With no unblanked part, center the window on the active display.
+// part. With no unblanked part, center the window on the active display. The
+// active display always stays in the window.
 int active_offset(int window, int active, unblanked_span span)
 {
-	if (span.length <= 0)
-		return floor_half(window - active);
-	return floor_half(window - span.length) - span.start;
+	int const centered = span.length <= 0 ? floor_half(window - active) : floor_half(window - span.length) - span.start;
+	return std::clamp(centered, 0, std::max(0, window - active));
 }
 
 // Oak STD8_HC.DRV SetCursor (ordinal 102, segment 1:4BE3):
@@ -699,10 +707,13 @@ bool oak_oti087_vga_device::vertical_retrace()
 	// OTI p40: odd-field vertical retrace starts at the character
 	// position in index15, rather than invariably half a scan line.
 	int const phase = odd ? (m_ext[0x15] & 0x7f) * char_width / pixel_divisor() : 0;
-	int const length = (vga.crtc.vert_retrace_end - vga.crtc.vert_retrace_start) & 15;
+	int const lines = vga.crtc.vert_total + 2;
+	if (int(vga.crtc.vert_retrace_start) >= lines)
+		return false;
+	int const length = retrace_length(vga.crtc.vert_retrace_start, vga.crtc.vert_retrace_end & 15, 15, lines);
 	int const position = field_y * ht + crtc_hpos();
 	int const sync_start = vga.crtc.vert_retrace_start * vertical_divisor() * ht + phase;
-	return (position - sync_start + vt * ht * 2) % (vt * ht) < (length ? length : 16) * vertical_divisor() * ht;
+	return !length || (position - sync_start + vt * ht * 2) % (vt * ht) < length * int(vertical_divisor()) * ht;
 }
 
 int oak_oti087_vga_device::vsync_r()
@@ -733,8 +744,8 @@ int oak_oti087_vga_device::hsync_r()
 	int const total = vga.crtc.horz_total + 5;
 	int const character = crtc_hpos() * pixel_divisor() / (dots * horizontal_multiplier());
 	int const start = (vga.crtc.horz_retrace_start + vga.crtc.horz_retrace_skew) % total;
-	int const width = (vga.crtc.horz_retrace_end - vga.crtc.horz_retrace_start) & 31;
-	bool const active = (character - start + total) % total < (width ? width : 32);
+	int const width = retrace_length(vga.crtc.horz_retrace_start, vga.crtc.horz_retrace_end & 31, 31, total);
+	bool const active = vga.crtc.horz_retrace_start < total && (!width || (character - start + total) % total < width);
 	return (vga.crtc.sync_en && active) ^ BIT(vga.miscellaneous_output, 6);
 }
 
@@ -801,11 +812,13 @@ u8 oak_oti087_vga_device::io_r(offs_t port, bool *driven)
 			unsigned const dots = BIT(vga.sequencer.data[1], 0) ? 8 : 9;
 			unsigned const char_width = dots * horizontal_multiplier();
 			int const hchar = crtc_hpos() * pixel_divisor() / char_width;
+			// Status follows the horizontal register count (IBM VGA/XGA TRM
+			// p. 2-57); only the output blanking comes one character later.
 			int const hb_len = (vga.crtc.horz_blank_end - vga.crtc.horz_blank_start) & 63;
 			int const vb_len = vertical_blank_length();
 			bool const hb =
 				(hchar - vga.crtc.horz_blank_start + vga.crtc.horz_total + 5) % (vga.crtc.horz_total + 5) < (hb_len ? hb_len : 64);
-			bool const vb = (field_y - vga.crtc.vert_blank_start + vt * 2) % vt < vb_len;
+			bool const vb = (field_y - int(vertical_blank_first()) + vt * 2) % vt < vb_len;
 			bool const active = hchar >= vga.crtc.disp_enable_skew &&
 				hchar <= vga.crtc.horz_disp_end + vga.crtc.disp_enable_skew && field_y <= vga.crtc.vert_disp_end;
 			// IBM 2-74: CRTC $17 bit 7 = 0 forces the retrace signals inactive,
@@ -1227,11 +1240,49 @@ unsigned oak_oti087_vga_device::pixel_divisor() const
 	return dac * (BIT(vga.attribute.data[0x10], 6) ? 2 : 1);
 }
 
+// Blanking at the output. The vertical start register holds the line where
+// blanking begins, minus 1 (IBM VGA/XGA TRM p. 2-73); blanking ends with the
+// line whose low eight bits equal the end register. Horizontal output
+// blanking also comes one character after its register counts. IBM's
+// 640 x 480 timing with these registers has 8 border dots and 8 border lines
+// at each side, and 18 characters and 29 lines of blanking (IBM PS/2 Video
+// Subsystem, Oct 1990, Figs. 106, 108 and 109).
+unsigned oak_oti087_vga_device::horizontal_blank_first() const
+{
+	return vga.crtc.horz_blank_start + 1;
+}
+
+unsigned oak_oti087_vga_device::horizontal_blank_length() const
+{
+	unsigned const n = (vga.crtc.horz_blank_end - vga.crtc.horz_blank_start) & 63;
+	return n ? n : 64;
+}
+
+unsigned oak_oti087_vga_device::vertical_blank_first() const
+{
+	return vga.crtc.vert_blank_start + 1;
+}
+
 unsigned oak_oti087_vga_device::vertical_blank_length() const
 {
-	// IBM VGA/XGA TRM 2-73: End = Start + Width - 1 (eight low bits).
-	// Unlike horizontal blanking (2-59/60), the last encoded line counts.
-	return ((vga.crtc.vert_blank_end - vga.crtc.vert_blank_start) & 255) + 1;
+	unsigned const n = (vga.crtc.vert_blank_end - vga.crtc.vert_blank_start) & 255;
+	return n ? n : 256;
+}
+
+// On the AppleColor RGB, a mode with the IIgs screen's shape mirrors the IIgs
+// screen: text of 24 rows, or graphics of 192 or 200 lines. The user sets the
+// monitor to the frame GSSquared shows around the IIgs screen: the 19 lines
+// above the picture and 240 lines in all, the lines with border in the IIgs RGB
+// signal (Apple A2M6014 RGB Monitor timing chart), and 3/40 of the width at each
+// side. The whole frame is border color, also where the card's signal blanks.
+bool oak_oti087_vga_device::iigs_frame()
+{
+	if (((m_monitor_override < 0 ? m_monitor->read() : m_monitor_override) & 1) || BIT(m_ext[0x14], 7))
+		return false;
+	unsigned const lines = (vga.crtc.vert_disp_end + 1) * vertical_divisor();
+	if (vga.gc.alpha_dis)
+		return lines == 192 || lines == 200;
+	return lines == 24 * vga.crtc.maximum_scan_line;
 }
 
 void oak_oti087_vga_device::recompute_params()
@@ -1260,19 +1311,18 @@ void oak_oti087_vga_device::recompute_params()
 	u32 const dotclock = vclk_hz() / (BIT(vga.sequencer.data[1], 3) ? 2 : 1) / (m_output_divider ? 2 : 1);
 	// Type 0 straps pass PCLK; do not apply a second Oak DAC clock divider.
 	attotime const frame = attotime::from_ticks(u64(ht) * vt * div, dotclock);
-	// The monitor window holds the whole unblanked signal, centered, as the
-	// owner's position and size controls would set it. Keep the pixel and
-	// line counters and the U12 AppleColor timing GAL divider unchanged.
-	unsigned const blank_chars = (vga.crtc.horz_blank_end - vga.crtc.horz_blank_start) & 63;
+	// The monitor window, as the user's controls would set it. Keep the pixel
+	// and line counters and the U12 AppleColor timing GAL divider unchanged.
 	unsigned const line_rows = interlace * vertical_divisor();
-	unblanked_span const hspan = unblanked(ht, hd, vga.crtc.horz_blank_start * dots * mult / div % ht,
-		std::min(ht, (blank_chars ? blank_chars : 64) * dots * mult / div));
-	unblanked_span const vspan = unblanked(vt, vd, vga.crtc.vert_blank_start * line_rows % vt,
+	unblanked_span const hspan = unblanked(ht, hd, horizontal_blank_first() * dots * mult / div % ht,
+		std::min(ht, horizontal_blank_length() * dots * mult / div));
+	unblanked_span const vspan = unblanked(vt, vd, vertical_blank_first() * line_rows % vt,
 		std::min(vt, vertical_blank_length() * line_rows));
 	double const line_hz = double(dotclock) / (double(ht) * div);
 	bool const vga_monitor = (m_monitor_override < 0 ? m_monitor->read() : m_monitor_override) & 1;
 	monitor_window window = card_monitor(vga_monitor, line_hz, line_hz * interlace / vt, double(dotclock) / div, ht, vt,
-		hspan.length, vspan.length, interlace, BIT(vga.miscellaneous_output, 6), BIT(vga.miscellaneous_output, 7));
+		hspan.length > 0 ? hspan.length : hd, vspan.length > 0 ? vspan.length : vd, hd, vd, interlace,
+		BIT(vga.miscellaneous_output, 6), BIT(vga.miscellaneous_output, 7));
 	if (!window.locked)
 	{
 		// No picture, as on a monitor that cannot lock. Keep the screen
@@ -1288,9 +1338,17 @@ void oak_oti087_vga_device::recompute_params()
 		m_lock_since = machine().time();
 	}
 	m_lock_rates = { line_hz, line_hz * interlace / vt, double(vga_monitor) };
-	unsigned const width = std::clamp(window.width, 1U, ht), height = std::clamp(window.height, 1U, vt);
-	int const left = window.locked ? active_offset(width, hd, hspan) : floor_half(int(width) - int(hd));
-	int const top = window.locked ? active_offset(height, vd, vspan) : floor_half(int(height) - int(vd));
+	unsigned width = std::clamp(window.width, 1U, ht), height = std::clamp(window.height, 1U, vt);
+	int left = window.locked ? active_offset(width, hd, hspan) : floor_half(int(width) - int(hd));
+	int top = window.locked ? active_offset(height, vd, vspan) : floor_half(int(height) - int(vd));
+	if (window.locked && iigs_frame())
+	{
+		unsigned const side = (hd * 3 + 20) / 40;
+		width = std::min(hd + 2 * side, ht);
+		height = std::min(std::max(240U, vd + 19), vt);
+		left = side;
+		top = 19;
+	}
 	// A window that starts left of counter zero starts in the preceding
 	// CRTC line. A linear pixel offset retains that carry when status and
 	// timers cross X=0.
@@ -1942,10 +2000,8 @@ bool oak_oti087_vga_device::blanked(int x, int y) const
 	unsigned const dots = BIT(vga.sequencer.data[1], 0) ? 8 : 9;
 	int const hx = x * pixel_divisor() / (dots * horizontal_multiplier());
 	int const vy = y / ((BIT(m_ext[0x14], 7) ? 2 : 1) * vertical_divisor());
-	int const hb = (vga.crtc.horz_blank_end - vga.crtc.horz_blank_start) & 63;
-	int const vb = vertical_blank_length();
-	return (hx - vga.crtc.horz_blank_start + ht * 2) % ht < (hb ? hb : 64) ||
-		(vy - vga.crtc.vert_blank_start + vt * 2) % vt < vb;
+	return (hx - int(horizontal_blank_first()) + ht * 2) % ht < int(horizontal_blank_length()) ||
+		(vy - int(vertical_blank_first()) + vt * 2) % vt < int(vertical_blank_length());
 }
 
 u8 oak_oti087_vga_device::cursor_background_index(row_state const &row, int x) const
@@ -2112,16 +2168,18 @@ u32 oak_oti087_vga_device::draw_raster(bitmap_rgb32 &bitmap, rectangle const &cl
 		draw_cursor<true>(bitmap, bounds, ox, oy);
 	else
 		draw_cursor(bitmap, bounds, ox, oy);
+	// The IIgs frame is border color, also where the signal blanks.
+	if (iigs_frame())
+		return 0;
 	// Apply the programmed blanking intervals, including intervals moved
 	// inside active display. Ordinary modes have no horizontal intersection;
 	// do not add a blanking test to their pixel loops.
 	unsigned const dots = BIT(vga.sequencer.data[1], 0) ? 8 : 9;
 	int const ht = vga.crtc.horz_total + 5, vt = vga.crtc.vert_total + 2;
 	int const unit = dots * horizontal_multiplier();
-	int const hb = vga.crtc.horz_blank_start % ht;
-	int const hw = (vga.crtc.horz_blank_end - vga.crtc.horz_blank_start) & 63;
-	int const he = hb + (hw ? hw : 64);
-	int const vb = vga.crtc.vert_blank_start % vt;
+	int const hb = horizontal_blank_first() % ht;
+	int const he = hb + horizontal_blank_length();
+	int const vb = vertical_blank_first() % vt;
 	int const vw = vertical_blank_length();
 	int const repeat = vertical_divisor() * (get_interlace_mode() ? 2 : 1);
 	auto black_span = [&](int y, int left, int right) {

@@ -173,7 +173,22 @@ class oak_oti087_vga_device : public svga_device
 	void latch_diagnostic(unsigned bit, char const *reason, u32 address);
 	unsigned pixel_divisor() const;
 	unsigned horizontal_multiplier() const;
+	unsigned horizontal_blank_first() const;
+	unsigned horizontal_blank_length() const;
+	unsigned vertical_blank_first() const;
 	unsigned vertical_blank_length() const;
+	bool iigs_frame();
+	// Characters or lines of a CRTC retrace pulse. It starts where the counter
+	// equals start and ends where the low bits (mask) of the counter equal
+	// end; the counter wraps at total first (IBM VGA/XGA TRM pp. 2-60, 2-71).
+	// 0 when the counter never matches end, so the pulse never ends.
+	static int retrace_length(int start, int end, int mask, int total)
+	{
+		for (int n = 1; n < total; ++n)
+			if ((((start + n) % total) & mask) == end)
+				return n;
+		return 0;
+	}
 	bool scan_test() const { return (m_ext[3] & 0x87) == 0x85; }
 	void draw_scan_test(bitmap_rgb32 &bitmap, rectangle const &cliprect, int ox, int oy);
 	void draw_packed(bitmap_rgb32 &bitmap, rectangle const &cliprect, int ox, int oy);
