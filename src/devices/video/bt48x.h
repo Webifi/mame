@@ -32,6 +32,9 @@ public:
 	uint8_t command_r() const { return m_cra; }
 	unsigned bytes_per_pixel() const;
 	unsigned pixels_per_clock_divisor() const;
+	// Input clocks from a pixel and its BLANK* at the inputs to its analog
+	// output (L481A_C Table 13, pipeline delay).
+	unsigned pipeline_clocks() const;
 	rgb_t direct_color(uint32_t pixel, uint8_t overlay = 0) const;
 	// Output remains blank during Bt481 color chip (RAMDAC) wake-up recovery,
 	// even with B0 clear.

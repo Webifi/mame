@@ -40,15 +40,14 @@ rectangle output_span(rectangle area, int x, int y)
 	return area;
 }
 
-// The monitors the card drives are CRTs. Each places the picture by the
-// signal's timing. The user sets the size and position controls for the best
-// picture of each mode: the picture keeps the aspect that the monitor's
-// factory raster, below, gives its scan rates, and fills the screen. Both
-// sizes change together until the unblanked signal, the active picture and its
-// border, covers the screen, and further only where the whole active picture
-// needs it. The unblanked signal is centered: border that does not fit is
-// cropped evenly, the active picture never; any rest of the window is blanked
-// signal.
+// The CRT monitors place the picture by the signal's timing. The user sets
+// the size and position controls for the best picture of each mode: the
+// picture keeps the aspect that the monitor's factory raster, below, gives
+// its scan rates, and fills the screen. Both sizes change together until the
+// unblanked signal, the active picture and its border, covers the screen, and
+// further only where the whole active picture needs it. The unblanked signal
+// is centered: border that does not fit is cropped evenly, the active picture
+// never; any rest of the window is blanked signal.
 //
 // VGA, a multisync monitor: it keeps its raster a fixed part of the line and
 // of the frame. At 31.5 kHz the sync polarities select the IBM vertical size
@@ -143,6 +142,52 @@ int active_offset(int window, int active, unblanked_span span)
 	return std::clamp(centered, 0, std::max(0, window - active));
 }
 
+// The screen that the user runs Auto on, one field: the finest detail that
+// the mode can show, white and black columns one pixel wide with white at both
+// ends of the active display, the border in its color, and black where the
+// card blanks. Auto finds a sharp clock only on a screen with detail; on a
+// plain screen the clock it finds depends on the edges of the signal. edge is
+// the Bt481's rise and fall time, 3 ns from 10% to 90% (L481A_C Table 13), in
+// pixels.
+oti087_lcd::Picture lcd_picture(std::array<s32, 11> const &shape, int fields, rgb_t border, double edge)
+{
+	auto const [hd, vd, ht, vt, hfirst, hlength, vfirst, vlength, lit, hsync, vsync] = shape;
+	oti087_lcd::Picture picture;
+	picture.width = ht;
+	picture.lines = vt / fields;
+	picture.hsync = hsync;
+	picture.vsync = vsync;
+	picture.edge = edge;
+	picture.active_width = hd;
+	picture.active_lines = (vd + fields - 1) / fields;
+	picture.level.assign(size_t(ht) * picture.lines, 0);
+	picture.blue.assign(size_t(ht) * picture.lines, 0);
+	u8 const border_level = std::max({ border.r(), border.g(), border.b() });
+	for (int line = 0; line < picture.lines; ++line)
+	{
+		int const y = line * fields;
+		if ((y + vt - vfirst) % vt < vlength)
+			continue;
+		u8 *const level = &picture.level[size_t(line) * ht];
+		u8 *const blue = &picture.blue[size_t(line) * ht];
+		for (int x = 0; x < ht; ++x)
+		{
+			if ((x + ht - hfirst) % ht < hlength)
+				continue;
+			if (x < hd && y < vd)
+			{
+				level[x] = blue[x] = (x % 2 == 0 || x == hd - 1) ? 255 : 0;
+			}
+			else
+			{
+				level[x] = border_level;
+				blue[x] = border.b();
+			}
+		}
+	}
+	return picture;
+}
+
 // Oak STD8_HC.DRV SetCursor (ordinal 102, segment 1:4BE3):
 // plane A is the Windows AND mask, plane B is XOR. This primary driver
 // evidence supersedes the conflicting secondary OAK.TXT code table.
@@ -195,8 +240,9 @@ static INPUT_PORTS_START(oti087)
 	PORT_START("VGA_SENSE")
 	PORT_BIT(0xff, IP_ACTIVE_LOW, IPT_UNUSED)
 	PORT_START("MONITOR")
-	PORT_CONFNAME(1, 1, "Second Sight monitor")
-	PORT_CONFSETTING(1, "VGA")
+	PORT_CONFNAME(3, 1, "Second Sight monitor")
+	PORT_CONFSETTING(1, "VGA CRT")
+	PORT_CONFSETTING(3, "VGA LCD")
 	PORT_CONFSETTING(0, "AppleColor RGB")
 INPUT_PORTS_END
 
@@ -443,9 +489,24 @@ TIMER_CALLBACK_MEMBER(oak_oti087_vga_device::display_latch_tick)
 	if (m_lock_candidate == m_out_of_range && machine().time() - m_lock_since >= m_screen->frame_period())
 	{
 		m_out_of_range = !m_lock_candidate;
-		if (m_out_of_range)
-			popmessage("Second Sight %s monitor: out of range (%.2f kHz, %.2f Hz)",
-				m_lock_rates[2] ? "VGA" : "AppleColor RGB", m_lock_rates[0] / 1000.0, m_lock_rates[1]);
+		char const *const name = m_lock_rates[2] == 2 ? "VGA LCD" : m_lock_rates[2] ? "VGA CRT" : "AppleColor RGB";
+		if (m_out_of_range && !m_lock_rates[3])
+			popmessage("Second Sight %s monitor: no signal", name);
+		else if (m_out_of_range)
+			popmessage("Second Sight %s monitor: out of range (%.2f kHz, %.2f Hz)", name, m_lock_rates[0] / 1000.0,
+				m_lock_rates[1]);
+	}
+	// The LCD's Auto follows the picture's shape, which also changes with the
+	// border color.
+	if (vga_lcd() != m_lcd_attached)
+		recompute_params();
+	else if (m_lcd_attached)
+	{
+		oti087_lcd::Timing timing;
+		int hsync = 0, vsync = 0;
+		lcd_measure(timing, hsync, vsync);
+		if (lcd_shape(hsync, vsync) != m_lcd_shape)
+			recompute_params();
 	}
 	schedule_display_latch(1);
 }
@@ -1285,6 +1346,83 @@ bool oak_oti087_vga_device::iigs_frame()
 	return lines == 24 * vga.crtc.maximum_scan_line;
 }
 
+// The LCD monitor uses the VGA cable; the card senses no difference.
+bool oak_oti087_vga_device::vga_lcd() const
+{
+	return ((m_monitor_override < 0 ? m_monitor->read() : m_monitor_override) & 1) && BIT(m_monitor->read(), 1);
+}
+
+// The HSYNC leading edge at the card's VGA connector, in pixels from the
+// start of the active display there. HSYNC and VSYNC go from the Oak to the
+// connector through 22 ohm resistors only; the pixels and blanking go through
+// the Bt481, which the Oak's PCLK clocks. PCLK passes VCLK through on this
+// board's Type 0 color-chip interface (OTI-087 data book p. 37).
+// IBM's VGA, with the registers that IBM programs, starts HSync one border
+// and one front porch after the active display (VGA/XGA TRM pp. 4-4, 4-5,
+// timing set 1): its video leaves 2 characters after the CRTC count in
+// graphics and 3 in text, which also reads the character generator. 3 dot
+// clocks of that are IBM's DAC (TRM Fig. 2-97, T8). No source gives the
+// Oak's own delay; this takes IBM's, because the Oak BIOS and the card's
+// firmware program IBM's horizontal values unchanged. The Bt481 takes
+// pipeline_clocks().
+int oak_oti087_vga_device::connector_hsync()
+{
+	auto const &crtc = vga.crtc;
+	int const characters = crtc.horz_total + 5;
+	int const delay = vga.gc.alpha_dis ? 2 : 3;
+	int const start = ((crtc.horz_retrace_start + crtc.horz_retrace_skew - delay) % characters + characters) % characters;
+	unsigned const dots = BIT(vga.sequencer.data[1], 0) ? 8 : 9;
+	int const unit = dots * horizontal_multiplier(), div = pixel_divisor();
+	int const pixels = characters * unit / div;
+	// The Bt481 runs on the Oak's clock input, which U12 halves on the RGB path.
+	int const vclks = div * (BIT(vga.sequencer.data[1], 3) ? 2 : 1);
+	int const dac = int(std::lround(double(int(m_ramdac->pipeline_clocks()) - 3) / vclks));
+	return ((start * unit / div - dac) % pixels + pixels) % pixels;
+}
+
+// The card's VGA output as the LCD monitor's controller measures it, and the
+// leading edges of HSync and VSync in pixels and lines of a field from the
+// start of the active display. False when there is no sync to measure.
+bool oak_oti087_vga_device::lcd_measure(oti087_lcd::Timing &timing, int &hsync, int &vsync)
+{
+	auto const &crtc = vga.crtc;
+	if (!crtc.sync_en || !crtc.horz_total || !crtc.horz_disp_end || !crtc.vert_disp_end)
+		return false;
+	int const characters = crtc.horz_total + 5, line_total = crtc.vert_total + 2;
+	int const hwidth = retrace_length(crtc.horz_retrace_start, crtc.horz_retrace_end & 31, 31, characters);
+	int const vwidth = retrace_length(crtc.vert_retrace_start, crtc.vert_retrace_end & 15, 15, line_total);
+	// A pulse that never starts or never ends gives no sync edge.
+	if (crtc.horz_retrace_start >= characters || crtc.vert_retrace_start >= line_total || !hwidth || !vwidth)
+		return false;
+	unsigned const dots = BIT(vga.sequencer.data[1], 0) ? 8 : 9;
+	unsigned const unit = dots * horizontal_multiplier(), div = pixel_divisor();
+	u32 const dotclock = vclk_hz() / (BIT(vga.sequencer.data[1], 3) ? 2 : 1) / (m_output_divider ? 2 : 1);
+	hsync = connector_hsync();
+	vsync = crtc.vert_retrace_start * vertical_divisor();
+	// VSYNC is the retrace XOR Miscellaneous Output bit 7 XOR the Oak ext03
+	// bit 5 toggle (vsync_r); HSYNC is the retrace XOR bit 6.
+	bool const v_negative = BIT(vga.miscellaneous_output, 7) ^ BIT(m_ext[3], 5);
+	return oti087_lcd::measure(double(dotclock) / (double(characters * unit / div) * div), line_total * vertical_divisor(),
+		double(hwidth * unit) / dotclock, vwidth * vertical_divisor(), !BIT(vga.miscellaneous_output, 6), !v_negative,
+		get_interlace_mode(), timing);
+}
+
+// What sets the LCD picture's shape: the active display, the totals, the
+// blanking, the border's brightness over the auto function's noise margin
+// and the sync leading edges.
+std::array<s32, 11> oak_oti087_vga_device::lcd_shape(int hsync, int vsync)
+{
+	unsigned const dots = BIT(vga.sequencer.data[1], 0) ? 8 : 9;
+	unsigned const unit = dots * horizontal_multiplier(), div = pixel_divisor();
+	unsigned const rows = (get_interlace_mode() ? 2 : 1) * vertical_divisor();
+	s32 const ht = (vga.crtc.horz_total + 5) * unit / div, vt = (vga.crtc.vert_total + 2) * rows;
+	rgb_t const border = m_ramdac->pixel_select(vga.attribute.data[0x11]);
+	return { s32((vga.crtc.horz_disp_end + 1) * unit / div), s32((vga.crtc.vert_disp_end + 1) * rows), ht, vt,
+		s32(horizontal_blank_first() * unit / div % ht), std::min(ht, s32(horizontal_blank_length() * unit / div)),
+		s32(vertical_blank_first() * rows % vt), std::min(vt, s32(vertical_blank_length() * rows)),
+		border.r() > 0x40 || border.g() > 0x40 || border.b() > 0x40, hsync, vsync };
+}
+
 void oak_oti087_vga_device::recompute_params()
 {
 	// IBM 2-54: EM enables 256KB rather than 64KB, i.e. 64KB rather
@@ -1320,9 +1458,46 @@ void oak_oti087_vga_device::recompute_params()
 		std::min(vt, vertical_blank_length() * line_rows));
 	double const line_hz = double(dotclock) / (double(ht) * div);
 	bool const vga_monitor = (m_monitor_override < 0 ? m_monitor->read() : m_monitor_override) & 1;
-	monitor_window window = card_monitor(vga_monitor, line_hz, line_hz * interlace / vt, double(dotclock) / div, ht, vt,
-		hspan.length > 0 ? hspan.length : hd, vspan.length > 0 ? vspan.length : vd, hd, vd, interlace,
-		BIT(vga.miscellaneous_output, 6), BIT(vga.miscellaneous_output, 7));
+	m_lcd_attached = vga_lcd();
+	monitor_window window;
+	int left = 0, top = 0;
+	bool signal = true;
+	if (m_lcd_attached)
+	{
+		// The window of the LCD monitor: the capture of the preset its
+		// controller picks. An interlaced signal shows both fields woven.
+		oti087_lcd::Timing timing;
+		int hsync = 0, vsync = 0;
+		signal = lcd_measure(timing, hsync, vsync);
+		m_lcd.follow(signal, timing);
+		std::array<s32, 11> const shape = lcd_shape(hsync, vsync);
+		if (m_lcd.needs_picture() || shape != m_lcd_shape)
+		{
+			m_lcd_shape = shape;
+			m_lcd.picture(lcd_picture(shape, interlace, m_ramdac->pixel_select(vga.attribute.data[0x11]), 3e-9 / 0.8 * dotclock / div));
+		}
+		auto const &capture = m_lcd.capture();
+		window = { hd, vd, m_lcd.supported() };
+		if (window.locked)
+		{
+			// Each ADC sample shows the pixel phase/64 of a sample after the
+			// start of its period.
+			auto const sample = [&] (int n) {
+				return int((hsync + (64 * s64(capture.hstart + n) + capture.phase) * ht / (64 * s64(capture.samples))) % ht);
+			};
+			int const x0 = sample(0), y0 = (vsync + capture.vstart + 1) * interlace % vt;
+			window.width = (sample(capture.width - 1) - x0 + ht) % ht + 1;
+			window.height = capture.height * interlace;
+			left = x0 < int(hd) ? -x0 : int(ht) - x0;
+			top = y0 < int(vd) ? -y0 : int(vt) - y0;
+		}
+	}
+	else
+	{
+		window = card_monitor(vga_monitor, line_hz, line_hz * interlace / vt, double(dotclock) / div, ht, vt,
+			hspan.length > 0 ? hspan.length : hd, vspan.length > 0 ? vspan.length : vd, hd, vd, interlace,
+			BIT(vga.miscellaneous_output, 6), BIT(vga.miscellaneous_output, 7));
+	}
 	if (!window.locked)
 	{
 		// No picture, as on a monitor that cannot lock. Keep the screen
@@ -1337,10 +1512,13 @@ void oak_oti087_vga_device::recompute_params()
 		m_lock_candidate = window.locked;
 		m_lock_since = machine().time();
 	}
-	m_lock_rates = { line_hz, line_hz * interlace / vt, double(vga_monitor) };
+	m_lock_rates = { line_hz, line_hz * interlace / vt, m_lcd_attached ? 2.0 : double(vga_monitor), double(signal) };
 	unsigned width = std::clamp(window.width, 1U, ht), height = std::clamp(window.height, 1U, vt);
-	int left = window.locked ? active_offset(width, hd, hspan) : floor_half(int(width) - int(hd));
-	int top = window.locked ? active_offset(height, vd, vspan) : floor_half(int(height) - int(vd));
+	if (!m_lcd_attached || !window.locked)
+	{
+		left = window.locked ? active_offset(width, hd, hspan) : floor_half(int(width) - int(hd));
+		top = window.locked ? active_offset(height, vd, vspan) : floor_half(int(height) - int(vd));
+	}
 	if (window.locked && iigs_frame())
 	{
 		unsigned const side = (hd * 3 + 20) / 40;

@@ -8,6 +8,7 @@
 #include "bt48x.h"
 #include "machine/eepromser.h"
 #include "oti087_memory.h"
+#include "oti087_lcd.h"
 
 // Second Sight's Oak OTI-087X VGA chip, Bt481 color chip (RAMDAC) and
 // OTI-068 clock generator. Addresses passed to io_r/w are full port numbers,
@@ -178,6 +179,7 @@ class oak_oti087_vga_device : public svga_device
 	unsigned vertical_blank_first() const;
 	unsigned vertical_blank_length() const;
 	bool iigs_frame();
+	bool vga_lcd() const;
 	// Characters or lines of a CRTC retrace pulse. It starts where the counter
 	// equals start and ends where the low bits (mask) of the counter equal
 	// end; the counter wraps at total first (IBM VGA/XGA TRM pp. 2-60, 2-71).
@@ -189,6 +191,9 @@ class oak_oti087_vga_device : public svga_device
 				return n;
 		return 0;
 	}
+	int connector_hsync();
+	bool lcd_measure(oti087_lcd::Timing &timing, int &hsync, int &vsync);
+	std::array<s32, 11> lcd_shape(int hsync, int vsync);
 	bool scan_test() const { return (m_ext[3] & 0x87) == 0x85; }
 	void draw_scan_test(bitmap_rgb32 &bitmap, rectangle const &cliprect, int ox, int oy);
 	void draw_packed(bitmap_rgb32 &bitmap, rectangle const &cliprect, int ox, int oy);
@@ -236,7 +241,12 @@ class oak_oti087_vga_device : public svga_device
 	attotime m_origin_phase = attotime::zero;
 	bool m_out_of_range = false, m_lock_candidate = true;
 	attotime m_lock_since = attotime::zero;
-	std::array<double, 3> m_lock_rates{};
+	std::array<double, 4> m_lock_rates{};
+	// The VGA LCD monitor's controller, and whether it is attached with the
+	// picture shape of its last Auto. Both follow from the registers.
+	oti087_lcd::Monitor m_lcd;
+	bool m_lcd_attached = false;
+	std::array<s32, 11> m_lcd_shape{};
 	u8 m_system_data = 0xff;
 	u8 m_packed_layout_diagnostics = 0;
 	u8 m_latch[8]{};

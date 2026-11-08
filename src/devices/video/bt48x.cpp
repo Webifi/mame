@@ -170,6 +170,15 @@ unsigned bt481_device::pixels_per_clock_divisor() const
 	return !BIT(m_cra, 7) ? 1 : bytes_per_pixel() / (BIT(m_cra, 5) ? 1 : 2);
 }
 
+// Pseudo color and the two-edge 15- and 16-bit modes take 7 clocks, the
+// one-edge 15- and 16-bit and two-edge 32-bit modes 8, one-edge 24-bit 9.
+unsigned bt481_device::pipeline_clocks() const
+{
+	if (!BIT(m_cra, 7))
+		return 7;
+	return BIT(m_cra, 5) ? 6 + bytes_per_pixel() : bytes_per_pixel() == 4 ? 8 : 7;
+}
+
 rgb_t bt481_device::pixel_select(uint8_t index, uint8_t overlay) const
 {
 	if (asleep()) return rgb_t::black();
