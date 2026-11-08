@@ -192,6 +192,7 @@ class oak_oti087_vga_device : public svga_device
 		return 0;
 	}
 	int connector_hsync();
+	bool sync_present();
 	bool lcd_measure(oti087_lcd::Timing &timing, int &hsync, int &vsync);
 	std::array<s32, 11> lcd_shape(int hsync, int vsync);
 	bool scan_test() const { return (m_ext[3] & 0x87) == 0x85; }
@@ -241,7 +242,12 @@ class oak_oti087_vga_device : public svga_device
 	attotime m_origin_phase = attotime::zero;
 	bool m_out_of_range = false, m_lock_candidate = true;
 	attotime m_lock_since = attotime::zero;
-	std::array<double, 4> m_lock_rates{};
+	std::array<double, 5> m_lock_rates{};
+	// A mode that needs a back-panel control turned gets one short notice:
+	// its line and field rates and which controls, 0 for no such mode.
+	std::array<double, 5> m_hold_rates{};
+	attotime m_hold_since = attotime::zero;
+	bool m_hold_shown = false;
 	// The VGA LCD monitor's controller, and whether it is attached with the
 	// picture shape of its last Auto. Both follow from the registers.
 	oti087_lcd::Monitor m_lcd;

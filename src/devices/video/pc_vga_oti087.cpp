@@ -40,14 +40,15 @@ rectangle output_span(rectangle area, int x, int y)
 	return area;
 }
 
-// The CRT monitors place the picture by the signal's timing. The user sets
-// the size and position controls for the best picture of each mode: the
-// picture keeps the aspect that the monitor's factory raster, below, gives
-// its scan rates, and fills the screen. Both sizes change together until the
-// unblanked signal, the active picture and its border, covers the screen, and
-// further only where the whole active picture needs it. The unblanked signal
-// is centered: border that does not fit is cropped evenly, the active picture
-// never; any rest of the window is blanked signal.
+// The CRT monitors place the picture by the signal's timing. On the VGA CRT
+// the user sets the size and position controls for the best picture of each
+// mode: the picture keeps the aspect that the monitor's factory raster,
+// below, gives its scan rates, and fills the screen. Both sizes change
+// together until the unblanked signal, the active picture and its border,
+// covers the screen, and further only where the whole active picture needs
+// it. The unblanked signal is centered: border that does not fit is cropped
+// evenly, the active picture never; any rest of the window is blanked
+// signal. The AppleColor RGB has only V-HEIGHT for this (applecolor_placement).
 //
 // VGA, a multisync monitor: it keeps its raster a fixed part of the line and
 // of the frame. At 31.5 kHz the sync polarities select the IBM vertical size
@@ -70,17 +71,64 @@ constexpr double vga_field_min = 50.0 * (1 - vga_tolerance), vga_field_max = 44'
 constexpr double applecolor_face = 11.5 * 25.4 / 250.0;
 constexpr double applecolor_window_time = 40 * 14 / 14'318'180.0 * applecolor_face;
 constexpr double applecolor_window_frame = 200 * (65 * 14 + 2) / 14'318'180.0 * applecolor_face;
-// Apple specifies 15.734 kHz and 50 or 60 Hz. The AppleColor RGB records
-// Sequential shipped for the card run from 13.31 kHz (M640X200.18M) to
-// 18.75 kHz (M80X25.1575M) and up to 74.5 Hz (M560X192); the monitor shows
-// nothing at 31 kHz.
-constexpr double applecolor_line_min = 28'322'000.0 / 2 / 1064, applecolor_line_max = 72'000'000.0 / 4 / 960;
-constexpr double applecolor_field_min = 50.0, applecolor_field_max = 28'322'000.0 / 2 / 856 / 222;
+// Its lock (A2M6014 schematic and service manual): H-HOLD and V-HOLD are on
+// the back panel, so the user turns them for a mode that does not lock at
+// their factory settings. No source gives the lock ranges; these are the most
+// probable from the parts.
+// Horizontal: a Sanyo LA7822 holds the line oscillator to the sync with its
+// AFC. The factory sets H-HOLD on the IIgs line. The card firmware's modes,
+// 15.58 to 16.54 kHz, are made to lock at that setting, so the AFC holds at
+// least the 844 Hz from the IIgs line to 16.54 kHz; this takes 844 Hz on each
+// side. H-HOLD must cancel the LA7822's free-running spread, 750 Hz each side
+// (Sanyo No. 1337B), so turned it moves that band 750 Hz further.
+// Vertical: a Sanyo LA7824 has a 20 Hz pull-in range (Sanyo No. 1643B). Sync
+// can only end a sweep early, so it locks up to 20 Hz above the free-running
+// rate. Apple uses Sanyo's sample circuit, V-HOLD 180k plus a 200k control.
+// This takes Sanyo's 55 Hz center at the middle of the control and the rate
+// inverse to the resistance: 40.5 to 85.6 Hz from end to end. It takes a
+// factory rate of 50 Hz: 60 Hz locks with margin, and owners sometimes turn
+// V-HOLD for 50 Hz signals.
+constexpr double iigs_line = 14'318'180.0 / (65 * 14 + 2);
+constexpr double applecolor_afc = 36'000'000.0 / 4 / 544 - iigs_line, applecolor_h_hold = 750.0;
+constexpr double applecolor_line_min = iigs_line - applecolor_afc, applecolor_line_max = iigs_line + applecolor_afc;
+constexpr double applecolor_field_min = 50.0, applecolor_field_max = applecolor_field_min + 20.0;
+constexpr double applecolor_v_hold_min = 55.0 * 280 / 380, applecolor_v_hold_max = 55.0 * 280 / 180 + 20.0;
+// Its factory setup uses the IIgs signal (A2M6014 timing chart, service
+// manual): the IIgs's active picture is centered, its middle 34.22 us after
+// the middle of HSync, where the AFC locks, and 138 lines after VSync starts.
+// Width and centering are inside the case, so every mode keeps that position.
+// The beam crosses the middle of the screen half a sweep after its retrace,
+// so the middle moves by half of any change in line or field time.
+constexpr double applecolor_middle_x = (3.911 / 2 + 6.844 + 5.867 + 39.111 / 2) * 1e-6;
+constexpr double applecolor_middle_y = 138 / iigs_line, iigs_frame_time = 262 / iigs_line;
+// V-HEIGHT on the back panel: VR403 (500 ohm over 220 ohm) picks part of the
+// yoke current's sense voltage, which R421 (1k) mixes with the full voltage
+// through R420 (1.2k) as the vertical feedback. From the middle of the
+// control, taken as the factory setting, to an end, it makes the picture 0.81
+// to 1.30 times as high. More than half way to an end is a heavy adjustment.
+constexpr double applecolor_height(double wiper)
+{
+	return (1 / 1.2 + (220 + 500 * 0.5) / 720) / (1 / 1.2 + (220 + 500 * wiper) / 720);
+}
+
+// The line and field rates in Hz that each CRT locks to, the AppleColor RGB
+// with its hold controls turned as needed. Messages show them.
+struct rate_limits
+{
+	double line_min, line_max, field_min, field_max;
+};
+constexpr rate_limits vga_limits{ vga_line_min, vga_line_max, vga_field_min, vga_field_max };
+constexpr rate_limits applecolor_limits{ applecolor_line_min - applecolor_h_hold, applecolor_line_max + applecolor_h_hold,
+	applecolor_v_hold_min, applecolor_v_hold_max };
 
 struct monitor_window
 {
 	unsigned width, height;
 	bool locked;
+	// The lock needs H-HOLD or V-HOLD turned away from its factory setting.
+	bool h_hold = false, v_hold = false;
+	// The card's composite sync has the wrong polarity for the monitor.
+	bool bad_sync = false;
 };
 
 // The signal's line, field and pixel rates, its line in pixels, its frame in
@@ -90,7 +138,7 @@ monitor_window card_monitor(bool vga, double line_hz, double field_hz, double pi
 	unsigned uw, unsigned uh, unsigned aw, unsigned ah, unsigned fields, bool h_negative, bool v_negative)
 {
 	double width, height;
-	bool locked;
+	bool locked, h_hold = false, v_hold = false, bad_sync = false;
 	if (vga)
 	{
 		double part = 496.0 / 525.0;
@@ -98,17 +146,33 @@ monitor_window card_monitor(bool vga, double line_hz, double field_hz, double pi
 			part = (v_negative ? 362.0 : 414.0) / 449.0;
 		width = ht * vga_window_part;
 		height = vt * part;
-		locked = line_hz >= vga_line_min && line_hz <= vga_line_max && field_hz >= vga_field_min && field_hz <= vga_field_max;
+		locked = line_hz >= vga_limits.line_min && line_hz <= vga_limits.line_max &&
+			field_hz >= vga_limits.field_min && field_hz <= vga_limits.field_max;
 	}
 	else
 	{
 		width = applecolor_window_time * pixel_hz;
 		height = applecolor_window_frame * line_hz * fields;
-		locked = line_hz >= applecolor_line_min && line_hz <= applecolor_line_max &&
-			field_hz >= applecolor_field_min && field_hz <= applecolor_field_max;
+		// A firmware mode on a band edge locks despite rounding.
+		constexpr double rounding = 1e-6;
+		auto const within = [] (double value, double min, double max) {
+			return value >= min * (1 - rounding) && value <= max * (1 + rounding);
+		};
+		// U12 makes the monitor's composite sync from HSync and VSync. Only
+		// HSync negative with VSync positive, as every firmware RGB mode sets,
+		// is sure to give the negative composite sync that the monitor takes
+		// (TIL01930). Both negative or both positive give no usable sync with
+		// either equation that fits the firmware. U12's equation is not
+		// recovered: this takes XOR, which also passes HSync positive with
+		// VSync negative.
+		bad_sync = h_negative == v_negative;
+		locked = !bad_sync && within(line_hz, applecolor_limits.line_min, applecolor_limits.line_max) &&
+			within(field_hz, applecolor_limits.field_min, applecolor_limits.field_max);
+		h_hold = locked && !within(line_hz, applecolor_line_min, applecolor_line_max);
+		v_hold = locked && !within(field_hz, applecolor_field_min, applecolor_field_max);
 	}
 	double const scale = std::max({ std::min(uw / width, uh / height), aw / width, ah / height });
-	return { unsigned(width * scale + 0.5), unsigned(height * scale + 0.5), locked };
+	return { unsigned(width * scale + 0.5), unsigned(height * scale + 0.5), locked, h_hold, v_hold, bad_sync };
 }
 
 // Floor of half a signed difference, so both directions round the same way.
@@ -140,6 +204,41 @@ int active_offset(int window, int active, unblanked_span span)
 {
 	int const centered = span.length <= 0 ? floor_half(window - active) : floor_half(window - span.length) - span.start;
 	return std::clamp(centered, 0, std::max(0, window - active));
+}
+
+// The AppleColor RGB's window at the factory position, in pixels and lines,
+// and the offset of the active display in it. V-HEIGHT is set as the user
+// would, within its range: the unblanked signal fills the screen height,
+// unless the active display needs more. hsync is the middle of HSync in
+// pixels and vsync the start of VSync in lines of a field, both from the start
+// of the active display; vspan is in lines of the frame.
+struct applecolor_window
+{
+	int width, height, left, top;
+	bool heavy;
+};
+
+applecolor_window applecolor_placement(double line, unsigned ht, unsigned hd, double hsync, unsigned lines,
+	unsigned active, double vsync, unsigned fields, unblanked_span vspan)
+{
+	double const pixel = line / ht;
+	// The middle of the screen, in pixels from the start of the active display
+	// and in lines of a field from its first line, nearest the active middle.
+	auto const nearest = [] (double value, double size, double period) {
+		return value - period * std::round((value - size / 2) / period);
+	};
+	double const x = nearest(hsync + (applecolor_middle_x + (line - 1 / iigs_line) / 2) / pixel, hd, ht);
+	double const y = nearest(vsync + (applecolor_middle_y + (lines * line - iigs_frame_time) / 2) / line, active, lines);
+	// Half heights in lines: the active display's need, the unblanked signal's
+	// fill and the screen's at the factory height.
+	double const need = std::max(y, active - y);
+	double const fill = vspan.length > 0 ?
+		std::min(y - double(vspan.start) / fields, double(vspan.start + vspan.length) / fields - y) : need;
+	double const screen = applecolor_window_frame / line / 2;
+	double const gain = std::clamp(screen / std::max(need, fill), applecolor_height(1), applecolor_height(0));
+	double const half = screen / gain, width = applecolor_window_time / pixel;
+	return { int(std::lround(width)), int(std::lround(2 * half * fields)), int(std::lround(width / 2 - x)),
+		int(std::lround((half - y) * fields)), gain < applecolor_height(0.75) || gain > applecolor_height(0.25) };
 }
 
 // The screen that the user runs Auto on, one field: the finest detail that
@@ -276,6 +375,9 @@ void oak_oti087_vga_device::device_start()
 	save_item(NAME(m_lock_candidate));
 	save_item(NAME(m_lock_since));
 	save_item(NAME(m_lock_rates));
+	save_item(NAME(m_hold_rates));
+	save_item(NAME(m_hold_since));
+	save_item(NAME(m_hold_shown));
 	save_item(NAME(m_system_data));
 	save_item(NAME(m_latch));
 	save_item(NAME(m_latch_diagnostics));
@@ -490,11 +592,43 @@ TIMER_CALLBACK_MEMBER(oak_oti087_vga_device::display_latch_tick)
 	{
 		m_out_of_range = !m_lock_candidate;
 		char const *const name = m_lock_rates[2] == 2 ? "VGA LCD" : m_lock_rates[2] ? "VGA CRT" : "AppleColor RGB";
-		if (m_out_of_range && !m_lock_rates[3])
-			popmessage("Second Sight %s monitor: no signal", name);
-		else if (m_out_of_range)
-			popmessage("Second Sight %s monitor: out of range (%.2f kHz, %.2f Hz)", name, m_lock_rates[0] / 1000.0,
-				m_lock_rates[1]);
+		if (m_out_of_range)
+		{
+			double const line_hz = m_lock_rates[0], field_hz = m_lock_rates[1];
+			if (!m_lock_rates[3])
+				popmessage("Second Sight %s: %s", name,
+					m_lock_rates[2] == 2 ? "no signal" : "no sync, the card sends no sync pulses");
+			else if (m_lock_rates[4])
+				popmessage("Second Sight %s: no sync, %s", name,
+					BIT(vga.miscellaneous_output, 6) ? "VSync must be positive" : "HSync must be negative");
+			else if (m_lock_rates[2] == 2)
+				popmessage("Second Sight %s: out of range (%.2f kHz, %.2f Hz)", name, line_hz / 1000.0, field_hz);
+			else
+			{
+				// Name the rate the monitor cannot follow, with the range it takes.
+				rate_limits const &limits = m_lock_rates[2] ? vga_limits : applecolor_limits;
+				bool const line_out = line_hz < limits.line_min || line_hz > limits.line_max;
+				bool const field_out = field_hz < limits.field_min || field_hz > limits.field_max;
+				std::string rates;
+				if (line_out || !field_out)
+					rates = util::string_format("lines %.2f kHz (%.2f-%.2f)", line_hz / 1000.0, limits.line_min / 1000.0,
+						limits.line_max / 1000.0);
+				if (field_out || !line_out)
+					rates += util::string_format("%sfields %.1f Hz (%.1f-%.1f)", rates.empty() ? "" : ", ", field_hz,
+						limits.field_min, limits.field_max);
+				popmessage("Second Sight %s: out of range, %s", name, rates);
+			}
+		}
+	}
+	if (m_hold_rates[0] && !m_hold_shown && !m_out_of_range && machine().time() - m_hold_since >= m_screen->frame_period())
+	{
+		m_hold_shown = true;
+		std::string controls;
+		for (auto const &[index, name] : { std::pair{ 2, "H-HOLD" }, { 3, "V-HOLD" }, { 4, "V-HEIGHT" } })
+			if (m_hold_rates[index])
+				controls += (controls.empty() ? "" : ", ") + std::string(name);
+		popmessage("Second Sight AppleColor RGB: this mode needs %s adjusted (%.2f kHz, %.2f Hz)",
+			controls, m_hold_rates[0] / 1000.0, m_hold_rates[1]);
 	}
 	// The LCD's Auto follows the picture's shape, which also changes with the
 	// border color.
@@ -1353,7 +1487,8 @@ bool oak_oti087_vga_device::vga_lcd() const
 }
 
 // The HSYNC leading edge at the card's VGA connector, in pixels from the
-// start of the active display there. HSYNC and VSYNC go from the Oak to the
+// start of the active display there; U12 makes the RGB connector's composite
+// sync from the same HSYNC. HSYNC and VSYNC go from the Oak to the VGA
 // connector through 22 ohm resistors only; the pixels and blanking go through
 // the Bt481, which the Oak's PCLK clocks. PCLK passes VCLK through on this
 // board's Type 0 color-chip interface (OTI-087 data book p. 37).
@@ -1383,17 +1518,27 @@ int oak_oti087_vga_device::connector_hsync()
 // The card's VGA output as the LCD monitor's controller measures it, and the
 // leading edges of HSync and VSync in pixels and lines of a field from the
 // start of the active display. False when there is no sync to measure.
-bool oak_oti087_vga_device::lcd_measure(oti087_lcd::Timing &timing, int &hsync, int &vsync)
+// Whether the card sends both sync pulses: a pulse that never starts or never
+// ends gives no sync edge.
+bool oak_oti087_vga_device::sync_present()
 {
 	auto const &crtc = vga.crtc;
 	if (!crtc.sync_en || !crtc.horz_total || !crtc.horz_disp_end || !crtc.vert_disp_end)
 		return false;
 	int const characters = crtc.horz_total + 5, line_total = crtc.vert_total + 2;
+	return crtc.horz_retrace_start < characters && crtc.vert_retrace_start < line_total &&
+		retrace_length(crtc.horz_retrace_start, crtc.horz_retrace_end & 31, 31, characters) &&
+		retrace_length(crtc.vert_retrace_start, crtc.vert_retrace_end & 15, 15, line_total);
+}
+
+bool oak_oti087_vga_device::lcd_measure(oti087_lcd::Timing &timing, int &hsync, int &vsync)
+{
+	auto const &crtc = vga.crtc;
+	if (!sync_present())
+		return false;
+	int const characters = crtc.horz_total + 5, line_total = crtc.vert_total + 2;
 	int const hwidth = retrace_length(crtc.horz_retrace_start, crtc.horz_retrace_end & 31, 31, characters);
 	int const vwidth = retrace_length(crtc.vert_retrace_start, crtc.vert_retrace_end & 15, 15, line_total);
-	// A pulse that never starts or never ends gives no sync edge.
-	if (crtc.horz_retrace_start >= characters || crtc.vert_retrace_start >= line_total || !hwidth || !vwidth)
-		return false;
 	unsigned const dots = BIT(vga.sequencer.data[1], 0) ? 8 : 9;
 	unsigned const unit = dots * horizontal_multiplier(), div = pixel_divisor();
 	u32 const dotclock = vclk_hz() / (BIT(vga.sequencer.data[1], 3) ? 2 : 1) / (m_output_divider ? 2 : 1);
@@ -1496,7 +1641,10 @@ void oak_oti087_vga_device::recompute_params()
 	{
 		window = card_monitor(vga_monitor, line_hz, line_hz * interlace / vt, double(dotclock) / div, ht, vt,
 			hspan.length > 0 ? hspan.length : hd, vspan.length > 0 ? vspan.length : vd, hd, vd, interlace,
-			BIT(vga.miscellaneous_output, 6), BIT(vga.miscellaneous_output, 7));
+			BIT(vga.miscellaneous_output, 6), BIT(vga.miscellaneous_output, 7) ^ BIT(m_ext[3], 5));
+		signal = sync_present();
+		if (!signal)
+			window.locked = false;
 	}
 	if (!window.locked)
 	{
@@ -1512,7 +1660,8 @@ void oak_oti087_vga_device::recompute_params()
 		m_lock_candidate = window.locked;
 		m_lock_since = machine().time();
 	}
-	m_lock_rates = { line_hz, line_hz * interlace / vt, m_lcd_attached ? 2.0 : double(vga_monitor), double(signal) };
+	m_lock_rates = { line_hz, line_hz * interlace / vt, m_lcd_attached ? 2.0 : double(vga_monitor), double(signal),
+		double(window.bad_sync) };
 	unsigned width = std::clamp(window.width, 1U, ht), height = std::clamp(window.height, 1U, vt);
 	if (!m_lcd_attached || !window.locked)
 	{
@@ -1526,6 +1675,29 @@ void oak_oti087_vga_device::recompute_params()
 		height = std::min(std::max(240U, vd + 19), vt);
 		left = side;
 		top = 19;
+	}
+	bool heavy = false;
+	if (window.locked && !vga_monitor && !iigs_frame())
+	{
+		auto const &crtc = vga.crtc;
+		int const characters = crtc.horz_total + 5;
+		int const hwidth = retrace_length(crtc.horz_retrace_start, crtc.horz_retrace_end & 31, 31, characters);
+		applecolor_window const placement = applecolor_placement(1 / line_hz, ht, hd,
+			connector_hsync() + 0.5 * hwidth * dots * mult / div, vt / interlace, vd / interlace,
+			crtc.vert_retrace_start * vertical_divisor(), interlace, vspan);
+		width = std::clamp(placement.width, 1, int(ht));
+		height = std::clamp(placement.height, 1, int(vt));
+		left = placement.left;
+		top = placement.top;
+		heavy = placement.heavy;
+	}
+	if (!window.h_hold && !window.v_hold && !heavy)
+		m_hold_rates = {};
+	else if (m_hold_rates[0] != m_lock_rates[0] || m_hold_rates[1] != m_lock_rates[1])
+	{
+		m_hold_rates = { m_lock_rates[0], m_lock_rates[1], double(window.h_hold), double(window.v_hold), double(heavy) };
+		m_hold_since = machine().time();
+		m_hold_shown = false;
 	}
 	// A window that starts left of counter zero starts in the preceding
 	// CRTC line. A linear pixel offset retains that carry when status and
