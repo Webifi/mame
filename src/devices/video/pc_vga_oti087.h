@@ -242,6 +242,9 @@ class oak_oti087_vga_device : public svga_device
 	attotime m_origin_phase = attotime::zero;
 	bool m_out_of_range = false, m_lock_candidate = true;
 	attotime m_lock_since = attotime::zero;
+	// The out-of-range message and when it was last shown.
+	std::string m_monitor_message;
+	attotime m_message_time = attotime::zero;
 	std::array<double, 5> m_lock_rates{};
 	// A mode that needs a back-panel control turned gets one short notice:
 	// its line and field rates and which controls, 0 for no such mode.

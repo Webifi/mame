@@ -596,13 +596,14 @@ TIMER_CALLBACK_MEMBER(oak_oti087_vga_device::display_latch_tick)
 		{
 			double const line_hz = m_lock_rates[0], field_hz = m_lock_rates[1];
 			if (!m_lock_rates[3])
-				popmessage("Second Sight %s: %s", name,
+				m_monitor_message = util::string_format("Second Sight %s: %s", name,
 					m_lock_rates[2] == 2 ? "no signal" : "no sync, the card sends no sync pulses");
 			else if (m_lock_rates[4])
-				popmessage("Second Sight %s: no sync, %s", name,
+				m_monitor_message = util::string_format("Second Sight %s: no sync, %s", name,
 					BIT(vga.miscellaneous_output, 6) ? "VSync must be positive" : "HSync must be negative");
 			else if (m_lock_rates[2] == 2)
-				popmessage("Second Sight %s: out of range (%.2f kHz, %.2f Hz)", name, line_hz / 1000.0, field_hz);
+				m_monitor_message = util::string_format("Second Sight %s: out of range (%.2f kHz, %.2f Hz)", name,
+					line_hz / 1000.0, field_hz);
 			else
 			{
 				// Name the rate the monitor cannot follow, with the range it takes.
@@ -616,9 +617,18 @@ TIMER_CALLBACK_MEMBER(oak_oti087_vga_device::display_latch_tick)
 				if (field_out || !line_out)
 					rates += util::string_format("%sfields %.1f Hz (%.1f-%.1f)", rates.empty() ? "" : ", ", field_hz,
 						limits.field_min, limits.field_max);
-				popmessage("Second Sight %s: out of range, %s", name, rates);
+				m_monitor_message = util::string_format("Second Sight %s: out of range, %s", name, rates);
 			}
+			popmessage("%s", m_monitor_message);
+			m_message_time = machine().time();
 		}
+	}
+	// A pop-up message clears after a few seconds; repeat the monitor's
+	// message for as long as it shows no picture.
+	if (m_out_of_range && machine().time() - m_message_time >= attotime::from_seconds(1))
+	{
+		popmessage("%s", m_monitor_message);
+		m_message_time = machine().time();
 	}
 	if (m_hold_rates[0] && !m_hold_shown && !m_out_of_range && machine().time() - m_hold_since >= m_screen->frame_period())
 	{
